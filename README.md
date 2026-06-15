@@ -203,8 +203,7 @@ Add as many as you want, numbered from 1:
 catches everything within ~`INTERVAL × MIN_STRIKES`.
 
 **Event**: stack-doctor runs a tiny webhook server. Point each *arr at it
-(*Settings → Connect → Webhook*, URL `http://stack-doctor:8088`, on **On Grab / On Import
-Failure / On Manual Interaction Required**) and it sweeps the moment the *arr reports trouble.
+(*Settings → Connect → Webhook*, URL `http://stack-doctor:8088`, enable **On Grab / On Import / On Manual Interaction Required**) and it sweeps the moment the *arr reports trouble.
 A slow safety-net sweep still runs in the background in case a webhook is missed. In event
 mode you'll usually set `DOCTOR_MIN_STRIKES: "1"` to act immediately, the event already
 confirms the item is stuck.
