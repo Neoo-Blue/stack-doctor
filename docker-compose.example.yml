@@ -20,6 +20,7 @@ services:
       ENABLE_RESOURCES: "true"       # host load / mem / swap
       ENABLE_JANITOR: "false"        # usenet dead-file quarantine (needs a decypharr log file)
       ENABLE_BAZARR: "false"         # Bazarr reachability (set BAZARR_URL/BAZARR_APIKEY)
+      ENABLE_SEERR: "false"          # Overseerr/Jellyseerr/Seerr: auto-retry FAILED requests (set SEERR_URL/SEERR_APIKEY)
       ENABLE_WARMER: "false"         # precache the head of likely-next media (needs PLEX_URL/PLEX_TOKEN)
       ENABLE_UI: "true"              # web dashboard: status, per-service health, warmer stats, config, logs
       # DOCTOR_UI_TOKEN: "changeme"  # require ?token= / X-Doctor-Token to reach the dashboard
@@ -59,6 +60,14 @@ services:
       # ---------- bazarr (optional) ----------
       BAZARR_URL: http://bazarr:6767
       BAZARR_APIKEY: ${BAZARR_API_KEY}
+
+      # ---------- seerr (Overseerr / Jellyseerr / Seerr - auto-retry FAILED requests) ----------
+      # seerr hands an approved request to the arr with a ~10s timeout and never retries; under heavy
+      # arr load that add times out and the request is silently stuck FAILED. This re-drives them.
+      SEERR_URL: http://seerr:5055
+      SEERR_APIKEY: ${SEERR_API_KEY}
+      SEERR_RETRY_MAX: "10"          # max requests retried per sweep (rate-limit the re-adds)
+      SEERR_MAX_ATTEMPTS: "5"        # give up on a request after this many auto-retries (0 = never give up)
 
       # ---------- decypharr (mount-hang watchdog) ----------
       DECYPHARR_URL: http://192.168.1.10:8282        # API reachability (optional)

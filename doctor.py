@@ -13,6 +13,7 @@ Modular checks, each toggled and configured by environment variables:
   janitor    usenet dead files          - quarantine library symlinks for permanently-dead
                                            releases (reversible) from a decypharr log file
   bazarr     Bazarr                     - reachability check
+  seerr      Overseerr/Jellyseerr/Seerr - auto-retry FAILED requests (arr add timed out under load)
   warmer     Plex-driven precache       - read the head of likely-next media so playback starts
                                            instantly (next episode + On Deck); thread, not a sweep
 
@@ -101,8 +102,9 @@ EN_DECYPHARR  = _b("ENABLE_DECYPHARR", False)
 EN_PLEX       = _b("ENABLE_PLEX", False)
 EN_RESOURCES  = _b("ENABLE_RESOURCES", False)
 EN_JANITOR    = _b("ENABLE_JANITOR", False)
-EN_PROVIDERS  = _b("ENABLE_PROVIDERS", False)
-EN_BAZARR     = _b("ENABLE_BAZARR", False)
+EN_PROVIDERS  = _b("ENABLE_PROVIDERS", False)   # auto-test failed indexers/download clients (sonarr/radarr/prowlarr)
+EN_BAZARR     = _b("ENABLE_BAZARR", False)      # Bazarr reachability
+EN_SEERR      = _b("ENABLE_SEERR", False)       # Overseerr/Jellyseerr/Seerr: auto-retry FAILED requests
 EN_WESTREPAIR = _b("ENABLE_WESTREPAIR", False)  # symlink repair via repair.py subprocess
 
 # westrepair config
@@ -112,6 +114,16 @@ WR_REPAIR_INTERVAL = os.environ.get("WESTREPAIR_REPAIR_INTERVAL", "1m")
 
 BAZARR_URL    = os.environ.get("BAZARR_URL", "")
 BAZARR_APIKEY = os.environ.get("BAZARR_APIKEY", "")
+
+# seerr (Overseerr / Jellyseerr / Seerr) failed-request auto-retry.
+# When the arr API is briefly slow (e.g. under a heavy search load), seerr's add call times out and
+# it marks the request FAILED - it never auto-retries, so the title silently never reaches the arr.
+# We periodically re-drive those FAILED requests so a transient blip self-heals, with an attempt cap
+# so a genuinely-bad request (dead tmdb id, etc.) doesn't get retried forever.
+SEERR_URL       = os.environ.get("SEERR_URL", "")
+SEERR_APIKEY    = os.environ.get("SEERR_APIKEY", "")
+SEERR_MAX       = _i("SEERR_RETRY_MAX", 10)      # max requests retried per sweep (rate-limit the re-adds)
+SEERR_MAX_TRIES = _i("SEERR_MAX_ATTEMPTS", 5)    # give up on a request after this many auto-retries (0 = never give up)
 
 # queue check
 MIN_STRIKES   = _i("DOCTOR_MIN_STRIKES", 2)
@@ -644,6 +656,80 @@ def check_bazarr():
     (log.info if c == 200 else log.error)("[bazarr] %s -> %s", BAZARR_URL, c if c else "DOWN")
 
 # =========================================================================== #
+# CHECK: seerr (Overseerr / Jellyseerr / Seerr) - auto-retry FAILED requests
+#
+# seerr hands an approved request to Radarr/Sonarr with a fixed ~10s API timeout
+# and NO retry of its own. If the arr is briefly slow (heavy search load, host
+# contention) the add times out, the request is marked FAILED, and the title
+# silently never lands in the arr. We re-drive those FAILED requests each sweep
+# so a transient blip self-heals; an attempt cap stops us looping on a request
+# that fails for a real reason (dead tmdb id, removed title).
+# =========================================================================== #
+
+class Seerr:
+    def __init__(self, url, apikey):
+        self.base = url.rstrip("/") + "/api/v1"
+        self.apikey = apikey
+
+    def _req(self, method, path, data=None, t=None):
+        req = urllib.request.Request(self.base + path, data=data, method=method,
+                                     headers={"X-Api-Key": self.apikey, "Content-Type": "application/json"})
+        return urllib.request.urlopen(req, timeout=t or TIMEOUT)
+
+    def failed(self):
+        """Requests currently in the FAILED state (seerr could not hand them to the arr)."""
+        try:
+            d = json.load(self._req("GET", "/request?take=100&skip=0&filter=failed&sort=added", t=15))
+            return d.get("results", [])
+        except Exception as e:
+            log.warning("[seerr] failed-list fetch error: %s", str(e)[:80]); return None
+
+    def retry(self, rid):
+        self._req("POST", "/request/%d/retry" % int(rid), data=b"", t=30)
+
+def check_seerr():
+    if not SEERR_URL or not SEERR_APIKEY:
+        return
+    s = Seerr(SEERR_URL, SEERR_APIKEY)
+    reqs = s.failed()
+    if reqs is None:                                          # fetch errored -> seerr down/unreachable
+        log.error("[seerr] %s unreachable", SEERR_URL); return
+    if not reqs:
+        log.info("[seerr] no failed requests"); return
+    state = _load_state()
+    tries = state.setdefault("__seerr__", {})
+    log.warning("[seerr] %d failed request(s)", len(reqs))
+    acted = 0
+    for r in reqs:
+        if acted >= SEERR_MAX:
+            break
+        rid = r.get("id")
+        if rid is None:
+            continue
+        md = r.get("media") or {}
+        label = "%s tmdb=%s req#%s" % (md.get("mediaType", "?"), md.get("tmdbId", "?"), rid)
+        n = int(tries.get(str(rid), 0))
+        if SEERR_MAX_TRIES and n >= SEERR_MAX_TRIES:          # keeps failing -> stop, leave it for a human
+            log.error("[seerr] giving up on %s after %d retries (persistent failure)", label, n)
+            continue
+        if DRY_RUN:
+            log.info("[seerr] DRY-RUN would retry %s", label); acted += 1; continue
+        try:
+            s.retry(rid)
+            tries[str(rid)] = n + 1
+            acted += 1
+            log.info("[seerr] retried %s (attempt %d)", label, n + 1)
+        except Exception as e:
+            log.warning("[seerr] retry %s failed: %s", label, str(e)[:80])
+    # a recovered request drops off the failed list; forget its counter so a future fresh fail starts clean
+    live = set(str(r.get("id")) for r in reqs)
+    for k in [k for k in tries if k not in live]:
+        tries.pop(k, None)
+    _save_state(state)
+    if acted:
+        log.info("[seerr] re-drove %d failed request(s)", acted)
+
+# =========================================================================== #
 # WARMER: precache the head of likely-next media so playback starts instantly
 #
 # On a usenet/debrid FUSE mount the slow part of pressing Play is decypharr
@@ -1030,7 +1116,8 @@ def _wr_plex_rescan():
 CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_providers),
           ("decypharr", EN_DECYPHARR, check_decypharr), ("plex", EN_PLEX, check_plex),
           ("resources", EN_RESOURCES, check_resources), ("janitor", EN_JANITOR, check_janitor),
-          ("bazarr", EN_BAZARR, check_bazarr), ("westrepair", EN_WESTREPAIR, check_westrepair)]
+          ("bazarr", EN_BAZARR, check_bazarr), ("seerr", EN_SEERR, check_seerr),
+          ("westrepair", EN_WESTREPAIR, check_westrepair)]
 
 _lock = threading.Lock()
 
@@ -1060,7 +1147,7 @@ UI_SCHEMA = [
               ("DOCTOR_DRY_RUN", "false"), ("DOCTOR_LOG_LEVEL", "INFO")]),
     ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
               ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""),
-              ("ENABLE_BAZARR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", "")]),
+              ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", "")]),
     ("Westrepair", [("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py"),
               ("WESTREPAIR_RUN_INTERVAL", "6h"), ("WESTREPAIR_REPAIR_INTERVAL", "1m")]),
     ("Queue / churn brake", [("DOCTOR_MIN_STRIKES", "2"), ("DOCTOR_MAX_ACTIONS", "20"), ("DOCTOR_BLOCKLIST", "true"),
@@ -1069,6 +1156,7 @@ UI_SCHEMA = [
               ("WARMER_ONDECK", "true|false"), ("WARMER_MAX_PER_CYCLE", "40"), ("WARMER_NEXT_EPISODES", "1"),
               ("WARMER_COOLDOWN", "3600"), ("WARMER_LOAD_MAX", "0")]),
     ("Resources", [("RES_LOAD_WARN", "40"), ("RES_SWAP_WARN_MB", "7000"), ("RES_MEM_MIN_MB", "800")]),
+    ("Seerr (failed-request retry)", [("SEERR_URL", "http://seerr:5055"), ("SEERR_RETRY_MAX", "10"), ("SEERR_MAX_ATTEMPTS", "5")]),
 ]
 UI_KEYS = set(k for _, items in UI_SCHEMA for k, _ in items)
 
@@ -1093,6 +1181,9 @@ def _ui_health():
     if BAZARR_URL:
         jobs.append(("bazarr", "bazarr", lambda: (http_code(BAZARR_URL.rstrip("/") + "/api/system/status",
             headers={"X-API-KEY": BAZARR_APIKEY} if BAZARR_APIKEY else None, t=5) == 200, "")))
+    if SEERR_URL:
+        jobs.append(("seerr", "seerr", lambda: (http_code(SEERR_URL.rstrip("/") + "/api/v1/status",
+            headers={"X-Api-Key": SEERR_APIKEY} if SEERR_APIKEY else None, t=5) == 200, "")))
     out = [None] * len(jobs)
     def run(i, name, kind, fn):
         try:
@@ -1109,7 +1200,7 @@ def _ui_status():
     checks = [{"name": n, "on": bool(e)} for n, e, _ in CHECKS]
     checks.append({"name": "warmer", "on": _b("ENABLE_WARMER", False) and bool(PLEX_URL)})
     checks.append({"name": "detail-page warm", "on": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE)})
-    return {"version": "0.2", "mode": MODE, "dry_run": DRY_RUN, "load": round(host_load(), 2), "checks": checks}
+    return {"version": "0.3", "mode": MODE, "dry_run": DRY_RUN, "load": round(host_load(), 2), "checks": checks}
 
 def _ui_warmer():
     rec = [{"title": r["title"], "why": r["why"], "ago": int(time.time() - r["ts"])} for r in reversed(_warm_recent)]

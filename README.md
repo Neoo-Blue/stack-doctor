@@ -29,6 +29,7 @@ container, everything configured by env vars.
 | **resources** | host load / low memory / swap pressure | reports; optional `drop_caches` relief |
 | **janitor** | permanently-dead usenet releases (from decypharr's log) | quarantines those library symlinks (reversible) |
 | **bazarr** | Bazarr unreachable | alerts |
+| **seerr** | Overseerr/Jellyseerr/Seerr requests stuck **FAILED** (the arr add timed out under load) | re-drives them so a transient blip self-heals (attempt-capped) |
 | **warmer** | what a viewer is about to watch (Plex On Deck + next episode) | precaches the file head so playback starts instantly |
 
 Safe by design: risky actions (restart, drop_caches) are **opt-in**, the queue fixer only
@@ -183,6 +184,25 @@ LAN isn't trusted. In event mode the webhook listener (`DOCTOR_PORT`) and the da
 | `DOCTOR_CONFIG_FILE` | `/data/config.json` | overlay the dashboard writes edited settings to (merged over env at startup; applies on restart) |
 | `DOCTOR_TRIGGER_EVENTS` | `Download,ManualInteractionRequired,DownloadFailed,Grab` | webhook events that trigger a sweep |
 | `DOCTOR_LOG_LEVEL` | `INFO` | `DEBUG` for verbose |
+
+### Seerr (failed-request retry)
+
+`seerr` watches Overseerr / Jellyseerr / Seerr for requests stuck in **FAILED**. seerr hands an
+approved request to Radarr/Sonarr with a fixed ~10s timeout and never retries on its own, so when
+the arr is briefly slow (heavy search load, host CPU/RAM contention) the add times out and the title
+is silently marked failed and never lands. Each sweep this re-drives those failed requests so a
+transient blip self-heals; a per-request attempt cap stops it looping on a request that fails for a
+real reason (dead TMDB id, removed title).
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_SEERR` | `false` | turn the check on (needs `SEERR_URL` + `SEERR_APIKEY`) |
+| `SEERR_URL` | *(none)* | e.g. `http://seerr:5055` (Overseerr / Jellyseerr / Seerr share this API) |
+| `SEERR_APIKEY` | *(none)* | from *Settings → General → API Key* |
+| `SEERR_RETRY_MAX` | `10` | max requests retried per sweep (rate-limit the re-adds) |
+| `SEERR_MAX_ATTEMPTS` | `5` | give up on a request after this many auto-retries (`0` = never give up) |
+
+Honors `DOCTOR_DRY_RUN` (logs what it would retry, changes nothing).
 
 ### Instances
 
