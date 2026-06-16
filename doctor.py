@@ -34,6 +34,8 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 
+VERSION = "0.3"
+
 # --------------------------------------------------------------------------- #
 # config helpers
 # --------------------------------------------------------------------------- #
@@ -1200,7 +1202,7 @@ def _ui_status():
     checks = [{"name": n, "on": bool(e)} for n, e, _ in CHECKS]
     checks.append({"name": "warmer", "on": _b("ENABLE_WARMER", False) and bool(PLEX_URL)})
     checks.append({"name": "detail-page warm", "on": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE)})
-    return {"version": "0.3", "mode": MODE, "dry_run": DRY_RUN, "load": round(host_load(), 2), "checks": checks}
+    return {"version": VERSION, "mode": MODE, "dry_run": DRY_RUN, "load": round(host_load(), 2), "checks": checks}
 
 def _ui_warmer():
     rec = [{"title": r["title"], "why": r["why"], "ago": int(time.time() - r["ts"])} for r in reversed(_warm_recent)]
@@ -1435,8 +1437,8 @@ def main():
     if not enabled and not warmer_on and not EN_UI:
         log.error("nothing enabled. Set ENABLE_QUEUE / ENABLE_DECYPHARR / ENABLE_PLEX / ENABLE_RESOURCES / ENABLE_JANITOR / ENABLE_WARMER / ENABLE_UI.")
         sys.exit(2)
-    log.info("stack-doctor v0.2 | mode=%s | checks=[%s]%s%s | instances=%s | dry_run=%s",
-             MODE, ",".join(enabled), " +warmer" if warmer_on else "", " +ui" if EN_UI else "",
+    log.info("stack-doctor v%s | mode=%s | checks=[%s]%s%s | instances=%s | dry_run=%s",
+             VERSION, MODE, ",".join(enabled), " +warmer" if warmer_on else "", " +ui" if EN_UI else "",
              ", ".join(a.name for a in INSTANCES) or "-", DRY_RUN)
 
     stop = threading.Event()
