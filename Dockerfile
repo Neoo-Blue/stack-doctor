@@ -9,10 +9,10 @@ ENV PYTHONUNBUFFERED=1 \
     DOCTOR_STATE_FILE=/data/state.json
 
 WORKDIR /app
-COPY doctor.py /app/doctor.py
+COPY doctor /app/doctor
 
-# No Python dependencies (standard library only). openssh-client lets a restart
-# hook reach a *host* service (e.g. DECYPHARR_RESTART_CMD="ssh root@host systemctl restart decypharr").
+# The doctor package uses only the Python standard library. openssh-client lets a
+# restart hook reach a *host* service (e.g. DECYPHARR_RESTART_CMD="ssh root@host systemctl restart decypharr").
 # Runs as root so a bind-mounted /data (and an optional rw /mnt/library for the
 # janitor) is always writable regardless of host ownership.
 RUN apt-get update \
@@ -24,4 +24,4 @@ VOLUME /data
 # webhook port (event mode) + web dashboard (ENABLE_UI)
 EXPOSE 8088 12345
 
-ENTRYPOINT ["python3", "/app/doctor.py"]
+ENTRYPOINT ["python3", "-m", "doctor"]

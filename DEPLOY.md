@@ -1,6 +1,6 @@
 # Deployment guide
 
-stack-doctor is one small file (`doctor.py`, pure Python standard library, no dependencies).
+stack-doctor is a small pure-Python package (standard library only, no third-party dependencies).
 Pick the path that matches your setup:
 
 - **Docker** is easiest. It runs the `queue` / `providers` / `plex` / `resources` checks and the
@@ -69,8 +69,9 @@ Run this on the machine that runs decypharr.
 
 ```bash
 mkdir -p /opt/stack-doctor
-curl -fsSL https://raw.githubusercontent.com/Neoo-Blue/stack-doctor/main/doctor.py \
-  -o /opt/stack-doctor/doctor.py
+cd /opt/stack-doctor
+curl -fsSL https://github.com/Neoo-Blue/stack-doctor/archive/refs/heads/main.tar.gz \
+  | tar -xz --strip-components=1 stack-doctor-main/doctor
 ```
 
 2. Install the service template and edit the values (URLs, API keys, paths):
@@ -115,6 +116,6 @@ and open `http://<host>:12345/?token=something`.
 ## Updating
 
 - **Docker**: `docker compose pull && docker compose up -d`
-- **Host**: re-download `doctor.py` (step 1 above) and `systemctl restart stack-doctor`
+- **Host**: re-download/extract the `doctor` package (step 1 above) and `systemctl restart stack-doctor`
 
 Your saved settings live in `DOCTOR_CONFIG_FILE` (`/data/config.json` by default) and survive updates.
