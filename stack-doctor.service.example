@@ -2,7 +2,8 @@
 # so it has native power (restart decypharr locally, read its journal, touch the library)
 # with no container-to-host bridge / SSH key needed.
 #
-#   cp doctor.py /opt/stack-doctor/doctor.py
+#   mkdir -p /opt/stack-doctor
+#   cp -r doctor /opt/stack-doctor/doctor
 #   cp stack-doctor.service.example /etc/systemd/system/stack-doctor.service   # edit values
 #   systemctl daemon-reload && systemctl enable --now stack-doctor.service
 #   journalctl -u stack-doctor -f
@@ -13,7 +14,8 @@ After=network-online.target decypharr.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/stack-doctor/doctor.py
+WorkingDirectory=/opt/stack-doctor
+ExecStart=/usr/bin/python3 -m doctor
 Restart=always
 RestartSec=30
 # --- mode ---

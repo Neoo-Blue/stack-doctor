@@ -1,0 +1,15 @@
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# F = pyflakes: undefined names, unused imports, redefined names.
+# E and W are available for local runs but CI only gates on F (see ci.yml).
+select = ["F"]
+
+# The compat re-export in config.py is intentional — silence it per-file
+# rather than globally, so future real F401s in other files still fail.
+[tool.ruff.lint.per-file-ignores]
+"doctor/config.py" = ["F401"]           # backward-compat re-export of utils helpers
+"doctor/__init__.py" = ["F401"]         # re-export of VERSION
+"doctor/checks/repair/__init__.py" = ["F401"]  # re-export of check_repair, _dead_symlink
+"doctor/checks/__init__.py" = ["F401"]  # explicit re-exports for checks package
