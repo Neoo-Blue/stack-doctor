@@ -906,8 +906,15 @@ def check_scrubber():
         candidates.append((real_path, lib_symlink, st))
         if len(candidates) >= SCRUB_MAX_FILES * 4:
             break
-    # prefer never-scanned-or-suspect; sort by oldest-tested first so we cycle through evenly
-    candidates.sort(key=lambda t: files_state.get(t[0], {}).get("ts", 0))
+    # Priority: SUSPECTS first (so a 1-strike file gets its 2nd strike next sweep instead of
+    # waiting for the whole library to be scanned once), then never-scanned, then due-for-reverify.
+    # Within each tier, oldest-tested first so the queue cycles evenly.
+    def _prio(real_path):
+        rec = files_state.get(real_path, {})
+        if rec.get("status") == "suspect":
+            return (0, rec.get("ts", 0))
+        return (1, rec.get("ts", 0))
+    candidates.sort(key=lambda t: _prio(t[0]))
     candidates = candidates[:SCRUB_MAX_FILES]
     if not candidates:
         log.debug("[scrubber] nothing due (all cached-OK or below min-age)"); return
