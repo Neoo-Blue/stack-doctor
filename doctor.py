@@ -108,6 +108,7 @@ EN_PROVIDERS  = _b("ENABLE_PROVIDERS", False)   # auto-test failed indexers/down
 EN_BAZARR     = _b("ENABLE_BAZARR", False)      # Bazarr reachability
 EN_SEERR      = _b("ENABLE_SEERR", False)       # Overseerr/Jellyseerr/Seerr: auto-retry FAILED requests
 EN_WESTREPAIR = _b("ENABLE_WESTREPAIR", False)  # symlink repair via repair.py subprocess
+EN_SCRUBBER   = _b("ENABLE_SCRUBBER", False)    # proactive file integrity scan (catches mid-file dead segments before playback)
 
 # westrepair config
 WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
@@ -200,6 +201,35 @@ JAN_LOG       = os.environ.get("JANITOR_DECYPHARR_LOG", "")         # log file p
 JAN_LOG_CMD   = os.environ.get("JANITOR_LOG_CMD", "")               # cmd printing the log, e.g. "journalctl -u decypharr -n 10000 --no-hostname"
 JAN_QUAR      = os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine")
 JAN_PATTERNS  = os.environ.get("JANITOR_DEAD_PATTERNS", "ARTICLE_NOT_FOUND,still missing").split(",")
+
+# scrubber (proactive file integrity scan)
+# Tiered, cheapest-first: 1=ffprobe header, 2=+sampled chunk reads, 3=+ffmpeg stream-skim at seek points,
+# 4=+full ffmpeg -v error decode. Default tier=2 is the sweet spot for usenet streaming (cheap reads via
+# the FUSE mount catch dead NZB articles without restreaming the whole file from Newshosting).
+SCRUB_PATHS        = [p.strip() for p in os.environ.get("SCRUBBER_PATHS", os.environ.get("JANITOR_LIBRARY_PATHS", "")).split(",") if p.strip()]
+SCRUB_STATE        = os.environ.get("SCRUBBER_STATE_FILE", "/data/scrubber.json")
+SCRUB_TIER         = _i("SCRUBBER_TIER", 2)              # 1..4, see above
+SCRUB_PROMOTE      = _b("SCRUBBER_PROMOTE_ON_SUSPECT", True)  # auto-promote to next tier on suspect (verify cheap finding with a deeper read)
+SCRUB_FULL_ON_BAD  = _b("SCRUBBER_FULL_DECODE_ON_BAD", False) # final-confirm a BAD with a full decode before quarantining (slow; off by default)
+SCRUB_SAMPLES      = _i("SCRUBBER_SAMPLE_COUNT", 8)      # evenly-spaced chunk reads (tier 2)
+SCRUB_SAMPLE_MB    = _i("SCRUBBER_SAMPLE_MB", 1)         # MB per chunk (tier 2)
+SCRUB_SKIM_POINTS  = _i("SCRUBBER_SKIM_POINTS", 4)       # seek points for tier 3 stream-skim
+SCRUB_SKIM_SECS    = _i("SCRUBBER_SKIM_SECS", 5)         # seconds decoded at each skim point
+SCRUB_MAX_FILES    = _i("SCRUBBER_MAX_FILES", 50)        # files scanned per sweep
+SCRUB_CONC         = _i("SCRUBBER_CONCURRENCY", 1)       # parallel scans (1 = single stream, kindest to decypharr)
+SCRUB_LOAD_MAX     = _f("SCRUBBER_LOAD_MAX", 12)         # skip sweep if 1-min load above this (0=off)
+SCRUB_STRIKES      = _i("SCRUBBER_STRIKES", 2)           # consecutive bad reads before action (transient mount blips don't cost re-grabs)
+SCRUB_FFPROBE      = os.environ.get("SCRUBBER_FFPROBE", "ffprobe")
+SCRUB_FFMPEG       = os.environ.get("SCRUBBER_FFMPEG", "ffmpeg")
+SCRUB_HEADER_TO    = _i("SCRUBBER_HEADER_TIMEOUT", 30)
+SCRUB_READ_TO      = _i("SCRUBBER_READ_TIMEOUT", 60)     # per-chunk read timeout (tier 2)
+SCRUB_SKIM_TO      = _i("SCRUBBER_SKIM_TIMEOUT", 120)    # per skim point timeout (tier 3)
+SCRUB_FULL_TO      = _i("SCRUBBER_FULL_TIMEOUT", 1800)   # full-decode timeout (tier 4)
+SCRUB_QUAR         = os.environ.get("SCRUBBER_QUARANTINE_DIR", os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine"))
+SCRUB_DEL_ARR      = _b("SCRUBBER_DELETE_ARR_FILE", True)  # DELETE arr movieFile/episodeFile so it re-searches; false = quarantine only
+SCRUB_EXTS         = tuple(x.strip().lower() for x in os.environ.get("SCRUBBER_EXTENSIONS", ".mkv,.mp4,.avi,.m4v,.ts").split(",") if x.strip())
+SCRUB_MIN_AGE      = _i("SCRUBBER_MIN_AGE_HOURS", 1)     # skip files newer than this (don't fight the warmer / fresh imports)
+SCRUB_REVERIFY_DAYS = _i("SCRUBBER_REVERIFY_DAYS", 30)   # re-check previously-OK files after N days (0=never)
 
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
@@ -619,8 +649,380 @@ def check_janitor():
         log.info("[janitor] quarantined %d dead-file symlink(s) across %d release(s) -> %s", moved, len(bad), qroot)
 
 # =========================================================================== #
-# CHECK: providers (radarr/sonarr/prowlarr indexers + download clients that errored -> Test)
+# CHECK: scrubber (proactive file integrity scan)
+#
+# Walks library paths and verifies each file isn't going to make Plex skip
+# mid-play. Most common failure mode on a usenet/decypharr stack: a file
+# imported clean but has dead NZB articles partway through (cached header
+# survived, mid-stream article rotted off retention) or slipped through with
+# availability_sample_percent<100. Plex hits the dead segment, the FUSE read
+# stalls, the family complains.
+#
+# Tiered, cheapest -> deepest. Default tier=2 (header + sampled chunks) catches
+# the article-missing failure mode cheaply through the FUSE mount without
+# restreaming whole files from Newshosting. Tier 3/4 only run on suspects
+# (when SCRUBBER_PROMOTE_ON_SUSPECT) or when explicitly enabled.
+#
+#   tier 1: ffprobe header               (~1s per file; catches torn containers)
+#   tier 2: + N sampled MB-sized chunks  (catches dead articles mid-file)
+#   tier 3: + ffmpeg -v error stream-skim at N seek points
+#                                        (catches packet/codec corruption)
+#   tier 4: + full ffmpeg -v error -f null - decode of the whole file (slow; opt-in)
+#
+# State (path -> last-known result keyed on size+mtime) is persisted, so
+# unchanged-OK files are skipped on subsequent sweeps - the scan is
+# incremental. STRIKES count consecutive bad reads so a transient mount blip
+# does not cost a re-grab. Confirmed BAD => quarantine the library symlink
+# (reversible manifest, same shape as the janitor) + DELETE the owning arr's
+# moviefile/episodefile with blocklist=true so the arr re-searches a clean
+# release.
 # =========================================================================== #
+
+_SCRUB_ARR_INDEX_CACHE = {"sweep": 0, "data": None}
+_SCRUB_SWEEP_COUNTER   = [0]
+
+def _scrub_load_state():
+    try:
+        return json.load(open(SCRUB_STATE))
+    except Exception:
+        return {"files": {}, "manifest_dir": None}
+
+def _scrub_save_state(s):
+    try:
+        os.makedirs(os.path.dirname(SCRUB_STATE) or ".", exist_ok=True)
+        json.dump(s, open(SCRUB_STATE, "w"))
+    except Exception as e:
+        log.debug("[scrubber] state save failed: %s", e)
+
+def _scrub_walk(paths):
+    """Yield (real_path_for_io, lib_symlink_path) for every video file under any of `paths`.
+    For symlinks we use the realpath for ffprobe/ffmpeg (so they read straight through the FUSE mount)
+    and remember the original symlink so we can quarantine it cleanly."""
+    seen = set()
+    for libp in paths:
+        try:
+            for root, _, files in os.walk(libp):
+                for fn in files:
+                    if not fn.lower().endswith(SCRUB_EXTS):
+                        continue
+                    fp = os.path.join(root, fn)
+                    try:
+                        rp = os.path.realpath(fp)
+                    except Exception:
+                        rp = fp
+                    if rp in seen:
+                        continue
+                    seen.add(rp)
+                    yield rp, fp
+        except Exception as e:
+            log.warning("[scrubber] walk %s failed: %s", libp, e)
+
+def _scrub_arr_index():
+    """Build {realpath: (arr, fileId, kind)} once per sweep across all sonarr/radarr instances.
+    kind = 'movie' for radarr, 'episode' for sonarr."""
+    sweep = _SCRUB_SWEEP_COUNTER[0]
+    if _SCRUB_ARR_INDEX_CACHE["sweep"] == sweep and _SCRUB_ARR_INDEX_CACHE["data"] is not None:
+        return _SCRUB_ARR_INDEX_CACHE["data"]
+    idx = {}
+    for arr in INSTANCES:
+        if arr.kind == "radarr":
+            try:
+                ms = json.load(arr._req("GET", "/movie"))
+                for m in ms:
+                    mf = m.get("movieFile") or {}
+                    p = mf.get("path")
+                    if p and mf.get("id"):
+                        idx[os.path.realpath(p)] = (arr, mf["id"], "movie")
+                log.debug("[scrubber] indexed %d radarr files from %s", sum(1 for v in idx.values() if v[0] is arr), arr.name)
+            except Exception as e:
+                log.warning("[scrubber] radarr index %s failed: %s", arr.name, str(e)[:80])
+        elif arr.kind == "sonarr":
+            try:
+                series = json.load(arr._req("GET", "/series"))
+                n0 = len(idx)
+                for s in series:
+                    sid = s.get("id")
+                    if not sid:
+                        continue
+                    try:
+                        efs = json.load(arr._req("GET", "/episodefile?seriesId=%d" % sid))
+                        for ef in efs:
+                            p = ef.get("path")
+                            if p and ef.get("id"):
+                                idx[os.path.realpath(p)] = (arr, ef["id"], "episode")
+                    except Exception:
+                        continue
+                log.debug("[scrubber] indexed %d sonarr files from %s", len(idx) - n0, arr.name)
+            except Exception as e:
+                log.warning("[scrubber] sonarr index %s failed: %s", arr.name, str(e)[:80])
+    _SCRUB_ARR_INDEX_CACHE["sweep"] = sweep
+    _SCRUB_ARR_INDEX_CACHE["data"]  = idx
+    return idx
+
+def _scrub_run(cmd, timeout):
+    """Run cmd with a hard timeout. Returns (rc, stderr_text). Empty stderr = clean."""
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           timeout=timeout)
+        return p.returncode, p.stderr.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        return 124, "TIMEOUT after %ds" % timeout
+    except FileNotFoundError as e:
+        return 127, "binary not found: %s" % e
+
+def _scrub_t1_header(path):
+    """Tier 1: ffprobe parses the container header. Returns (ok, detail)."""
+    cmd = [SCRUB_FFPROBE, "-v", "error", "-hide_banner",
+           "-show_entries", "format=duration,bit_rate",
+           "-of", "default=nw=1", path]
+    rc, err = _scrub_run(cmd, SCRUB_HEADER_TO)
+    if rc == 0 and not err.strip():
+        return True, ""
+    return False, ("ffprobe rc=%d %s" % (rc, err.strip()[:200])) or "header_fail"
+
+def _scrub_t2_samples(path):
+    """Tier 2: read N evenly-spaced chunks through the file. Catches mid-file dead segments
+    (NNTP article-missing) cheaply via the FUSE mount - decypharr will fault on an unreadable
+    segment within the read timeout."""
+    try:
+        size = os.path.getsize(path)
+    except Exception as e:
+        return False, "stat: %s" % e
+    if size < 4 * 1024 * 1024:
+        # too small for spaced sampling; one read of the whole file suffices
+        try:
+            with open(path, "rb") as fh:
+                fh.read(size)
+            return True, ""
+        except Exception as e:
+            return False, "small_read: %s" % str(e)[:120]
+    n = max(2, SCRUB_SAMPLES)
+    chunk = max(64 * 1024, SCRUB_SAMPLE_MB * 1024 * 1024)
+    # don't go past end; sample evenly across (size - chunk)
+    span = size - chunk
+    offsets = [int(span * i / (n - 1)) for i in range(n)]
+    result = {"ok": True, "err": "", "at": -1}
+    def _do():
+        try:
+            with open(path, "rb") as fh:
+                for i, off in enumerate(offsets):
+                    fh.seek(off)
+                    got = 0
+                    while got < chunk:
+                        b = fh.read(chunk - got)
+                        if not b:
+                            break
+                        got += len(b)
+                    if got < chunk and (off + chunk) < size:
+                        # short read mid-file = dead segment / mount drop
+                        result["ok"] = False
+                        result["err"] = "short_read got=%d want=%d at_offset=%d" % (got, chunk, off)
+                        result["at"]  = i
+                        return
+        except Exception as e:
+            result["ok"]  = False
+            result["err"] = "io: %s" % str(e)[:160]
+    th = threading.Thread(target=_do, daemon=True); th.start(); th.join(SCRUB_READ_TO)
+    if th.is_alive():
+        return False, "TIMEOUT after %ds (mount hang or dead article)" % SCRUB_READ_TO
+    return result["ok"], result["err"]
+
+def _scrub_t3_skim(path):
+    """Tier 3: decode SCRUB_SKIM_SECS at SCRUB_SKIM_POINTS seek points. Catches packet/codec
+    corruption that survives a plain read but explodes the decoder."""
+    cmd0 = [SCRUB_FFPROBE, "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1", path]
+    rc, err = _scrub_run(cmd0, SCRUB_HEADER_TO)
+    try:
+        dur = float(err.strip() or "0") if rc != 0 else 0.0
+    except Exception:
+        dur = 0.0
+    if dur <= 0:
+        # ffprobe stdout was captured into devnull above; re-run capturing stdout
+        try:
+            p = subprocess.run(cmd0, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=SCRUB_HEADER_TO)
+            dur = float((p.stdout or b"0").decode("utf-8", "replace").strip() or "0")
+        except Exception:
+            dur = 0.0
+    n = max(2, SCRUB_SKIM_POINTS)
+    sec = max(1, SCRUB_SKIM_SECS)
+    pts = [int(dur * i / (n + 1)) for i in range(1, n + 1)] if dur > 0 else [0]
+    for off in pts:
+        cmd = [SCRUB_FFMPEG, "-v", "error", "-hide_banner",
+               "-ss", str(off), "-t", str(sec),
+               "-i", path, "-f", "null", "-"]
+        rc, err = _scrub_run(cmd, SCRUB_SKIM_TO)
+        if rc != 0 or err.strip():
+            return False, "ffmpeg @%ds rc=%d %s" % (off, rc, (err or "").strip()[:200])
+    return True, ""
+
+def _scrub_t4_full(path):
+    """Tier 4: full -v error decode. Slow. Only used to final-confirm a BAD before action."""
+    cmd = [SCRUB_FFMPEG, "-v", "error", "-hide_banner", "-i", path, "-f", "null", "-"]
+    rc, err = _scrub_run(cmd, SCRUB_FULL_TO)
+    if rc != 0 or err.strip():
+        return False, "ffmpeg full rc=%d %s" % (rc, (err or "").strip()[:300])
+    return True, ""
+
+def _scrub_act_on_bad(real_path, lib_symlink, reason, state, manifest):
+    """Quarantine the library symlink + delete the owning arr's file with blocklist=true.
+    Mirrors the janitor's quarantine shape so 'undo' is the same drill."""
+    if DRY_RUN:
+        log.warning("[scrubber] WOULD quarantine + re-grab %s (%s)", lib_symlink, reason)
+        return False
+    qroot = state.get("manifest_dir") or os.path.join(SCRUB_QUAR, time.strftime("scrubber-%Y%m%d-%H%M%S"))
+    state["manifest_dir"] = qroot
+    try:
+        os.makedirs(qroot, exist_ok=True)
+    except Exception as e:
+        log.warning("[scrubber] cannot create quar dir %s: %s", qroot, e); return False
+    # 1) move the library symlink (preserve its target so an undo is just `mv` back)
+    moved = False
+    try:
+        if os.path.islink(lib_symlink):
+            tgt = os.readlink(lib_symlink)
+            dst = os.path.join(qroot, os.path.relpath(lib_symlink, "/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(tgt, dst)
+            os.unlink(lib_symlink)
+            moved = True
+        elif os.path.exists(lib_symlink):
+            # not a symlink (a flat file under the library) - move the file itself
+            dst = os.path.join(qroot, os.path.relpath(lib_symlink, "/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.rename(lib_symlink, dst)
+            moved = True
+    except Exception as e:
+        log.warning("[scrubber] quarantine %s failed: %s", lib_symlink, e)
+    # 2) ask the arr to delete the file record + blocklist so a different release is searched
+    arr_acted = False
+    if SCRUB_DEL_ARR:
+        idx = _scrub_arr_index()
+        ent = idx.get(real_path) or idx.get(os.path.realpath(lib_symlink))
+        if ent:
+            arr, file_id, kind = ent
+            path = "/moviefile/%d" % file_id if kind == "movie" else "/episodefile/%d" % file_id
+            try:
+                arr._req("DELETE", path)
+                arr_acted = True
+                log.warning("[scrubber] [%s:%s] deleted %s id=%d -> arr will re-search (%s)",
+                            arr.name, kind, kind+"File", file_id, reason)
+            except Exception as e:
+                log.warning("[scrubber] arr delete failed (%s id=%d): %s", kind, file_id, str(e)[:120])
+        else:
+            log.info("[scrubber] no arr record matched for %s (quarantine only)", real_path)
+    manifest.append({"real": real_path, "symlink": lib_symlink, "reason": reason,
+                     "moved": moved, "arr_acted": arr_acted, "ts": int(time.time())})
+    return moved or arr_acted
+
+def check_scrubber():
+    if not SCRUB_PATHS:
+        log.debug("[scrubber] no SCRUBBER_PATHS (or JANITOR_LIBRARY_PATHS) configured"); return
+    # plex-safe gate
+    load1 = host_load()
+    if SCRUB_LOAD_MAX > 0 and load1 > SCRUB_LOAD_MAX:
+        log.info("[scrubber] load %.1f > %.1f, skipping this sweep", load1, SCRUB_LOAD_MAX); return
+    state = _scrub_load_state()
+    files_state = state.setdefault("files", {})
+    _SCRUB_SWEEP_COUNTER[0] += 1
+    now = time.time()
+    reverify_after = SCRUB_REVERIFY_DAYS * 86400 if SCRUB_REVERIFY_DAYS > 0 else 0
+    # pick candidates: never-scanned OR changed (size/mtime) OR overdue for reverify OR previously suspect (strikes>0)
+    candidates = []
+    for real_path, lib_symlink in _scrub_walk(SCRUB_PATHS):
+        try:
+            st = os.stat(real_path)
+        except Exception:
+            continue
+        if (now - st.st_mtime) < SCRUB_MIN_AGE * 3600:
+            continue   # don't fight fresh imports / the warmer
+        rec = files_state.get(real_path) or {}
+        if rec.get("size") == st.st_size and rec.get("mtime") == int(st.st_mtime):
+            if rec.get("status") == "ok" and reverify_after > 0 and (now - rec.get("ts", 0)) < reverify_after:
+                continue
+            if rec.get("status") == "bad":
+                continue   # already actioned; will reappear as a new path once arr re-grabs
+        candidates.append((real_path, lib_symlink, st))
+        if len(candidates) >= SCRUB_MAX_FILES * 4:
+            break
+    # prefer never-scanned-or-suspect; sort by oldest-tested first so we cycle through evenly
+    candidates.sort(key=lambda t: files_state.get(t[0], {}).get("ts", 0))
+    candidates = candidates[:SCRUB_MAX_FILES]
+    if not candidates:
+        log.debug("[scrubber] nothing due (all cached-OK or below min-age)"); return
+    log.info("[scrubber] scanning %d file(s), tier=%d", len(candidates), SCRUB_TIER)
+    manifest = []
+    bad = 0; suspect = 0; ok_n = 0
+    for real_path, lib_symlink, st in candidates:
+        # re-check load mid-sweep; bail early if we've started crowding decypharr
+        if SCRUB_LOAD_MAX > 0 and host_load() > SCRUB_LOAD_MAX:
+            log.info("[scrubber] load climbed >%.1f, pausing mid-sweep", SCRUB_LOAD_MAX)
+            break
+        rec = files_state.setdefault(real_path, {})
+        # ----- tier 1 -----
+        ok, why = _scrub_t1_header(real_path)
+        cur_tier = 1
+        # ----- tier 2 -----
+        if ok and SCRUB_TIER >= 2:
+            ok, why = _scrub_t2_samples(real_path); cur_tier = 2
+        # ----- tier 3 (auto-promote on suspect, or explicit) -----
+        if (not ok and SCRUB_PROMOTE and SCRUB_TIER < 3) or (ok and SCRUB_TIER >= 3):
+            ok3, why3 = _scrub_t3_skim(real_path); cur_tier = 3
+            if ok and ok3:
+                ok, why = True, ""
+            elif not ok and not ok3:
+                ok, why = False, "tier2+3: %s | %s" % (why, why3)
+            elif not ok and ok3:
+                # samples saw a hiccup but stream skim was clean -> transient mount blip; not bad
+                ok, why = True, "tier2 hiccup ('%s') cleared by tier3 skim" % why[:80]
+            else:  # ok and not ok3
+                ok, why = False, "tier3 skim: %s" % why3
+        # ----- tier 4 (full decode) -----
+        if (not ok and SCRUB_FULL_ON_BAD) or (ok and SCRUB_TIER >= 4):
+            ok4, why4 = _scrub_t4_full(real_path); cur_tier = 4
+            if not ok and not ok4:
+                why = "tier3+4 BAD: %s" % why4
+            elif not ok and ok4:
+                ok, why = True, "tier<4 hiccup cleared by full decode"
+            elif ok and not ok4:
+                ok, why = False, "tier4 full: %s" % why4
+        # ----- record result -----
+        size = st.st_size; mtime = int(st.st_mtime)
+        prev_strikes = rec.get("strikes", 0)
+        if ok:
+            rec.update({"status": "ok", "size": size, "mtime": mtime, "ts": int(now),
+                        "tier": cur_tier, "strikes": 0})
+            ok_n += 1
+            log.debug("[scrubber] OK  t%d %s", cur_tier, real_path)
+        else:
+            strikes = prev_strikes + 1
+            rec.update({"status": "suspect" if strikes < SCRUB_STRIKES else "bad",
+                        "size": size, "mtime": mtime, "ts": int(now),
+                        "tier": cur_tier, "strikes": strikes, "why": why[:240]})
+            if strikes < SCRUB_STRIKES:
+                suspect += 1
+                log.warning("[scrubber] SUSPECT t%d (%d/%d) %s :: %s",
+                            cur_tier, strikes, SCRUB_STRIKES, real_path, why[:160])
+            else:
+                bad += 1
+                log.error("[scrubber] BAD t%d %s :: %s", cur_tier, real_path, why[:200])
+                _scrub_act_on_bad(real_path, lib_symlink, why, state, manifest)
+    # persist manifest snapshot for reversibility
+    if manifest and state.get("manifest_dir"):
+        try:
+            mf = os.path.join(state["manifest_dir"], "manifest.json")
+            existing = []
+            if os.path.exists(mf):
+                try: existing = json.load(open(mf))
+                except Exception: pass
+            json.dump(existing + manifest, open(mf, "w"), indent=1)
+        except Exception:
+            pass
+    _scrub_save_state(state)
+    log.info("[scrubber] done: %d ok, %d suspect, %d bad (action)", ok_n, suspect, bad)
+
+
 
 _PROVIDER_KEYWORDS = ("indexer", "download client", "applications unavailable", "applications are unavailable")
 
@@ -1118,6 +1520,7 @@ def _wr_plex_rescan():
 CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_providers),
           ("decypharr", EN_DECYPHARR, check_decypharr), ("plex", EN_PLEX, check_plex),
           ("resources", EN_RESOURCES, check_resources), ("janitor", EN_JANITOR, check_janitor),
+          ("scrubber", EN_SCRUBBER, check_scrubber),
           ("bazarr", EN_BAZARR, check_bazarr), ("seerr", EN_SEERR, check_seerr),
           ("westrepair", EN_WESTREPAIR, check_westrepair)]
 
@@ -1148,8 +1551,15 @@ UI_SCHEMA = [
     ("Mode", [("DOCTOR_MODE", "cron|event"), ("DOCTOR_INTERVAL", "900"),
               ("DOCTOR_DRY_RUN", "false"), ("DOCTOR_LOG_LEVEL", "INFO")]),
     ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
-              ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""),
+              ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""), ("ENABLE_SCRUBBER", ""),
               ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", "")]),
+    ("Scrubber (file integrity)", [
+              ("SCRUBBER_PATHS", "/mnt/library/movies,/mnt/library/movies-4k,/mnt/library/tv,/mnt/library/tv-4k"),
+              ("SCRUBBER_TIER", "2"), ("SCRUBBER_PROMOTE_ON_SUSPECT", "true"),
+              ("SCRUBBER_SAMPLE_COUNT", "8"), ("SCRUBBER_SAMPLE_MB", "1"),
+              ("SCRUBBER_MAX_FILES", "50"), ("SCRUBBER_CONCURRENCY", "1"),
+              ("SCRUBBER_LOAD_MAX", "12"), ("SCRUBBER_STRIKES", "2"),
+              ("SCRUBBER_REVERIFY_DAYS", "30"), ("SCRUBBER_DELETE_ARR_FILE", "true")]),
     ("Westrepair", [("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py"),
               ("WESTREPAIR_RUN_INTERVAL", "6h"), ("WESTREPAIR_REPAIR_INTERVAL", "1m")]),
     ("Queue / churn brake", [("DOCTOR_MIN_STRIKES", "2"), ("DOCTOR_MAX_ACTIONS", "20"), ("DOCTOR_BLOCKLIST", "true"),
