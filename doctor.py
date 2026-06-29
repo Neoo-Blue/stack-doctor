@@ -203,17 +203,23 @@ JAN_QUAR      = os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine")
 JAN_PATTERNS  = os.environ.get("JANITOR_DEAD_PATTERNS", "ARTICLE_NOT_FOUND,still missing").split(",")
 
 # scrubber (proactive file integrity scan)
-# Tiered, cheapest-first: 1=ffprobe header, 2=+sampled chunk reads, 3=+ffmpeg stream-skim at seek points,
-# 4=+full ffmpeg -v error decode. Default tier=2 is the sweet spot for usenet streaming (cheap reads via
-# the FUSE mount catch dead NZB articles without restreaming the whole file from Newshosting).
+# Tiered, cheapest-first:
+#   1 = ffprobe header parse           (catches torn containers, ~1s)
+#   2 = ffmpeg null-muxer skim at N seek points (catches mid-file dead NZB articles + packet corruption;
+#       ffmpeg blocks on FUSE cold-cache misses so it does NOT false-positive on uncached chunks the way
+#       raw byte reads do)
+#   3 = full ffmpeg -v error decode    (opt-in / used to final-confirm a tier-2 BAD before action)
+# Default tier=2 is the sweet spot for usenet/decypharr stacks.
 SCRUB_PATHS        = [p.strip() for p in os.environ.get("SCRUBBER_PATHS", os.environ.get("JANITOR_LIBRARY_PATHS", "")).split(",") if p.strip()]
 SCRUB_STATE        = os.environ.get("SCRUBBER_STATE_FILE", "/data/scrubber.json")
-SCRUB_TIER         = _i("SCRUBBER_TIER", 2)              # 1..4, see above
-SCRUB_PROMOTE      = _b("SCRUBBER_PROMOTE_ON_SUSPECT", True)  # auto-promote to next tier on suspect (verify cheap finding with a deeper read)
+# Default = 1 (ffprobe header only) because byte-level / ffmpeg-seek checks false-positive on
+# decypharr-style FUSE mounts that return EOF for uncached chunks. Tier 1 catches the truly torn
+# containers (the only failure mode we can verify reliably without a deeper decypharr-native API).
+# Tiers 2-3 stay available for libraries on local disk OR for opt-in slow-but-thorough scans;
+# they will misclassify cold-cache misses as bad on a stream-fetched library.
+SCRUB_TIER         = _i("SCRUBBER_TIER", 1)              # 1..3
 SCRUB_FULL_ON_BAD  = _b("SCRUBBER_FULL_DECODE_ON_BAD", False) # final-confirm a BAD with a full decode before quarantining (slow; off by default)
-SCRUB_SAMPLES      = _i("SCRUBBER_SAMPLE_COUNT", 8)      # evenly-spaced chunk reads (tier 2)
-SCRUB_SAMPLE_MB    = _i("SCRUBBER_SAMPLE_MB", 1)         # MB per chunk (tier 2)
-SCRUB_SKIM_POINTS  = _i("SCRUBBER_SKIM_POINTS", 4)       # seek points for tier 3 stream-skim
+SCRUB_SKIM_POINTS  = _i("SCRUBBER_SKIM_POINTS", 4)       # seek points for tier 2 ffmpeg skim
 SCRUB_SKIM_SECS    = _i("SCRUBBER_SKIM_SECS", 5)         # seconds decoded at each skim point
 SCRUB_MAX_FILES    = _i("SCRUBBER_MAX_FILES", 50)        # files scanned per sweep
 SCRUB_CONC         = _i("SCRUBBER_CONCURRENCY", 1)       # parallel scans (1 = single stream, kindest to decypharr)
@@ -222,9 +228,8 @@ SCRUB_STRIKES      = _i("SCRUBBER_STRIKES", 2)           # consecutive bad reads
 SCRUB_FFPROBE      = os.environ.get("SCRUBBER_FFPROBE", "ffprobe")
 SCRUB_FFMPEG       = os.environ.get("SCRUBBER_FFMPEG", "ffmpeg")
 SCRUB_HEADER_TO    = _i("SCRUBBER_HEADER_TIMEOUT", 30)
-SCRUB_READ_TO      = _i("SCRUBBER_READ_TIMEOUT", 60)     # per-chunk read timeout (tier 2)
-SCRUB_SKIM_TO      = _i("SCRUBBER_SKIM_TIMEOUT", 120)    # per skim point timeout (tier 3)
-SCRUB_FULL_TO      = _i("SCRUBBER_FULL_TIMEOUT", 1800)   # full-decode timeout (tier 4)
+SCRUB_SKIM_TO      = _i("SCRUBBER_SKIM_TIMEOUT", 180)    # per skim point timeout (tier 2)
+SCRUB_FULL_TO      = _i("SCRUBBER_FULL_TIMEOUT", 1800)   # full-decode timeout (tier 3)
 SCRUB_QUAR         = os.environ.get("SCRUBBER_QUARANTINE_DIR", os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine"))
 SCRUB_DEL_ARR      = _b("SCRUBBER_DELETE_ARR_FILE", True)  # DELETE arr movieFile/episodeFile so it re-searches; false = quarantine only
 SCRUB_EXTS         = tuple(x.strip().lower() for x in os.environ.get("SCRUBBER_EXTENSIONS", ".mkv,.mp4,.avi,.m4v,.ts").split(",") if x.strip())
@@ -780,85 +785,40 @@ def _scrub_t1_header(path):
         return True, ""
     return False, ("ffprobe rc=%d %s" % (rc, err.strip()[:200])) or "header_fail"
 
-def _scrub_t2_samples(path):
-    """Tier 2: read N evenly-spaced chunks through the file. Catches mid-file dead segments
-    (NNTP article-missing) cheaply via the FUSE mount - decypharr will fault on an unreadable
-    segment within the read timeout."""
+def _scrub_t2_skim(path):
+    """Tier 2: decode SCRUB_SKIM_SECS at SCRUB_SKIM_POINTS seek points with ffmpeg's null muxer.
+    This is the right primitive for a decypharr FUSE mount: ffmpeg BLOCKS waiting for FUSE I/O
+    until bytes arrive, so a cold-cache miss (the mount returns 0 bytes for an unfetched chunk)
+    doesn't false-positive the way raw byte reads do. A dead NZB article makes ffmpeg log a real
+    decode/demux error (or the timeout fires). Catches both 'mid-file dead segment' and
+    'packet/codec corruption' in one pass, at the cost of pulling ~SECS*bitrate bytes per seek
+    point (a few hundred MB per file at 1080p), all via the FUSE mount."""
+    # get duration; ffprobe with stderr=error never prints it to stderr -> capture stdout
     try:
-        size = os.path.getsize(path)
-    except Exception as e:
-        return False, "stat: %s" % e
-    if size < 4 * 1024 * 1024:
-        # too small for spaced sampling; one read of the whole file suffices
-        try:
-            with open(path, "rb") as fh:
-                fh.read(size)
-            return True, ""
-        except Exception as e:
-            return False, "small_read: %s" % str(e)[:120]
-    n = max(2, SCRUB_SAMPLES)
-    chunk = max(64 * 1024, SCRUB_SAMPLE_MB * 1024 * 1024)
-    # don't go past end; sample evenly across (size - chunk)
-    span = size - chunk
-    offsets = [int(span * i / (n - 1)) for i in range(n)]
-    result = {"ok": True, "err": "", "at": -1}
-    def _do():
-        try:
-            with open(path, "rb") as fh:
-                for i, off in enumerate(offsets):
-                    fh.seek(off)
-                    got = 0
-                    while got < chunk:
-                        b = fh.read(chunk - got)
-                        if not b:
-                            break
-                        got += len(b)
-                    if got < chunk and (off + chunk) < size:
-                        # short read mid-file = dead segment / mount drop
-                        result["ok"] = False
-                        result["err"] = "short_read got=%d want=%d at_offset=%d" % (got, chunk, off)
-                        result["at"]  = i
-                        return
-        except Exception as e:
-            result["ok"]  = False
-            result["err"] = "io: %s" % str(e)[:160]
-    th = threading.Thread(target=_do, daemon=True); th.start(); th.join(SCRUB_READ_TO)
-    if th.is_alive():
-        return False, "TIMEOUT after %ds (mount hang or dead article)" % SCRUB_READ_TO
-    return result["ok"], result["err"]
-
-def _scrub_t3_skim(path):
-    """Tier 3: decode SCRUB_SKIM_SECS at SCRUB_SKIM_POINTS seek points. Catches packet/codec
-    corruption that survives a plain read but explodes the decoder."""
-    cmd0 = [SCRUB_FFPROBE, "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=nw=1:nk=1", path]
-    rc, err = _scrub_run(cmd0, SCRUB_HEADER_TO)
-    try:
-        dur = float(err.strip() or "0") if rc != 0 else 0.0
+        p = subprocess.run([SCRUB_FFPROBE, "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=nw=1:nk=1", path],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=SCRUB_HEADER_TO)
+        dur = float((p.stdout or b"0").decode("utf-8", "replace").strip() or "0")
     except Exception:
         dur = 0.0
-    if dur <= 0:
-        # ffprobe stdout was captured into devnull above; re-run capturing stdout
-        try:
-            p = subprocess.run(cmd0, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               timeout=SCRUB_HEADER_TO)
-            dur = float((p.stdout or b"0").decode("utf-8", "replace").strip() or "0")
-        except Exception:
-            dur = 0.0
     n = max(2, SCRUB_SKIM_POINTS)
     sec = max(1, SCRUB_SKIM_SECS)
     pts = [int(dur * i / (n + 1)) for i in range(1, n + 1)] if dur > 0 else [0]
     for off in pts:
+        # decode video-only (skip audio) to keep bandwidth modest; if a corrupt audio packet
+        # is what actually skips Plex playback ffmpeg still surfaces the demux error.
         cmd = [SCRUB_FFMPEG, "-v", "error", "-hide_banner",
                "-ss", str(off), "-t", str(sec),
-               "-i", path, "-f", "null", "-"]
+               "-i", path, "-map", "0:v:0", "-f", "null", "-"]
         rc, err = _scrub_run(cmd, SCRUB_SKIM_TO)
         if rc != 0 or err.strip():
             return False, "ffmpeg @%ds rc=%d %s" % (off, rc, (err or "").strip()[:200])
     return True, ""
 
-def _scrub_t4_full(path):
-    """Tier 4: full -v error decode. Slow. Only used to final-confirm a BAD before action."""
+def _scrub_t3_full(path):
+    """Tier 3: full -v error decode of the whole file. Slow. Opt-in or used as final-confirm
+    before action when SCRUBBER_FULL_DECODE_ON_BAD is set."""
     cmd = [SCRUB_FFMPEG, "-v", "error", "-hide_banner", "-i", path, "-f", "null", "-"]
     rc, err = _scrub_run(cmd, SCRUB_FULL_TO)
     if rc != 0 or err.strip():
@@ -960,33 +920,21 @@ def check_scrubber():
             log.info("[scrubber] load climbed >%.1f, pausing mid-sweep", SCRUB_LOAD_MAX)
             break
         rec = files_state.setdefault(real_path, {})
-        # ----- tier 1 -----
+        # ----- tier 1: ffprobe header -----
         ok, why = _scrub_t1_header(real_path)
         cur_tier = 1
-        # ----- tier 2 -----
+        # ----- tier 2: ffmpeg skim at N seek points (FUSE-safe; blocks on cold chunks) -----
         if ok and SCRUB_TIER >= 2:
-            ok, why = _scrub_t2_samples(real_path); cur_tier = 2
-        # ----- tier 3 (auto-promote on suspect, or explicit) -----
-        if (not ok and SCRUB_PROMOTE and SCRUB_TIER < 3) or (ok and SCRUB_TIER >= 3):
-            ok3, why3 = _scrub_t3_skim(real_path); cur_tier = 3
-            if ok and ok3:
-                ok, why = True, ""
-            elif not ok and not ok3:
-                ok, why = False, "tier2+3: %s | %s" % (why, why3)
+            ok, why = _scrub_t2_skim(real_path); cur_tier = 2
+        # ----- tier 3: full ffmpeg decode (opt-in, or used to final-confirm a tier-2 BAD) -----
+        if (not ok and SCRUB_FULL_ON_BAD) or (ok and SCRUB_TIER >= 3):
+            ok3, why3 = _scrub_t3_full(real_path); cur_tier = 3
+            if not ok and not ok3:
+                why = "tier2+3 BAD: %s | %s" % (why, why3)
             elif not ok and ok3:
-                # samples saw a hiccup but stream skim was clean -> transient mount blip; not bad
-                ok, why = True, "tier2 hiccup ('%s') cleared by tier3 skim" % why[:80]
-            else:  # ok and not ok3
-                ok, why = False, "tier3 skim: %s" % why3
-        # ----- tier 4 (full decode) -----
-        if (not ok and SCRUB_FULL_ON_BAD) or (ok and SCRUB_TIER >= 4):
-            ok4, why4 = _scrub_t4_full(real_path); cur_tier = 4
-            if not ok and not ok4:
-                why = "tier3+4 BAD: %s" % why4
-            elif not ok and ok4:
-                ok, why = True, "tier<4 hiccup cleared by full decode"
-            elif ok and not ok4:
-                ok, why = False, "tier4 full: %s" % why4
+                ok, why = True, "tier2 hiccup cleared by full decode"
+            elif ok and not ok3:
+                ok, why = False, "tier3 full: %s" % why3
         # ----- record result -----
         size = st.st_size; mtime = int(st.st_mtime)
         prev_strikes = rec.get("strikes", 0)
@@ -1555,8 +1503,8 @@ UI_SCHEMA = [
               ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", "")]),
     ("Scrubber (file integrity)", [
               ("SCRUBBER_PATHS", "/mnt/library/movies,/mnt/library/movies-4k,/mnt/library/tv,/mnt/library/tv-4k"),
-              ("SCRUBBER_TIER", "2"), ("SCRUBBER_PROMOTE_ON_SUSPECT", "true"),
-              ("SCRUBBER_SAMPLE_COUNT", "8"), ("SCRUBBER_SAMPLE_MB", "1"),
+              ("SCRUBBER_TIER", "2"), ("SCRUBBER_FULL_DECODE_ON_BAD", "false"),
+              ("SCRUBBER_SKIM_POINTS", "4"), ("SCRUBBER_SKIM_SECS", "5"),
               ("SCRUBBER_MAX_FILES", "50"), ("SCRUBBER_CONCURRENCY", "1"),
               ("SCRUBBER_LOAD_MAX", "12"), ("SCRUBBER_STRIKES", "2"),
               ("SCRUBBER_REVERIFY_DAYS", "30"), ("SCRUBBER_DELETE_ARR_FILE", "true")]),

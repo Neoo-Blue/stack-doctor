@@ -330,21 +330,34 @@ actually tried to read through it and decypharr has logged the failure. By then 
 already saw "skip" or "buffering forever". The **scrubber** is the proactive counterpart, it
 walks the library and verifies each file before anyone hits a bad spot.
 
-It is **tiered**, cheapest-first, so it can run continuously without crushing decypharr/Newshosting:
+It is **tiered**, cheapest-first:
 
 | tier | what it does | what it catches | cost |
 |---|---|---|---|
-| 1 | `ffprobe` parses the container header | torn / incomplete containers | ~1 s |
-| 2 | + reads N evenly-spaced ~1 MB chunks through the FUSE mount | **mid-file dead NZB articles** (decypharr raises an I/O error or the read times out) | ~`SAMPLE_COUNT × SAMPLE_MB` of NZB traffic |
-| 3 | + `ffmpeg -v error` decodes a few seconds at N seek points | packet / codec corruption that survives a plain read | ~`SKIM_POINTS × SKIM_SECS` of decode |
-| 4 | + full `ffmpeg -v error -f null -` decode of the whole file | anything tiers 1-3 missed | slow (whole file restreamed); **opt-in** |
+| 1 *(default)* | `ffprobe` parses the container header | **torn / incomplete containers** (the only failure mode that can be verified reliably without false positives on a stream-fetched library) | ~1 s |
+| 2 *(opt-in)* | + `ffmpeg -v error` decodes a few seconds at N seek points (via `-map 0:v:0 -f null -`) | mid-file dead NZB articles + packet/codec corruption | ~`SKIM_POINTS × SKIM_SECS × bitrate` (a few hundred MB per file at 1080p) |
+| 3 *(opt-in)* | + full `ffmpeg -v error -f null -` decode of the whole file | anything tier-2 missed | slow (whole file restreamed) |
 
-Default = **tier 2**. With `SCRUBBER_PROMOTE_ON_SUSPECT=true` (default) a tier-2 hit is
-auto-verified by a tier-3 skim before action, so a transient FUSE blip is not enough to lose
-a working file. A confirmed **bad** result quarantines the library symlink (reversible
-manifest under `SCRUBBER_QUARANTINE_DIR`, same shape as the janitor's) and **deletes the owning
-arr's `moviefile`/`episodefile` with `blocklist=true`** — the arr then re-searches and grabs
-a clean release on its own.
+**Why tier 1 is the default**: on a decypharr / rclone / zurg style FUSE mount the kernel
+sees a regular file, but reads of uncached chunks return EOF (or 0 bytes) instead of blocking
+to fetch them, and the actual fetch time varies wildly (1 s to 60 s+). Both raw byte
+sampling and `ffmpeg -ss` skimming false-positive on cold chunks in that environment —
+flagging healthy files as having dead segments. Tier 1 only reads the header (always cached
+or trivially fetchable) so it's the only check that cannot be tricked by cold-cache
+behavior. Tiers 2 and 3 stay available for libraries on local disk, or as opt-in slow scans
+where you accept some false-positive risk in return for catching mid-file rot.
+
+The complementary reactive piece on this stack is the [**janitor** check](#checks-toggle-each-with-enable_)
+which tails decypharr's log for `ARTICLE_NOT_FOUND` / "still missing" errors and quarantines
+the affected library symlinks once Plex (or anything else) has actually attempted the read.
+Together, **tier-1 scrubber + janitor** covers torn containers proactively and confirmed
+dead segments reactively.
+
+A confirmed **bad** result quarantines the library symlink (reversible manifest under
+`SCRUBBER_QUARANTINE_DIR`, same shape as the janitor's) and **deletes the owning arr's
+`moviefile`/`episodefile` with `blocklist=true`** — the arr then re-searches and grabs a
+clean release on its own. With `SCRUBBER_FULL_DECODE_ON_BAD=true`, a tier-2 BAD is verified
+by a full decode before action.
 
 State (`SCRUBBER_STATE_FILE`) caches `(path, size, mtime) -> result`, so the scan is
 **incremental**: once a file is OK, it is not re-checked until it changes (or until
@@ -356,13 +369,10 @@ State (`SCRUBBER_STATE_FILE`) caches `(path, size, mtime) -> result`, so the sca
 |---|---|---|
 | `ENABLE_SCRUBBER` | `false` | turn on the scrubber check |
 | `SCRUBBER_PATHS` | (falls back to `JANITOR_LIBRARY_PATHS`) | comma list of library roots to walk |
-| `SCRUBBER_TIER` | `2` | maximum tier to apply to every file (suspects can still promote one level past this when `SCRUBBER_PROMOTE_ON_SUSPECT=true`) |
-| `SCRUBBER_PROMOTE_ON_SUSPECT` | `true` | auto-verify a tier-N hit with a tier-(N+1) read before acting |
-| `SCRUBBER_FULL_DECODE_ON_BAD` | `false` | final-confirm a BAD with a full ffmpeg decode (slow; off by default) |
-| `SCRUBBER_SAMPLE_COUNT` | `8` | tier 2: evenly-spaced chunk reads per file |
-| `SCRUBBER_SAMPLE_MB` | `1` | tier 2: MB per chunk |
-| `SCRUBBER_SKIM_POINTS` | `4` | tier 3: seek points |
-| `SCRUBBER_SKIM_SECS` | `5` | tier 3: seconds decoded at each point |
+| `SCRUBBER_TIER` | `1` | maximum tier to apply (1 = header only, 2 = +ffmpeg skim, 3 = +full decode). Default tier 1 is the only one safe on a decypharr / rclone / zurg FUSE mount — see Scrubber section above. |
+| `SCRUBBER_FULL_DECODE_ON_BAD` | `false` | final-confirm a tier-2 BAD with a full ffmpeg decode before action (slow; off by default) |
+| `SCRUBBER_SKIM_POINTS` | `4` | tier 2: seek points across the duration |
+| `SCRUBBER_SKIM_SECS` | `5` | tier 2: seconds decoded at each point |
 | `SCRUBBER_MAX_FILES` | `50` | files scanned per sweep (rate limit) |
 | `SCRUBBER_CONCURRENCY` | `1` | parallel scans (1 = kindest to decypharr) |
 | `SCRUBBER_LOAD_MAX` | `12` | skip sweep if 1-min host load is above this (0 = off) |
@@ -374,9 +384,8 @@ State (`SCRUBBER_STATE_FILE`) caches `(path, size, mtime) -> result`, so the sca
 | `SCRUBBER_MIN_AGE_HOURS` | `1` | skip files newer than this (don't fight the warmer / fresh imports) |
 | `SCRUBBER_REVERIFY_DAYS` | `30` | re-check previously-OK files after N days; usenet retention rots (`0` = never re-check) |
 | `SCRUBBER_HEADER_TIMEOUT` | `30` | per-file ffprobe timeout (tier 1) |
-| `SCRUBBER_READ_TIMEOUT` | `60` | per-chunk read timeout (tier 2) |
-| `SCRUBBER_SKIM_TIMEOUT` | `120` | per-skim-point ffmpeg timeout (tier 3) |
-| `SCRUBBER_FULL_TIMEOUT` | `1800` | full-decode timeout (tier 4) |
+| `SCRUBBER_SKIM_TIMEOUT` | `180` | per-skim-point ffmpeg timeout (tier 2) |
+| `SCRUBBER_FULL_TIMEOUT` | `1800` | full-decode timeout (tier 3) |
 | `SCRUBBER_FFPROBE` / `SCRUBBER_FFMPEG` | `ffprobe` / `ffmpeg` | binaries (override to use a sandboxed build) |
 
 The scrubber needs **direct read access** to the library, so it is best run as a **host
