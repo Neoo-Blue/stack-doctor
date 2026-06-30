@@ -117,6 +117,7 @@ EN_HOLIDAYS   = _b("ENABLE_HOLIDAYS", False)    # auto-build + pin pre-holiday t
 EN_BACKLOG    = _b("ENABLE_BACKLOG", False)     # trickle-search monitored-but-missing items that no backlog search ever found
 EN_RIVEN      = _b("ENABLE_RIVEN", False)       # Riven (rivenmedia/riven): health + services watch, retry stuck/missing items
 EN_MEDIASTORM = _b("ENABLE_MEDIASTORM", False)  # mediastorm (godver3/mediastorm): up/health watch (no import queue to manage)
+EN_SCOUT      = _b("ENABLE_SCOUT", True)        # dashboard Scout tab: search a title -> Get -> watch it acquire -> play in Plex (uses whatever backend is enabled)
 
 # westrepair config
 WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
@@ -338,6 +339,20 @@ RIVEN_STATE        = os.environ.get("RIVEN_STATE_FILE", "/data/riven.json")
 # mediastorm (godver3/mediastorm): Go streaming server. Architecturally it has no Sonarr-style import
 # queue or monitored-missing list, so there is nothing to drain/retry - we only watch that it is up.
 MEDIASTORM_TIMEOUT = _i("MEDIASTORM_TIMEOUT", 8)                     # per-probe HTTP timeout for /health
+
+# scout: a request-and-watch acquire frontend on the dashboard. You search a title, pick a result,
+# hit Get; scout adds it to whatever acquisition backend is enabled (Sonarr/Radarr if present, else
+# Riven) with search-on-add, then the tab polls the backend and shows it move searching -> downloading
+# -> importing -> verifying -> available, ending in a deep link that plays it in Plex. Search + status
+# are read-only; only Get writes, and Get honors DOCTOR_DRY_RUN (logs a would-add, submits nothing).
+SCOUT_MOVIE_INSTANCE = os.environ.get("SCOUT_MOVIE_INSTANCE", "")    # which radarr name to acquire movies through (blank = first radarr)
+SCOUT_SHOW_INSTANCE  = os.environ.get("SCOUT_SHOW_INSTANCE", "")     # which sonarr name to acquire shows through (blank = first sonarr)
+SCOUT_QUALITY_PROFILE = os.environ.get("SCOUT_QUALITY_PROFILE", "")  # quality profile name or id to add with (blank = the instance's first profile)
+SCOUT_ROOT_FOLDER    = os.environ.get("SCOUT_ROOT_FOLDER", "")       # root folder path to add into (blank = the instance's first root folder)
+SCOUT_MAX_RESULTS    = _i("SCOUT_MAX_RESULTS", 20)                   # cap on search results returned to the UI
+SCOUT_RETAIN         = _i("SCOUT_RETAIN", 40)                       # how many recent requests the activity feed keeps
+SCOUT_TTL_HOURS      = _i("SCOUT_TTL_HOURS", 48)                    # drop a finished (available) request from the feed after this long
+SCOUT_STATE          = os.environ.get("SCOUT_STATE_FILE", "/data/scout.json")
 
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
@@ -2888,6 +2903,344 @@ def _ui_westrepair():
     s["enabled"] = EN_WESTREPAIR
     return s
 
+# --------------------------------------------------------------------------- #
+# scout: request-and-watch acquire frontend (search -> Get -> track -> play in Plex)
+# --------------------------------------------------------------------------- #
+_scout_lock = threading.Lock()
+_scout_pcache = {}
+_scout_rcache = {}
+_plex_mid = [None]
+_RIVEN_STAGE = {"Requested": "searching", "Indexed": "searching", "Unreleased": "searching",
+                "Ongoing": "searching", "Scraped": "grabbed", "Downloaded": "downloading",
+                "Symlinked": "verifying", "PartiallyCompleted": "verifying",
+                "Completed": "available", "Failed": "no source", "Paused": "no source"}
+
+def _scout_load():
+    try: return json.load(open(SCOUT_STATE))
+    except Exception: return {"reqs": {}}
+
+def _scout_save(s):
+    try:
+        os.makedirs(os.path.dirname(SCOUT_STATE) or ".", exist_ok=True)
+        json.dump(s, open(SCOUT_STATE, "w"))
+    except Exception as e:
+        log.debug("[scout] state save failed: %s", e)
+
+def _scout_mode():
+    if any(a.kind in ("sonarr", "radarr") for a in INSTANCES): return "arr"
+    if RIVENS: return "riven"
+    return "none"
+
+def _scout_arr(kind):
+    target = "radarr" if kind == "movie" else "sonarr"
+    want = SCOUT_MOVIE_INSTANCE if kind == "movie" else SCOUT_SHOW_INSTANCE
+    cands = [a for a in INSTANCES if a.kind == target]
+    if not cands: return None
+    if want:
+        for a in cands:
+            if a.name == want: return a
+    return cands[0]
+
+def _scout_meta():
+    mode = _scout_mode()
+    label = {"arr": "Sonarr / Radarr", "riven": "Riven", "none": "no acquisition backend"}[mode]
+    caps = {"movie": bool(_scout_arr("movie")) if mode == "arr" else (mode == "riven"),
+            "show":  bool(_scout_arr("show"))  if mode == "arr" else (mode == "riven")}
+    return {"enabled": EN_SCOUT, "available": EN_SCOUT and mode != "none", "mode": mode,
+            "backend": label, "caps": caps, "dry_run": DRY_RUN, "plex": bool(PLEX_URL)}
+
+def _scout_profile(arr):
+    if arr.name in _scout_pcache: return _scout_pcache[arr.name]
+    pid, profs = None, (arr.get_json("/qualityprofile") or [])
+    if SCOUT_QUALITY_PROFILE:
+        for p in profs:
+            if str(p.get("id")) == SCOUT_QUALITY_PROFILE or (p.get("name", "").lower() == SCOUT_QUALITY_PROFILE.lower()):
+                pid = p.get("id"); break
+    if pid is None and profs: pid = profs[0].get("id")
+    _scout_pcache[arr.name] = pid
+    return pid
+
+def _scout_root(arr):
+    if arr.name in _scout_rcache: return _scout_rcache[arr.name]
+    root, rfs = "", (arr.get_json("/rootfolder") or [])
+    if SCOUT_ROOT_FOLDER:
+        root = SCOUT_ROOT_FOLDER
+    elif rfs:
+        root = rfs[0].get("path", "")
+    _scout_rcache[arr.name] = root
+    return root
+
+def _scout_norm_arr(it, kind, arr):
+    poster = ""
+    for im in (it.get("images") or []):
+        if im.get("coverType") == "poster":
+            poster = im.get("remoteUrl") or im.get("url") or ""; break
+    hasfile = bool(it.get("hasFile")) if kind == "movie" else ((it.get("statistics") or {}).get("episodeFileCount", 0) > 0)
+    key = it.get("tmdbId") or it.get("tvdbId") or it.get("imdbId") or it.get("title")
+    return {"uid": kind + ":" + str(key), "kind": kind, "title": it.get("title") or "?",
+            "year": it.get("year") or "", "overview": (it.get("overview") or "")[:240], "poster": poster,
+            "tmdbId": it.get("tmdbId"), "tvdbId": it.get("tvdbId"), "imdbId": it.get("imdbId") or "",
+            "arr": arr.name, "inLibrary": bool(it.get("id")), "hasFile": hasfile, "arr_id": it.get("id") or 0}
+
+def _scout_search(qstr, kind):
+    qstr = (qstr or "").strip()
+    mode = _scout_mode()
+    if not qstr or not EN_SCOUT or mode == "none":
+        return {"mode": mode, "results": []}
+    res = []
+    if mode == "arr":
+        kinds = ["movie", "show"] if kind in ("both", "", None) else [kind]
+        for k in kinds:
+            arr = _scout_arr(k)
+            if not arr: continue
+            path = ("/movie/lookup?term=" if k == "movie" else "/series/lookup?term=") + urllib.parse.quote(qstr)
+            for it in (arr.get_json(path, t=20) or []):
+                res.append(_scout_norm_arr(it, k, arr))
+                if len(res) >= SCOUT_MAX_RESULTS * 2: break
+    elif mode == "riven":
+        m = re.match(r"(tt\d{6,9})", qstr)
+        if m:
+            res.append({"uid": "movie:" + m.group(1), "kind": "movie", "title": qstr, "year": "",
+                        "overview": "Add by IMDb id via Riven", "poster": "", "tmdbId": None, "tvdbId": None,
+                        "imdbId": m.group(1), "arr": "", "inLibrary": False, "hasFile": False, "arr_id": 0})
+    seen, out = set(), []
+    for r in res:
+        if r["uid"] in seen: continue
+        seen.add(r["uid"]); out.append(r)
+    return {"mode": mode, "results": out[:SCOUT_MAX_RESULTS]}
+
+def _scout_add_movie(arr, req):
+    prof, root = _scout_profile(arr), _scout_root(arr)
+    if prof is None or not root: return None, "no quality profile / root folder on %s" % arr.name
+    payload = {"title": req["title"], "tmdbId": req.get("tmdbId"), "year": req.get("year") or 0,
+               "qualityProfileId": prof, "rootFolderPath": root, "monitored": True,
+               "minimumAvailability": "released", "addOptions": {"searchForMovie": True}}
+    try:
+        return json.load(arr._req("POST", "/movie", data=json.dumps(payload).encode(), t=40)).get("id"), None
+    except urllib.error.HTTPError as e:
+        try: msg = json.loads(e.read())
+        except Exception: msg = e.reason
+        return None, "radarr add %s: %s" % (e.code, str(msg)[:140])
+    except Exception as ex:
+        return None, str(ex)[:140]
+
+def _scout_add_show(arr, req):
+    prof, root = _scout_profile(arr), _scout_root(arr)
+    if prof is None or not root: return None, "no quality profile / root folder on %s" % arr.name
+    payload = {"title": req["title"], "tvdbId": req.get("tvdbId"), "qualityProfileId": prof,
+               "rootFolderPath": root, "monitored": True, "seasonFolder": True,
+               "addOptions": {"searchForMissingEpisodes": True, "monitor": "all"}}
+    try:
+        return json.load(arr._req("POST", "/series", data=json.dumps(payload).encode(), t=40)).get("id"), None
+    except urllib.error.HTTPError as e:
+        try: msg = json.loads(e.read())
+        except Exception: msg = e.reason
+        return None, "sonarr add %s: %s" % (e.code, str(msg)[:140])
+    except Exception as ex:
+        return None, str(ex)[:140]
+
+def _scout_store(req):
+    with _scout_lock:
+        s = _scout_load(); reqs = s.setdefault("reqs", {}); reqs[req["id"]] = req
+        if len(reqs) > SCOUT_RETAIN * 2:
+            for k in sorted(reqs, key=lambda k: reqs[k].get("created", 0))[:len(reqs) - SCOUT_RETAIN * 2]:
+                reqs.pop(k, None)
+        _scout_save(s)
+
+def _scout_get(body):
+    try: p = json.loads(body or b"{}")
+    except Exception: return False, {"error": "bad request"}
+    if not EN_SCOUT: return False, {"error": "scout disabled"}
+    kind = p.get("kind") or "movie"
+    mode = _scout_mode()
+    rid = "%s-%s-%d" % (kind, (p.get("tmdbId") or p.get("tvdbId") or p.get("imdbId") or "x"), int(time.time()))
+    req = {"id": rid, "kind": kind, "title": p.get("title") or "?", "year": p.get("year") or "",
+           "imdbId": p.get("imdbId") or "", "tmdbId": p.get("tmdbId"), "tvdbId": p.get("tvdbId"),
+           "backend": mode, "created": time.time(), "stage": "queued", "play": "", "detail": ""}
+    if DRY_RUN:
+        req["stage"] = "dry-run"; req["detail"] = "DRY_RUN: nothing submitted"
+        _scout_store(req); log.info("[scout] DRY_RUN would acquire %s (%s)", req["title"], kind)
+        return True, {"id": rid, "stage": "dry-run"}
+    if mode == "arr":
+        arr = _scout_arr(kind)
+        if not arr: return False, {"error": "no %s instance" % ("radarr" if kind == "movie" else "sonarr")}
+        req["arr"] = arr.name
+        arr_id = int(p.get("arr_id") or 0)
+        if arr_id > 0:
+            req["target_id"] = arr_id
+            if not p.get("hasFile"):
+                arr.command({"name": "MoviesSearch", "movieIds": [arr_id]} if kind == "movie"
+                            else {"name": "SeriesSearch", "seriesId": arr_id})
+        else:
+            nid, err = (_scout_add_movie(arr, req) if kind == "movie" else _scout_add_show(arr, req))
+            if err: log.warning("[scout] add failed: %s", err); return False, {"error": err}
+            req["target_id"] = nid
+        req["stage"] = "searching"; _scout_store(req)
+        log.info("[scout] acquiring %s (%s) via %s id=%s", req["title"], kind, arr.name, req.get("target_id"))
+        return True, {"id": rid, "stage": "searching"}
+    if mode == "riven":
+        if not RIVENS: return False, {"error": "no riven instance"}
+        if not req["imdbId"]: return False, {"error": "riven needs an imdb id"}
+        rv = RIVENS[0]
+        try: rv._req("POST", "/items?imdb_ids=" + urllib.parse.quote(req["imdbId"]), t=30)
+        except Exception as e: return False, {"error": str(e)[:120]}
+        req["riven"] = rv.name; req["stage"] = "searching"; _scout_store(req)
+        log.info("[scout] acquiring %s via Riven (%s)", req["title"], req["imdbId"])
+        return True, {"id": rid, "stage": "searching"}
+    return False, {"error": "no acquisition backend enabled"}
+
+def _scout_clear(body):
+    try: p = json.loads(body or b"{}")
+    except Exception: p = {}
+    with _scout_lock:
+        s = _scout_load()
+        if p.get("id"): s.get("reqs", {}).pop(p["id"], None)
+        else: s["reqs"] = {}
+        _scout_save(s)
+    return True
+
+def _scout_queue_rec(arr, field, tid):
+    for r in (arr.queue() or []):
+        if r.get(field) == tid: return r
+    return None
+
+def _scout_stage_from_rec(rec):
+    status = (rec.get("status") or "").lower()
+    tds = (rec.get("trackedDownloadState") or "").lower()
+    size, left = rec.get("size") or 0, rec.get("sizeleft")
+    pct = None
+    if size and left is not None:
+        try: pct = max(0, min(100, int(100 * (size - float(left)) / size)))
+        except Exception: pct = None
+    if tds in ("importpending", "importing") or status == "completed":
+        return "importing", {"pct": 100}
+    return "downloading", {"pct": pct}
+
+def _scout_search_or_timeout(req):
+    if time.time() - req.get("created", 0) < 900:
+        return "searching", {}
+    return "no source", {"detail": "no release found yet"}
+
+def _scout_riven_item(rv, imdb):
+    if not imdb: return None
+    try:
+        d = json.load(rv._req("GET", "/items?limit=200&page=1&sort=date_desc&type=movie&type=show", t=15))
+        for it in (d.get("items") or []):
+            if str(it.get("imdb_id") or "") == imdb: return it
+    except Exception: pass
+    return None
+
+def _plex_json(path, t=8):
+    if not PLEX_URL: return None
+    hdr = {"Accept": "application/json"}
+    if PLEX_TOKEN: hdr["X-Plex-Token"] = PLEX_TOKEN
+    try:
+        return json.load(urllib.request.urlopen(urllib.request.Request(PLEX_URL.rstrip("/") + path, headers=hdr), timeout=t))
+    except Exception as e:
+        log.debug("[scout] plex %s err %s", path, str(e)[:60]); return None
+
+def _plex_machine_id():
+    if _plex_mid[0] is not None: return _plex_mid[0]
+    d = _plex_json("/")
+    _plex_mid[0] = (d or {}).get("MediaContainer", {}).get("machineIdentifier", "") or ""
+    return _plex_mid[0]
+
+def _plex_collect(d):
+    items, mc = [], (d or {}).get("MediaContainer", {})
+    if mc.get("Metadata"): items += mc["Metadata"]
+    for hub in (mc.get("Hub") or []):
+        if hub.get("Metadata"): items += hub["Metadata"]
+    return items
+
+def _guid_match(it, imdb, tmdb, tvdb):
+    ids = set()
+    for g in (it.get("Guid") or []):
+        gid = g.get("id") if isinstance(g, dict) else str(g)
+        if gid: ids.add(gid)
+    return bool((imdb and "imdb://%s" % imdb in ids) or (tmdb and "tmdb://%s" % tmdb in ids) or (tvdb and "tvdb://%s" % tvdb in ids))
+
+def _plex_resolve(title, year, imdb, tmdb, tvdb, kind):
+    mid = _plex_machine_id()
+    if not mid: return ""
+    items = _plex_collect(_plex_json("/search?query=" + urllib.parse.quote(title or "") + "&limit=30"))
+    want = "movie" if kind == "movie" else "show"
+    cand = [it for it in items if it.get("type") == want]
+    best = None
+    for it in cand:
+        if _guid_match(it, imdb, str(tmdb or ""), str(tvdb or "")): best = it; break
+    if not best:
+        for it in cand:
+            if year and str(it.get("year")) == str(year): best = it; break
+    if not best and cand: best = cand[0]
+    rk = (best or {}).get("ratingKey")
+    if not rk: return ""
+    return "https://app.plex.tv/desktop/#!/server/%s/details?key=%s" % (mid, urllib.parse.quote("/library/metadata/" + str(rk), safe=""))
+
+def _scout_play(req):
+    if req.get("play"): return req["play"]
+    return _plex_resolve(req.get("title"), req.get("year"), req.get("imdbId"), req.get("tmdbId"), req.get("tvdbId"), req.get("kind"))
+
+def _scout_probe(req):
+    if req.get("stage") == "dry-run": return "dry-run", {}
+    backend, kind = req.get("backend"), req.get("kind")
+    if backend == "arr":
+        arr = next((a for a in INSTANCES if a.name == req.get("arr")), None)
+        tid = req.get("target_id")
+        if not arr or not tid: return "error", {"detail": "instance/target gone"}
+        if kind == "movie":
+            m = arr.get_json("/movie/%d" % tid)
+            if m is None: return req.get("stage", "searching"), {}
+            if m.get("hasFile"): return "available", {"play": _scout_play(req)}
+            rec = _scout_queue_rec(arr, "movieId", tid)
+            return _scout_stage_from_rec(rec) if rec else _scout_search_or_timeout(req)
+        s = arr.get_json("/series/%d" % tid)
+        if s is None: return req.get("stage", "searching"), {}
+        stt = s.get("statistics") or {}
+        if stt.get("episodeFileCount", 0) > 0:
+            return "available", {"play": _scout_play(req), "detail": "%d/%d episodes" % (stt.get("episodeFileCount", 0), stt.get("episodeCount", 0) or 0)}
+        rec = _scout_queue_rec(arr, "seriesId", tid)
+        return _scout_stage_from_rec(rec) if rec else _scout_search_or_timeout(req)
+    if backend == "riven":
+        rv = next((r for r in RIVENS if r.name == req.get("riven")), RIVENS[0] if RIVENS else None)
+        if not rv: return "error", {"detail": "riven gone"}
+        it = _scout_riven_item(rv, req.get("imdbId"))
+        if not it: return _scout_search_or_timeout(req)
+        stg = _RIVEN_STAGE.get(it.get("state"), "searching")
+        return stg, ({"play": _scout_play(req)} if stg == "available" else {})
+    return req.get("stage", "queued"), {}
+
+def _scout_status():
+    mode = _scout_mode()
+    with _scout_lock:
+        items = list(_scout_load().get("reqs", {}).values())
+    now, changed, out = time.time(), False, []
+    for req in items:
+        if req.get("stage") in ("available", "no source", "error", "dry-run") and req.get("done_ts") and now - req["done_ts"] > SCOUT_TTL_HOURS * 3600:
+            with _scout_lock:
+                s = _scout_load(); s.get("reqs", {}).pop(req["id"], None); _scout_save(s)
+            continue
+        try: stg, extra = _scout_probe(req)
+        except Exception as e: stg, extra = "error", {"detail": str(e)[:80]}
+        if stg != req.get("stage"):
+            req["stage"] = stg; changed = True
+            if stg in ("available", "no source", "error"): req["done_ts"] = now
+        if extra.get("play") and not req.get("play"):
+            req["play"] = extra["play"]; changed = True
+        req["_pct"] = extra.get("pct"); req["_detail"] = extra.get("detail") or req.get("detail") or ""
+        out.append(req)
+    if changed:
+        with _scout_lock:
+            s = _scout_load()
+            for req in items:
+                if req["id"] in s.get("reqs", {}):
+                    s["reqs"][req["id"]].update({k: req[k] for k in ("stage", "play", "done_ts") if k in req})
+            _scout_save(s)
+    out.sort(key=lambda r: r.get("created", 0), reverse=True)
+    view = [{"id": r["id"], "title": r.get("title"), "year": r.get("year"), "kind": r.get("kind"),
+             "backend": r.get("backend"), "stage": r.get("stage"), "pct": r.get("_pct"),
+             "detail": r.get("_detail"), "play": r.get("play", ""), "ago": int(now - r.get("created", now))} for r in out[:SCOUT_RETAIN]]
+    return {"mode": mode, "backend": _scout_meta()["backend"], "requests": view}
+
 _UI_MULTI = {
     "HOLIDAYS_COUNTRIES": ["us", "canada", "uk", "china", "japan", "korea", "australia"],
     "DOCTOR_CONDITIONS": ["downloadClientUnavailable", "importBlocked", "importFailed",
@@ -2958,6 +3311,7 @@ UI_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>stack-doctor</title>
 <link rel=preconnect href="https://fonts.googleapis.com"><link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel=stylesheet>
+<link href="https://fonts.googleapis.com/css2?family=Patrick+Hand&family=Caveat:wght@600;700&display=swap" rel=stylesheet>
 <style>
 :root{--bg:#05070f;--card:rgba(18,26,46,.55);--card2:rgba(12,18,34,.72);--bd:rgba(120,160,255,.16);--bd2:rgba(120,160,255,.3);--fg:#dbe4ff;--mut:#7e8cb8;--ok:#34d399;--off:#5b6788;--bad:#fb7185;--ac:#22d3ee;--ac2:#a855f7;--warn:#fbbf24;--glow:0 0 18px rgba(34,211,238,.35);--sans:'Inter',system-ui,Segoe UI,sans-serif;--mono:'JetBrains Mono',ui-monospace,monospace}
 *{box-sizing:border-box}html,body{height:100%}
@@ -3004,15 +3358,98 @@ pre{background:rgba(2,5,12,.85);border:1px solid var(--bd);border-radius:12px;pa
 details summary{color:var(--ac)!important}
 #toast{position:fixed;right:18px;bottom:18px;background:var(--card2);border:1px solid var(--ac);color:var(--fg);padding:11px 16px;border-radius:10px;opacity:0;transition:.3s;pointer-events:none;backdrop-filter:blur(8px);box-shadow:var(--glow)}
 ::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:rgba(120,160,255,.25);border-radius:6px}::-webkit-scrollbar-track{background:transparent}
+/* ---- Scout: hand-drawn pencil-sketch tab (paper page inside the app) ---- */
+#scout{font-family:'Patrick Hand','Inter',sans-serif}
+#scout *{font-family:'Patrick Hand','Inter',sans-serif}
+.sk-wrap{position:relative;background:#f7f4ec;color:#2c2a26;border:2.5px solid #2c2a26;border-radius:12px;padding:18px 20px 24px;box-shadow:4px 5px 0 rgba(44,42,38,.16);background-image:repeating-linear-gradient(0deg,transparent 0,transparent 30px,rgba(44,42,38,.05) 31px)}
+.sk-wrap::after{content:"";position:absolute;inset:5px;border:1.5px solid rgba(44,42,38,.3);border-radius:9px;pointer-events:none}
+.sk-head{display:flex;align-items:baseline;gap:12px;margin:0 0 6px;flex-wrap:wrap}
+.sk-title{font-family:'Caveat',cursive;font-weight:700;font-size:32px;line-height:1}
+.sk-sub{font-size:15px;color:#6a6358}
+.sk-searchbar{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;margin-top:8px}
+.sk-input{flex:1 1 240px;width:auto;min-width:0;background:#fffdf7;color:#2c2a26;border:2px solid #2c2a26;border-radius:150px 9px 150px 9px/9px 130px 9px 130px;padding:10px 15px;font:18px 'Patrick Hand';box-shadow:2px 2px 0 rgba(44,42,38,.12)}
+.sk-input:focus{outline:0;box-shadow:2px 2px 0 rgba(44,42,38,.32)}
+.sk-input:disabled{opacity:.5}
+.sk-seg{display:inline-flex;border:2px solid #2c2a26;border-radius:9px;overflow:hidden}
+.sk-seg button{background:#fffdf7;color:#2c2a26;border:0;border-right:2px solid #2c2a26;padding:8px 15px;font:16px 'Patrick Hand';cursor:pointer}
+.sk-seg button:last-child{border-right:0}
+.sk-seg button.on{background:#2c2a26;color:#f7f4ec}
+.sk-btn{background:#ffe7a3;color:#2c2a26;border:2.5px solid #2c2a26;border-radius:150px 11px 150px 11px/11px 130px 11px 130px;padding:9px 20px;font:18px 'Patrick Hand';cursor:pointer;box-shadow:2px 3px 0 rgba(44,42,38,.25);transition:transform .1s,box-shadow .1s;text-decoration:none;display:inline-block;white-space:nowrap}
+.sk-btn:hover{transform:translate(-1px,-1px);box-shadow:3px 4px 0 rgba(44,42,38,.3)}
+.sk-btn:active{transform:translate(1px,1px);box-shadow:1px 1px 0 rgba(44,42,38,.25)}
+.sk-results{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;margin-top:16px}
+.sk-card{display:flex;flex-direction:column;background:#fffdf7;border:2px solid #2c2a26;border-radius:13px;padding:10px;box-shadow:3px 4px 0 rgba(44,42,38,.14);transform:rotate(-.35deg)}
+.sk-card:nth-child(2n){transform:rotate(.4deg)}
+.sk-card:nth-child(3n){transform:rotate(-.15deg)}
+.sk-poster{height:150px;border:2px solid #2c2a26;border-radius:8px;background:#efe9da center/cover no-repeat;margin-bottom:8px;filter:grayscale(.3) contrast(1.05)}
+.sk-noposter{display:flex;align-items:center;justify-content:center;font-size:44px}
+.sk-cardtitle{font-size:18px;font-weight:700;line-height:1.12}
+.sk-year{color:#6a6358}
+.sk-kindtag{display:inline-block;align-self:flex-start;font-size:13px;border:1.5px solid #2c2a26;border-radius:6px;padding:0 8px;margin:5px 0;text-transform:capitalize}
+.sk-ov{font-size:14px;color:#5a5348;line-height:1.3;max-height:74px;overflow:hidden;margin-bottom:8px}
+.sk-noimg{display:flex;align-items:center;justify-content:center;font:16px 'Caveat';color:#9a9384;filter:none}
+.sk-have{display:inline-block;align-self:flex-start;font-size:13px;color:#3f7a2e;margin-bottom:6px}
+.sk-get{align-self:flex-start;margin-top:auto;font-size:16px;padding:7px 16px}
+.sk-get:disabled{opacity:.5;cursor:default;background:#efe9da;box-shadow:none}
+.sk-feed{margin-top:12px;display:flex;flex-direction:column;gap:12px}
+.sk-req{background:#fffdf7;border:2px solid #2c2a26;border-radius:12px;padding:12px 14px;box-shadow:3px 4px 0 rgba(44,42,38,.13)}
+.sk-reqhead{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}
+.sk-reqtitle{font-size:19px;font-weight:700}
+.sk-x{background:none;border:0;font-size:20px;cursor:pointer;color:#8a8276;line-height:1;padding:0 4px}
+.sk-x:hover{color:#b3261e}
+.sk-steps{display:flex;align-items:center;flex-wrap:wrap;gap:2px}
+.sk-step{display:flex;align-items:center;gap:6px;opacity:.4}
+.sk-step.done,.sk-step.cur{opacity:1}
+.sk-dot{width:14px;height:14px;border:2px solid #2c2a26;border-radius:50%;background:#fffdf7}
+.sk-step.done .sk-dot{background:#2c2a26}
+.sk-step.cur .sk-dot{background:#ffd34d;animation:skpulse 1.1s infinite}
+@keyframes skpulse{0%,100%{box-shadow:0 0 0 3px rgba(255,211,77,.45)}50%{box-shadow:0 0 0 6px rgba(255,211,77,.12)}}
+.sk-steplab{font-size:14px}
+.sk-line{flex:1 1 14px;min-width:12px;height:0;border-top:2px dashed #b8b0a0;margin:0 2px}
+.sk-line.done{border-top-color:#2c2a26;border-top-style:solid}
+.sk-play{background:#bfe3b0;margin-top:10px;font-size:16px}
+.sk-bad{color:#b3261e;margin-top:8px;font-size:15px}
+.sk-detail{color:#6a6358;margin-top:6px;font-size:14px}
+.sk-note{color:#6a6358;font-size:16px;padding:8px 2px}
+@media(max-width:560px){
+ .sk-wrap{padding:14px 13px 20px}
+ .sk-title{font-size:27px}
+ .sk-input{flex:1 1 100%}
+ .sk-seg{flex:1 1 auto}.sk-seg button{flex:1}
+ #sk-go{width:100%;text-align:center}
+ .sk-results{grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
+ .sk-poster{height:118px}
+ .sk-step:not(.cur) .sk-steplab{display:none}
+}
 </style></head><body>
 <header><h1>stack-doctor</h1><span class=mut id=sub>loading</span></header>
-<nav><button data-t=dash class=active>Dashboard</button><button data-t=config>Config</button><button data-t=logs>Logs</button></nav>
+<nav><button data-t=dash class=active>Dashboard</button><button data-t=scout>Scout</button><button data-t=config>Config</button><button data-t=logs>Logs</button></nav>
 <main>
 <div id=dash>
  <div class=card><h3>Checks</h3><div class=grid id=checks></div></div>
  <div class=card><h3>Monitored services</h3><div id=health></div></div>
  <div class=card><h3>Warmer</h3><div id=warm></div></div>
  <div class=card id=wr-card style=display:none><h3>Westrepair</h3><div id=wr></div></div>
+</div>
+<div id=scout style=display:none>
+ <div class=sk-wrap>
+  <div class=sk-head>
+   <div class=sk-title>Scout</div>
+   <div class=sk-note id=sk-backend>checking the stack...</div>
+  </div>
+  <div class=sk-searchbar>
+   <input id=sk-q class=sk-input placeholder="what do you want to watch?" autocomplete=off>
+   <div class=sk-seg id=sk-kind>
+    <button class="sk-segb on" data-k=both>Both</button>
+    <button class=sk-segb data-k=movie>Movie</button>
+    <button class=sk-segb data-k=show>Show</button>
+   </div>
+   <button id=sk-go class=sk-btn>Search</button>
+  </div>
+  <div id=sk-results class=sk-results></div>
+  <div class=sk-head style="margin-top:18px"><div class="sk-title" style="font-size:24px">Acquiring</div></div>
+  <div id=sk-feed class=sk-feed></div>
+ </div>
 </div>
 <div id=config style=display:none></div>
 <div id=logs style=display:none></div>
@@ -3026,9 +3463,10 @@ function toast(m){var e=E('toast');e.textContent=m;e.style.opacity=1;setTimeout(
 function ago(s){if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago'}
 var timer;
 function show(t){var b=document.querySelectorAll('nav button');for(var i=0;i<b.length;i++)b[i].classList.toggle('active',b[i].dataset.t===t);
- E('dash').style.display=t==='dash'?'':'none';E('config').style.display=t==='config'?'':'none';E('logs').style.display=t==='logs'?'':'none';
+ E('dash').style.display=t==='dash'?'':'none';E('scout').style.display=t==='scout'?'':'none';E('config').style.display=t==='config'?'':'none';E('logs').style.display=t==='logs'?'':'none';
  clearInterval(timer);
  if(t==='dash'){loadDash();timer=setInterval(loadDash,5000)}
+ if(t==='scout'){loadScoutMeta();loadScoutStatus();timer=setInterval(loadScoutStatus,4000)}
  if(t==='config')loadConfig();
  if(t==='logs'){loadLogs();timer=setInterval(loadLogs,4000)}}
 var nb=document.querySelectorAll('nav button');for(var i=0;i<nb.length;i++)nb[i].onclick=(function(t){return function(){show(t)}})(nb[i].dataset.t);
@@ -3096,6 +3534,72 @@ function restart(){fetch(q('/api/config'),{method:'POST',body:JSON.stringify(gat
 function loadLogs(){fetch(q('/api/logs?n=400')).then(function(r){return r.text()}).then(function(t){
   var d=E('logs');if(!d.dataset.i){d.innerHTML='<pre id=lp></pre>';d.dataset.i=1}
   var lp=E('lp'),bot=lp.scrollTop+lp.clientHeight>=lp.scrollHeight-40;lp.textContent=t;if(bot)lp.scrollTop=lp.scrollHeight})}
+var skResults=[];var skKind='both';var skMeta={};
+function loadScoutMeta(){fetch(q('/api/scout/meta')).then(function(r){return r.json()}).then(function(m){skMeta=m;
+  var el=E('sk-backend');
+  if(!m.enabled){el.textContent='Scout is turned off in config.';E('sk-go').disabled=true;return}
+  if(!m.available){el.textContent='No acquisition backend found. Enable Sonarr / Radarr or Riven.';E('sk-go').disabled=true;return}
+  E('sk-go').disabled=false;
+  var line='via '+esc(m.backend);if(m.dry_run)line+=' (DRY-RUN: nothing will download)';if(!m.plex)line+=' (no Plex link)';
+  el.textContent=line;
+  var ms=E('sk-kind');ms.style.display=(m.mode==='riven')?'none':''})}
+function scoutSearch(){var v=E('sk-q').value;if(!v.trim())return;
+  E('sk-results').innerHTML='<div class=sk-note>sketching results...</div>';
+  fetch(q('/api/scout/search?kind='+encodeURIComponent(skKind)+'&q='+encodeURIComponent(v))).then(function(r){return r.json()}).then(function(d){
+   skResults=d.results||[];renderResults()}).catch(function(){E('sk-results').innerHTML='<div class="sk-note sk-bad">search failed</div>'})}
+function renderResults(){var h='';
+  if(!skResults.length){E('sk-results').innerHTML='<div class=sk-note>nothing found. try another title.</div>';return}
+  for(var i=0;i<skResults.length;i++){var r=skResults[i];
+   var pos=r.poster?'<img class=sk-poster src="'+esc(r.poster)+'" alt="" onerror="this.style.display=\'none\'">':'<div class="sk-poster sk-noimg">no art</div>';
+   var yr=r.year?(' ('+esc(r.year)+')'):'';
+   var have=r.hasFile?'<span class=sk-have>in library</span>':'';
+   var btn=r.hasFile?'<button class="sk-btn sk-get" disabled>have it</button>':'<button class="sk-btn sk-get" onclick="scoutGet('+i+')">Get</button>';
+   h+='<div class=sk-card>'+pos+'<div class=sk-kindtag>'+esc(r.kind)+'</div>'+
+      '<div class=sk-cardtitle>'+esc(r.title)+yr+'</div>'+have+
+      '<div class=sk-ov>'+esc(r.overview||'')+'</div>'+btn+'</div>'}
+  E('sk-results').innerHTML=h}
+function scoutGet(i){var r=skResults[i];if(!r)return;
+  fetch(q('/api/scout/get'),{method:'POST',body:JSON.stringify(r)}).then(function(x){return x.json()}).then(function(d){
+   if(d.ok){toast('on it: '+r.title);loadScoutStatus()}else{toast(d.error||'could not start')}})}
+function loadScoutStatus(){fetch(q('/api/scout/status')).then(function(r){return r.json()}).then(function(d){renderFeed(d)})}
+var SK_STEPS=['searching','grabbed','downloading','importing','verifying','available'];
+function skStepIndex(stage){if(stage==='queued'||stage==='searching')return 0;
+  for(var i=0;i<SK_STEPS.length;i++)if(SK_STEPS[i]===stage)return i;return -1}
+function renderFeed(d){var rs=d.requests||[];
+  if(!rs.length){E('sk-feed').innerHTML='<div class=sk-note>nothing in flight. search above and hit Get.</div>';return}
+  var h='';for(var i=0;i<rs.length;i++)h+=renderReq(rs[i]);E('sk-feed').innerHTML=h}
+function renderReq(r){var yr=r.year?(' ('+esc(r.year)+')'):'';
+  var head='<div class=sk-reqhead><div class=sk-reqtitle>'+esc(r.title)+yr+' <span class=sk-kindtag>'+esc(r.kind)+'</span></div>'+
+           '<button class=sk-x title=dismiss onclick="scoutClear(\''+esc(r.id)+'\')">x</button></div>';
+  var term=(r.stage==='no source'||r.stage==='error'||r.stage==='dry-run');
+  var body='';
+  if(term){
+   var cls=r.stage==='dry-run'?'sk-detail':'sk-bad';
+   var msg=r.stage==='no source'?'no source found yet, still trying':(r.stage==='dry-run'?'dry-run: nothing was submitted':'error');
+   if(r.detail)msg+=': '+r.detail;
+   body='<div class="sk-note '+cls+'">'+esc(msg)+'</div>'}
+  else{
+   var cur=skStepIndex(r.stage);body='<div class=sk-steps>';
+   for(var s=0;s<SK_STEPS.length;s++){
+    var st=(s<cur)?'done':(s===cur?'cur':'');
+    var lab=SK_STEPS[s];
+    if(SK_STEPS[s]==='downloading'&&s===cur&&r.pct!=null)lab='downloading '+r.pct+'%';
+    if(SK_STEPS[s]==='available')lab='kaboom';
+    body+='<div class="sk-step '+st+'"><span class=sk-dot></span><span class=sk-steplab>'+esc(lab)+'</span></div>';
+    if(s<SK_STEPS.length-1)body+='<span class="sk-line '+(s<cur?'done':'')+'"></span>'}
+   body+='</div>';
+   if(r.detail&&r.stage!=='available')body+='<div class="sk-note sk-detail">'+esc(r.detail)+'</div>'}
+  var foot='';
+  if(r.stage==='available'){
+   if(r.play)foot='<a class="sk-btn sk-play" href="'+esc(r.play)+'" target=_blank rel=noopener>Play in Plex</a>';
+   else foot='<div class="sk-note sk-detail">ready, finding the Plex link...</div>'}
+  return '<div class=sk-req>'+head+body+foot+'</div>'}
+function scoutClear(id){fetch(q('/api/scout/clear'),{method:'POST',body:JSON.stringify({id:id})}).then(function(){loadScoutStatus()})}
+(function(){var seg=E('sk-kind').querySelectorAll('.sk-segb');
+  for(var i=0;i<seg.length;i++)seg[i].onclick=(function(b){return function(){skKind=b.dataset.k;
+   for(var j=0;j<seg.length;j++)seg[j].classList.toggle('on',seg[j]===b);if(skResults.length)scoutSearch()}})(seg[i]);
+  E('sk-go').onclick=scoutSearch;
+  E('sk-q').addEventListener('keydown',function(e){if(e.key==='Enter'||e.keyCode===13)scoutSearch()})})();
 show('dash');
 </script></body></html>"""
 
@@ -3130,6 +3634,12 @@ def _build_server(port):
             if path == "/api/warmer":      return self._send(200, "application/json", json.dumps(_ui_warmer()))
             if path == "/api/westrepair":  return self._send(200, "application/json", json.dumps(_ui_westrepair()))
             if path == "/api/config":      return self._send(200, "application/json", json.dumps(_ui_config()))
+            if path == "/api/scout/meta":   return self._send(200, "application/json", json.dumps(_scout_meta()))
+            if path == "/api/scout/status": return self._send(200, "application/json", json.dumps(_scout_status()))
+            if path == "/api/scout/search":
+                qd = parse_qs(urlparse(self.path).query)
+                return self._send(200, "application/json", json.dumps(
+                    _scout_search(qd.get("q", [""])[0], qd.get("kind", ["both"])[0])))
             if path == "/api/logs":
                 try: n = min(int(parse_qs(urlparse(self.path).query).get("n", ["300"])[0]), 3000)
                 except Exception: n = 300
@@ -3139,9 +3649,14 @@ def _build_server(port):
             path = urlparse(self.path).path
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else b""
-            if path in ("/api/config", "/api/restart", "/api/westrepair/rescan"):
+            if path in ("/api/config", "/api/restart", "/api/westrepair/rescan", "/api/scout/get", "/api/scout/clear"):
                 if not EN_UI or not self._authed():
                     return self._send(401, "text/plain", "unauthorized")
+                if path == "/api/scout/get":
+                    ok, info = _scout_get(body)
+                    return self._send(200 if ok else 400, "application/json", json.dumps(dict(info, ok=ok)))
+                if path == "/api/scout/clear":
+                    return self._send(200, "application/json", json.dumps({"ok": _scout_clear(body)}))
                 if path == "/api/config":
                     ok, msg = _ui_save(body)
                     return self._send(200 if ok else 400, "application/json", json.dumps({"ok": ok, "msg": msg}))

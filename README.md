@@ -176,6 +176,10 @@ Set `ENABLE_UI=true` and open `http://<host>:12345` for a simple, dependency-fre
 - **Dashboard**: which checks are on/off; the live up/down + version + health-warning count of every
   monitored service (each *arr, Prowlarr, decypharr, Plex, Bazarr); and warmer stats, total warmed
   plus a feed of *what* was warmed and *why* (`ondeck` / `next` / `detail-page`).
+- **Scout**: a hand-drawn acquisition front-end. Search a title, pick a result, hit **Get**, and
+  watch it move through `searching -> grabbed -> downloading -> importing -> verifying -> kaboom`,
+  then click straight through to **Play in Plex**. See the [Scout](#scout-acquire-from-the-dashboard)
+  section below.
 - **Config**: edit the common tuning knobs and save. Changes write to `DOCTOR_CONFIG_FILE` and apply
   on restart (there's a "Save and Restart" button). Secrets (API keys, tokens) are never shown.
 - **Logs**: a live tail of `DOCTOR_LOG_FILE`.
@@ -607,6 +611,45 @@ supply a key only if you front it with auth, and it is sent as a bearer token).
 |---|---|---|
 | `ENABLE_MEDIASTORM` | `false` | turn the check on |
 | `MEDIASTORM_TIMEOUT` | `8` | per-probe HTTP timeout (seconds) for `/health` |
+
+## Scout (acquire from the dashboard)
+
+Scout is a lightweight alternative front-end built into the dashboard. Instead of bouncing between
+Overseerr, Sonarr, Radarr and Plex, you search a title, click **Get**, and watch the request move
+through a live status track right there in the page, ending with a deep link that opens the finished
+item in Plex. It is drawn in a deliberately hand-sketched style and is laid out for both phone and
+desktop.
+
+It does not add a new backend: it drives whatever you already run.
+
+- If any `sonarr` / `radarr` instance is configured, Scout searches their lookup (TMDB/TVDB, no extra
+  key needed), adds or kicks a search on the matching instance, then follows the queue
+  (`downloading` with a percentage), import and on-disk state.
+- Otherwise, if a `riven` instance is configured, Scout adds by IMDb id through Riven and tracks the
+  item's Riven state.
+- With no acquisition backend, the tab shows a clear "nothing to drive" banner.
+
+The six stages are `searching -> grabbed -> downloading -> importing -> verifying -> available`.
+When the file lands, Scout resolves it in Plex (matching by IMDb/TMDB/TVDB guid, then year) and shows
+a **Play in Plex** button that opens `app.plex.tv` at that item. Set `PLEX_URL` + `PLEX_TOKEN` for the
+play link; without them acquisition still works, just without the deep link.
+
+Search and status are read-only, so the tab is safe to leave open. **Get** is the only action that
+writes, and it honours `DOCTOR_DRY_RUN`: in dry-run nothing is submitted and the request is marked
+`dry-run`. Requests live in `SCOUT_STATE_FILE` and a finished one drops off the feed after
+`SCOUT_TTL_HOURS`.
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_SCOUT` | `true` | show the Scout tab (it is inert unless a backend is configured) |
+| `SCOUT_MOVIE_INSTANCE` | _(first radarr)_ | which radarr name to acquire movies through |
+| `SCOUT_SHOW_INSTANCE` | _(first sonarr)_ | which sonarr name to acquire shows through |
+| `SCOUT_QUALITY_PROFILE` | _(instance default)_ | quality profile name or id to add new items with |
+| `SCOUT_ROOT_FOLDER` | _(instance default)_ | root folder path to add new items into |
+| `SCOUT_MAX_RESULTS` | `20` | cap on search results shown |
+| `SCOUT_RETAIN` | `40` | how many recent requests the activity feed keeps |
+| `SCOUT_TTL_HOURS` | `48` | drop a finished request from the feed after this long |
+| `SCOUT_STATE_FILE` | `/data/scout.json` | where in-flight requests are persisted |
 
 ## Extending
 
