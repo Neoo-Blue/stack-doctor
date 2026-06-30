@@ -29,6 +29,7 @@ container, everything configured by env vars.
 | **resources** | host load / low memory / swap pressure | reports; optional `drop_caches` relief |
 | **janitor** | permanently-dead usenet releases (from decypharr's log) | quarantines those library symlinks (reversible) |
 | **scrubber** | **proactively** scans library files for bad parts that make Plex skip mid-play (dead NZB articles, torn containers, packet corruption) | quarantines the symlink (reversible) + deletes the *arr's `moviefile`/`episodefile` with `blocklist=true` so a clean release is re-searched |
+| **watchlists** | new titles on Plex Home users' + non-Home friends' watchlists that aren't in your library | adds them directly to Sonarr/Radarr (4K instance first, 1080p fallback), bypassing Overseerr entirely; per-sweep rate-cap so a dumped 300-item watchlist doesn't flood |
 | **bazarr** | Bazarr unreachable | alerts |
 | **seerr** | Overseerr/Jellyseerr/Seerr requests stuck **FAILED** (the arr add timed out under load) | re-drives them so a transient blip self-heals (attempt-capped) |
 | **warmer** | what a viewer is about to watch (Plex On Deck + next episode) | precaches the file head so playback starts instantly |
@@ -392,6 +393,42 @@ The scrubber needs **direct read access** to the library, so it is best run as a
 service on the same host as decypharr** (where `/mnt/library` is real). It honors
 `DOCTOR_DRY_RUN=true` (logs what it would quarantine + which arr file it would delete,
 changes nothing).
+
+## Watchlists (Plex Home + friends -> arrs, no Overseerr)
+
+For people you trust enough that you don't want them clicking through an Overseerr approval
+flow. The check polls each watchlist on the configured interval, diffs against your current
+Sonarr / Radarr library, and adds new titles directly. Plex Home users are enumerated
+automatically from your owner `PLEX_TOKEN`; non-Home friends each give you their own
+`X-Plex-Token` (Plex Web -> any item -> ... -> Get Info -> View XML -> URL has the token).
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_WATCHLISTS` | `false` | turn the check on |
+| `WATCHLISTS_FRIENDS` | *(none)* | comma list of `label:token` pairs for non-Home Plex friends, e.g. `alice:xxxxxx,bob:yyyyyy` |
+| `WATCHLISTS_INCLUDE_HOME` | `true` | also pull every Plex Home / managed-user watchlist via your owner token |
+| `WATCHLISTS_HOME_PINS` | *(none)* | PINs for managed users that have one set, as `userUuid:1234,userUuid:5678` |
+| `WATCHLISTS_QUALITY` | *(use default)* | per-source quality preference. Format: `label=quality,label=quality` with `*` as wildcard, e.g. `*=both,home/kids=1080p,alice=4k`. Quality must be `4k`, `1080p`, or `both`. Labels match what the source is logged as (`home/<title>` for Plex Home users, the friend's label for non-Home friends) |
+| `WATCHLISTS_DEFAULT_QUALITY` | `both` | fallback quality when no explicit rule matches. `4k` / `1080p` / `both` |
+| `WATCHLISTS_PREFER_4K` | `true` | (legacy) only used if `WATCHLISTS_QUALITY` and `WATCHLISTS_DEFAULT_QUALITY` are unset; kept for back-compat |
+| `WATCHLISTS_PAGE_SIZE` | `100` | page size when crawling the Plex Discover watchlist endpoint (Plex caps `Container-Size` so anything over 100 returns 400) |
+| `WATCHLISTS_MAX_ADDS_PER_SWEEP` | `25` | rate-cap so a friend with a 300-item watchlist doesn't all land at once |
+| `WATCHLISTS_PROFILES` | *(auto-pick)* | override `qualityProfileId` per arr, e.g. `radarr=1,sonarr=4,radarr4k=5,sonarr4k=5`. When unset, picks the first profile each arr returns. |
+| `WATCHLISTS_STATE_FILE` | `/data/watchlists.json` | per-title `(tmdb|tvdb):id -> {added_to, ts, from}` cache so the same item isn't re-attempted |
+| `WATCHLISTS_HTTP_TIMEOUT` | `20` | HTTP timeout for plex.tv + arr lookups |
+
+The check needs `PLEX_TOKEN` (owner) for the Home enumeration and the configured `INSTANCE_n_*`
+arrs to actually add to. Honors `DOCTOR_DRY_RUN` (logs each WOULD-add, changes nothing). Adds
+are idempotent at the arr level - if a title is already present it's skipped via the per-sweep
+library index. A title successfully added is recorded in the state file so we don't re-poke
+the arrs every sweep for the same items.
+
+**Per-source quality preference** (`WATCHLISTS_QUALITY`) decides where each user's adds land:
+`4k` only routes to the Sonarr4K/Radarr4K instance, `1080p` only to the standard one, and
+`both` adds to BOTH (two arr records per title, so 4K plays first with the 1080p as a Plex
+fallback version). Single-quality adds fall back to the other tier on failure (so an
+unavailable 4K release still gets the 1080p drop). `both` runs each tier independently — 4K
+failing doesn't block 1080p and vice versa.
 
 ## Extending
 

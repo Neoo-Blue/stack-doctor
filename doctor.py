@@ -32,6 +32,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 import xml.etree.ElementTree as ET
 
 VERSION = "0.3"
@@ -109,6 +110,7 @@ EN_BAZARR     = _b("ENABLE_BAZARR", False)      # Bazarr reachability
 EN_SEERR      = _b("ENABLE_SEERR", False)       # Overseerr/Jellyseerr/Seerr: auto-retry FAILED requests
 EN_WESTREPAIR = _b("ENABLE_WESTREPAIR", False)  # symlink repair via repair.py subprocess
 EN_SCRUBBER   = _b("ENABLE_SCRUBBER", False)    # proactive file integrity scan (catches mid-file dead segments before playback)
+EN_WATCHLISTS = _b("ENABLE_WATCHLISTS", False)  # pull Plex Home/friends watchlists, add directly to *arr (bypasses Overseerr)
 
 # westrepair config
 WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
@@ -235,6 +237,31 @@ SCRUB_DEL_ARR      = _b("SCRUBBER_DELETE_ARR_FILE", True)  # DELETE arr movieFil
 SCRUB_EXTS         = tuple(x.strip().lower() for x in os.environ.get("SCRUBBER_EXTENSIONS", ".mkv,.mp4,.avi,.m4v,.ts").split(",") if x.strip())
 SCRUB_MIN_AGE      = _i("SCRUBBER_MIN_AGE_HOURS", 1)     # skip files newer than this (don't fight the warmer / fresh imports)
 SCRUB_REVERIFY_DAYS = _i("SCRUBBER_REVERIFY_DAYS", 30)   # re-check previously-OK files after N days (0=never)
+
+# watchlists (pull Plex Home users + non-Home friends watchlists, add directly to the arrs)
+# Sources:
+#   - Plex Home / managed users: enumerated automatically from PLEX_TOKEN (owner) via plex.tv API.
+#     PINs (per managed user) optional: WATCHLISTS_HOME_PINS="userUuid1:1234,userUuid2:5678".
+#   - Non-Home friends: each gives their X-Plex-Token; list as label:token pairs in
+#     WATCHLISTS_FRIENDS="alice:xxxxxxx,bob:yyyyyyy".
+# Policy: 4K instance first (Sonarr4K/Radarr4K), fall back to 1080p (Sonarr/Radarr) if 4K add fails.
+# State (tmdb:id / tvdb:id -> {added_to, ts}) persists so the same item isn't re-attempted.
+WL_FRIENDS         = os.environ.get("WATCHLISTS_FRIENDS", "")        # "alice:xxx,bob:yyy"
+WL_HOME_INCLUDE    = _b("WATCHLISTS_INCLUDE_HOME", True)             # also pull Plex Home users via owner token
+WL_HOME_PINS       = os.environ.get("WATCHLISTS_HOME_PINS", "")      # "uuid1:1234,uuid2:5678"
+WL_PREFER_4K       = _b("WATCHLISTS_PREFER_4K", True)                # FALLBACK preference when WATCHLISTS_QUALITY has no rule for a source
+# Per-source quality preference: 4k | 1080p | both. "both" = add to BOTH 4K and 1080p instances.
+# Format: comma list of "label=quality" pairs, with "*" as wildcard default.
+#   WATCHLISTS_QUALITY="*=both,home/kids=1080p,alice=4k,bob=1080p"
+# Labels match what the source is logged as ("home/<title>" for Plex Home users, the friend's
+# label for non-Home friends). Unknown sources fall back to WATCHLISTS_DEFAULT_QUALITY.
+WL_QUALITY_MAP     = os.environ.get("WATCHLISTS_QUALITY", "")
+WL_DEFAULT_QUALITY = os.environ.get("WATCHLISTS_DEFAULT_QUALITY", "both")  # 4k | 1080p | both
+WL_MAX_ADDS        = _i("WATCHLISTS_MAX_ADDS_PER_SWEEP", 25)         # rate-cap so a friend dumping 300 titles doesn't flood
+WL_STATE           = os.environ.get("WATCHLISTS_STATE_FILE", "/data/watchlists.json")
+WL_PROFILES        = os.environ.get("WATCHLISTS_PROFILES", "")       # override per-arr quality profile id, e.g. "radarr=1,sonarr=4,radarr4k=5,sonarr4k=5"
+WL_HTTP_TO         = _i("WATCHLISTS_HTTP_TIMEOUT", 20)
+WL_PAGE_SIZE       = _i("WATCHLISTS_PAGE_SIZE", 100)                 # Plex Discover caps Container-Size; 100 is safe
 
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
@@ -977,6 +1004,405 @@ def check_scrubber():
     _scrub_save_state(state)
     log.info("[scrubber] done: %d ok, %d suspect, %d bad (action)", ok_n, suspect, bad)
 
+# =========================================================================== #
+# CHECK: watchlists - pull Plex Home users + non-Home friends watchlists and
+# add new titles directly to Sonarr/Radarr, bypassing Overseerr.
+#
+# Why bypass seerr: seerr's add-to-arr call has a fixed ~10s timeout and no
+# retry; under load it silently drops requests (the existing seerr check
+# re-drives failed ones, but the user wanted to skip the approval step
+# entirely for people they trust). Watchlist = implicit "I want this" signal,
+# no approval UI needed.
+#
+# Sources of watchlist tokens:
+#   - Plex Home users: enumerated from the owner's PLEX_TOKEN via plex.tv's
+#     /home/users API, then /home/users/{uuid}/switch (with PIN if set) returns
+#     each managed user's token. WATCHLISTS_INCLUDE_HOME=true (default) turns
+#     this on.
+#   - Non-Home Plex friends: each gives their own X-Plex-Token; configured as
+#     "label:token,label:token" in WATCHLISTS_FRIENDS.
+#
+# Each token then hits discover.provider.plex.tv to fetch the watchlist, which
+# embeds tmdb:/tvdb:/imdb: GUIDs on each item. We index the current arrs once
+# per sweep to skip titles already in the library, try the 4K instance first
+# and fall back to 1080p if the 4K add fails (no 4K release, no matching
+# profile, etc.). Confirmed adds are cached in WATCHLISTS_STATE_FILE so the
+# same title isn't re-attempted next sweep.
+# =========================================================================== #
+
+_WL_ARR_INDEX_CACHE = {"sweep": 0, "data": None}
+
+def _wl_http(url, headers=None, t=None):
+    """GET url, return (status, bytes). Doesn't raise on HTTP errors."""
+    try:
+        req = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(req, timeout=t or WL_HTTP_TO) as r:
+            return r.getcode(), r.read()
+    except urllib.error.HTTPError as e:
+        try: return e.code, e.read()
+        except Exception: return e.code, b""
+    except Exception as e:
+        log.debug("[watchlists] GET %s err: %s", url, str(e)[:120])
+        return 0, b""
+
+def _wl_post(url, headers=None, data=None, t=None):
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers or {}, method="POST")
+        with urllib.request.urlopen(req, timeout=t or WL_HTTP_TO) as r:
+            return r.getcode(), r.read()
+    except urllib.error.HTTPError as e:
+        try: return e.code, e.read()
+        except Exception: return e.code, b""
+    except Exception as e:
+        log.debug("[watchlists] POST %s err: %s", url, str(e)[:120])
+        return 0, b""
+
+def _wl_collect_tokens():
+    """Return list of (label, token) for every watchlist source we'll poll."""
+    tokens = []
+    # Non-Home friends from env
+    for entry in (WL_FRIENDS or "").split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry: continue
+        lab, tok = entry.split(":", 1)
+        tokens.append((lab.strip() or "friend", tok.strip()))
+    # Plex Home users via the owner's PLEX_TOKEN
+    if WL_HOME_INCLUDE and PLEX_TOKEN:
+        pins = {}
+        for entry in (WL_HOME_PINS or "").split(","):
+            if ":" in entry:
+                u, p = entry.split(":", 1); pins[u.strip()] = p.strip()
+        code, body = _wl_http("https://plex.tv/api/v2/home/users",
+                              headers={"X-Plex-Token": PLEX_TOKEN,
+                                       "X-Plex-Client-Identifier": "stack-doctor",
+                                       "Accept": "application/json"})
+        if code == 200:
+            try:
+                users = json.loads(body)
+                users_list = users.get("users") if isinstance(users, dict) else (users if isinstance(users, list) else [])
+                for u in users_list or []:
+                    title = u.get("title") or u.get("friendlyName") or u.get("username") or "home-user"
+                    uuid  = u.get("uuid") or u.get("id")
+                    if u.get("admin"):
+                        # owner: use PLEX_TOKEN directly, no switch needed
+                        tokens.append(("home/%s" % title, PLEX_TOKEN)); continue
+                    sw_url = "https://plex.tv/api/v2/home/users/%s/switch" % uuid
+                    if pins.get(str(uuid)): sw_url += "?pin=" + pins[str(uuid)]
+                    sc, sb = _wl_post(sw_url,
+                                      headers={"X-Plex-Token": PLEX_TOKEN,
+                                               "X-Plex-Client-Identifier": "stack-doctor",
+                                               "Accept": "application/json"})
+                    if sc in (200, 201):
+                        try:
+                            sub = json.loads(sb); sub_tok = sub.get("authToken")
+                            if sub_tok: tokens.append(("home/%s" % title, sub_tok))
+                            else: log.debug("[watchlists] home %s: switch returned no token", title)
+                        except Exception:
+                            log.debug("[watchlists] home %s: switch body parse failed", title)
+                    else:
+                        log.info("[watchlists] home %s: switch failed (HTTP %s) - PIN required?", title, sc)
+            except Exception as e:
+                log.warning("[watchlists] /home/users parse failed: %s", str(e)[:120])
+        else:
+            log.warning("[watchlists] /home/users HTTP %s", code)
+    return tokens
+
+def _wl_fetch(token):
+    """Return list of {plex_id, type, tmdb, tvdb, title, year} for one user's watchlist.
+    Plex Discover caps Container-Size (>100 returns 400), so we paginate. Auth via QUERY PARAM
+    (X-Plex-Token: header gets 403 on Discover even though it works on a local PMS).
+    NOTE: Discover's listing endpoint does NOT include external GUIDs (tmdb/tvdb) on items;
+    those have to be fetched from metadata.provider.plex.tv per item - done lazily in
+    _wl_resolve_ids() so we only do it for items not already in the library or in our cache."""
+    items = []; seen_pg = set(); start = 0
+    safe_size = max(20, min(int(WL_PAGE_SIZE), 100))
+    while True:
+        url = ("https://discover.provider.plex.tv/library/sections/watchlist/all"
+               "?includeCollections=1&includeExternalMedia=1"
+               "&X-Plex-Container-Start=%d&X-Plex-Container-Size=%d"
+               "&X-Plex-Token=%s") % (start, safe_size, urllib.parse.quote(token))
+        code, body = _wl_http(url, headers={"Accept": "application/json"})
+        if code != 200:
+            log.warning("[watchlists] discover HTTP %s (start=%d)", code, start); break
+        try:
+            mc = json.loads(body).get("MediaContainer", {})
+            md = mc.get("Metadata", []) or []
+            total = int(mc.get("totalSize", 0) or 0)
+        except Exception as e:
+            log.warning("[watchlists] discover parse failed: %s", str(e)[:120]); break
+        for v in md:
+            pg = v.get("guid") or ""
+            if pg and pg in seen_pg: continue
+            seen_pg.add(pg)
+            plex_id = v.get("ratingKey")
+            items.append({"plex_id": plex_id, "type": v.get("type") or "",
+                          "tmdb": None, "tvdb": None,
+                          "title": v.get("title") or "", "year": v.get("year")})
+        if not md or len(items) >= total or len(md) < safe_size:
+            break
+        start += len(md)
+    return items
+
+def _wl_resolve_ids(plex_id, token, cache):
+    """Fetch tmdb / tvdb GUIDs for a single Plex Discover item; cache the answer forever
+    (Plex ids are immutable). Returns (tmdb, tvdb) or (None, None) on failure."""
+    if not plex_id: return None, None
+    if plex_id in cache:
+        c = cache[plex_id]; return c.get("tmdb"), c.get("tvdb")
+    url = ("https://metadata.provider.plex.tv/library/metadata/%s?X-Plex-Token=%s"
+           % (urllib.parse.quote(str(plex_id)), urllib.parse.quote(token)))
+    code, body = _wl_http(url, headers={"Accept": "application/json"})
+    if code != 200:
+        log.debug("[watchlists] resolve %s -> HTTP %s", plex_id, code)
+        return None, None
+    tmdb = tvdb = None
+    try:
+        mc = json.loads(body).get("MediaContainer", {})
+        for v in mc.get("Metadata", []) or []:
+            for g in v.get("Guid", []) or []:
+                gid = g.get("id") or ""
+                if gid.startswith("tmdb://"): tmdb = gid.split("//",1)[1]
+                elif gid.startswith("tvdb://"): tvdb = gid.split("//",1)[1]
+    except Exception as e:
+        log.debug("[watchlists] resolve parse %s: %s", plex_id, str(e)[:80])
+    cache[plex_id] = {"tmdb": tmdb, "tvdb": tvdb}
+    return tmdb, tvdb
+
+def _wl_arr_index():
+    """{ 'tmdb:NNN', 'tvdb:NNN', ... } across all arrs - skip-set for already-in-library."""
+    sweep = _SCRUB_SWEEP_COUNTER[0]   # reuse the same per-sweep counter
+    if _WL_ARR_INDEX_CACHE["sweep"] == sweep and _WL_ARR_INDEX_CACHE["data"] is not None:
+        return _WL_ARR_INDEX_CACHE["data"]
+    idx = set()
+    for arr in INSTANCES:
+        try:
+            if arr.kind == "radarr":
+                for m in json.load(arr._req("GET", "/movie")):
+                    if m.get("tmdbId"): idx.add("tmdb:%s" % m["tmdbId"])
+            elif arr.kind == "sonarr":
+                for s in json.load(arr._req("GET", "/series")):
+                    if s.get("tvdbId"): idx.add("tvdb:%s" % s["tvdbId"])
+        except Exception as e:
+            log.debug("[watchlists] %s index failed: %s", arr.name, str(e)[:80])
+    _WL_ARR_INDEX_CACHE["sweep"] = sweep
+    _WL_ARR_INDEX_CACHE["data"]  = idx
+    return idx
+
+def _wl_quality_for(label):
+    """Resolve quality preference for a source label. Returns one of '4k' | '1080p' | 'both'.
+    WATCHLISTS_QUALITY format: '*=both,home/kids=1080p,alice=4k,bob=1080p' (exact-match wins
+    over wildcard). Unknown label -> WATCHLISTS_DEFAULT_QUALITY."""
+    rules = {}
+    for entry in (WL_QUALITY_MAP or "").split(","):
+        if "=" not in entry: continue
+        k, v = entry.split("=", 1)
+        rules[k.strip().lower()] = v.strip().lower()
+    lab = (label or "").strip().lower()
+    if lab in rules: q = rules[lab]
+    elif "*" in rules: q = rules["*"]
+    else: q = (WL_DEFAULT_QUALITY or "both").lower()
+    if q not in ("4k", "1080p", "both"): q = "both"
+    return q
+
+def _wl_arr_for(kind, quality):
+    """Return arr instances of `kind` to try (in order) for the given quality preference.
+    quality='4k'    -> [arr_4k only]
+    quality='1080p' -> [arr_1080p only]
+    quality='both'  -> [arr_4k, arr_1080p]  (added to BOTH instances)
+    If only one tier exists for `kind`, the other tier silently degrades to that one.
+    A None entry is dropped."""
+    fourk = None; std = None
+    for arr in INSTANCES:
+        if arr.kind != kind: continue
+        if "4k" in arr.name.lower() or "uhd" in arr.name.lower():
+            fourk = arr
+        else:
+            std = arr
+    if quality == "4k":
+        return [a for a in (fourk,) if a]
+    if quality == "1080p":
+        return [a for a in (std,) if a]
+    # both
+    return [a for a in (fourk, std) if a]
+
+def _wl_profile_for(arr):
+    """qualityProfileId for this arr: respect WATCHLISTS_PROFILES override, else first available."""
+    for entry in (WL_PROFILES or "").split(","):
+        if "=" in entry:
+            k, v = entry.split("=", 1)
+            if k.strip().lower() == arr.name.lower():
+                try: return int(v.strip())
+                except Exception: pass
+    try:
+        profs = json.load(arr._req("GET", "/qualityprofile"))
+        if profs: return profs[0]["id"]
+    except Exception: pass
+    return 1
+
+def _wl_root_for(arr):
+    try:
+        rfs = json.load(arr._req("GET", "/rootfolder"))
+        if rfs: return rfs[0]["path"]
+    except Exception: pass
+    return None
+
+def _wl_add(item, arr):
+    """Try to add `item` to `arr`. Returns (ok, message)."""
+    qp   = _wl_profile_for(arr)
+    root = _wl_root_for(arr)
+    if not root: return False, "no rootFolder"
+    if arr.kind == "radarr" and item.get("tmdb"):
+        code, body = _wl_http("%s/movie/lookup/tmdb?tmdbId=%s" % (arr.base, item["tmdb"]),
+                              headers={"X-Api-Key": arr.apikey})
+        if code != 200: return False, "lookup HTTP %s" % code
+        try: m = json.loads(body)
+        except Exception: return False, "lookup parse failed"
+        if isinstance(m, list):
+            if not m: return False, "lookup empty"
+            m = m[0]
+        payload = {**m, "qualityProfileId": qp, "rootFolderPath": root, "monitored": True,
+                   "minimumAvailability": "released",
+                   "addOptions": {"searchForMovie": True}}
+        try:
+            arr._req("POST", "/movie", data=json.dumps(payload).encode())
+            return True, "added"
+        except urllib.error.HTTPError as e:
+            msg = ""
+            try: msg = e.read().decode("utf-8","replace")[:200]
+            except Exception: pass
+            return False, "POST /movie HTTP %s %s" % (e.code, msg[:120])
+        except Exception as e:
+            return False, "POST /movie err %s" % str(e)[:120]
+    elif arr.kind == "sonarr" and item.get("tvdb"):
+        code, body = _wl_http("%s/series/lookup?term=tvdb:%s" % (arr.base, item["tvdb"]),
+                              headers={"X-Api-Key": arr.apikey})
+        if code != 200: return False, "lookup HTTP %s" % code
+        try: arr_list = json.loads(body)
+        except Exception: return False, "lookup parse failed"
+        if not arr_list: return False, "lookup empty"
+        s = arr_list[0]
+        payload = {**s, "qualityProfileId": qp, "rootFolderPath": root, "monitored": True,
+                   "seasonFolder": True, "seriesType": s.get("seriesType") or "standard",
+                   "addOptions": {"monitor": "all", "searchForMissingEpisodes": True,
+                                  "searchForCutoffUnmetEpisodes": False}}
+        try:
+            arr._req("POST", "/series", data=json.dumps(payload).encode())
+            return True, "added"
+        except urllib.error.HTTPError as e:
+            msg = ""
+            try: msg = e.read().decode("utf-8","replace")[:200]
+            except Exception: pass
+            return False, "POST /series HTTP %s %s" % (e.code, msg[:120])
+        except Exception as e:
+            return False, "POST /series err %s" % str(e)[:120]
+    return False, "no usable id (tmdb/tvdb) for type=%s" % item.get("type")
+
+def _wl_load_state():
+    try: return json.load(open(WL_STATE))
+    except Exception: return {"added": {}}
+
+def _wl_save_state(s):
+    try:
+        os.makedirs(os.path.dirname(WL_STATE) or ".", exist_ok=True)
+        json.dump(s, open(WL_STATE, "w"))
+    except Exception as e:
+        log.debug("[watchlists] state save failed: %s", e)
+
+def check_watchlists():
+    tokens = _wl_collect_tokens()
+    if not tokens:
+        log.debug("[watchlists] no tokens (set WATCHLISTS_FRIENDS or PLEX_TOKEN+WATCHLISTS_INCLUDE_HOME=true)")
+        return
+    state = _wl_load_state()
+    added = state.setdefault("added", {})
+    id_cache = state.setdefault("plex_id_cache", {})  # plex ratingKey -> {tmdb,tvdb}
+    arr_idx = _wl_arr_index()
+    log.info("[watchlists] polling %d source(s); library skip-set: %d titles", len(tokens), len(arr_idx))
+    acts = 0; skipped_in_lib = skipped_cached = skipped_noid = 0
+    seen = set()
+    for label, tok in tokens:
+        wl = _wl_fetch(tok)
+        log.debug("[watchlists] %s: %d items", label, len(wl))
+        for it in wl:
+            # Discover's listing doesn't include external IDs; resolve via metadata endpoint
+            # (cached forever — Plex ratingKeys are immutable).
+            if not (it.get("tmdb") or it.get("tvdb")):
+                tmdb, tvdb = _wl_resolve_ids(it.get("plex_id"), tok, id_cache)
+                it["tmdb"], it["tvdb"] = tmdb, tvdb
+            # Pick the id that matches the title kind (radarr needs tmdb, sonarr needs tvdb).
+            # If the matching id isn't on the metadata response, the title cannot be auto-added.
+            t = it.get("type")
+            if t == "movie":
+                key = ("tmdb:%s" % it["tmdb"]) if it.get("tmdb") else None
+            elif t in ("show", "series"):
+                key = ("tvdb:%s" % it["tvdb"]) if it.get("tvdb") else None
+            else:
+                key = None
+            if not key:
+                log.debug("[watchlists] no usable %s id for %s (plex_id=%s)", t, it.get("title"), it.get("plex_id"))
+                skipped_noid += 1; continue
+            if key in seen: continue
+            seen.add(key)
+            if key in arr_idx:
+                skipped_in_lib += 1; continue
+            if key in added:
+                skipped_cached += 1; continue
+            if acts >= WL_MAX_ADDS:
+                log.info("[watchlists] hit per-sweep cap %d, deferring rest", WL_MAX_ADDS); break
+            kind = "radarr" if it["type"] == "movie" else "sonarr" if it["type"] in ("show", "series") else None
+            if not kind:
+                log.debug("[watchlists] unknown type %s for %s", it["type"], it["title"]); continue
+            qpref = _wl_quality_for(label)
+            arrs  = _wl_arr_for(kind, qpref)
+            if not arrs:
+                log.warning("[watchlists] %s wants %s but no matching %s instance",
+                            label, qpref, kind); continue
+            if DRY_RUN:
+                log.info("[watchlists] WOULD add (%s, q=%s, -> %s) %s (%s) from %s",
+                         kind, qpref, ",".join(a.name for a in arrs), it["title"], key, label)
+                added[key] = {"added_to": "DRY_RUN", "ts": int(time.time()), "from": label,
+                              "quality": qpref}
+                acts += 1; continue
+            # 'both' = add to every arr in the list; '4k' / '1080p' = single target.
+            # Fallback semantics: if quality=4k and the 4K add fails, fall back to 1080p (the
+            # title is still wanted, just at lower quality). For quality=both, each tier is
+            # independent (4K failing doesn't block 1080p and vice versa).
+            placed_any = False; placed_to = []
+            if qpref == "both":
+                for arr in arrs:
+                    ok, msg = _wl_add(it, arr)
+                    if ok:
+                        placed_any = True; placed_to.append(arr.name)
+                    else:
+                        log.info("[watchlists] %s -> %s failed: %s", it["title"], arr.name, msg)
+            else:
+                # single-quality with one fallback to the OTHER tier on failure
+                primary = arrs[0]
+                ok, msg = _wl_add(it, primary)
+                if ok:
+                    placed_any = True; placed_to = [primary.name]
+                else:
+                    log.info("[watchlists] %s -> %s failed: %s (trying fallback)",
+                             it["title"], primary.name, msg)
+                    other = _wl_arr_for(kind, "1080p" if qpref == "4k" else "4k")
+                    if other:
+                        ok2, msg2 = _wl_add(it, other[0])
+                        if ok2: placed_any = True; placed_to = [other[0].name]
+                        else: log.info("[watchlists] %s -> %s failed: %s",
+                                       it["title"], other[0].name, msg2)
+            if placed_any:
+                log.warning("[watchlists] added (%s, q=%s) %s (%s) -> %s -- from %s",
+                            kind, qpref, it["title"], key, "+".join(placed_to), label)
+                added[key] = {"added_to": placed_to, "ts": int(time.time()),
+                              "from": label, "quality": qpref}
+                acts += 1; arr_idx.add(key)
+            else:
+                log.warning("[watchlists] all %s instances failed for %s (%s) (q=%s, from %s)",
+                            kind, it["title"], key, qpref, label)
+        if acts >= WL_MAX_ADDS: break
+    _wl_save_state(state)
+    log.info("[watchlists] done: added=%d, already-in-library=%d, already-attempted=%d, no-external-id=%d",
+             acts, skipped_in_lib, skipped_cached, skipped_noid)
 
 
 _PROVIDER_KEYWORDS = ("indexer", "download client", "applications unavailable", "applications are unavailable")
@@ -1476,6 +1902,7 @@ CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_pr
           ("decypharr", EN_DECYPHARR, check_decypharr), ("plex", EN_PLEX, check_plex),
           ("resources", EN_RESOURCES, check_resources), ("janitor", EN_JANITOR, check_janitor),
           ("scrubber", EN_SCRUBBER, check_scrubber),
+          ("watchlists", EN_WATCHLISTS, check_watchlists),
           ("bazarr", EN_BAZARR, check_bazarr), ("seerr", EN_SEERR, check_seerr),
           ("westrepair", EN_WESTREPAIR, check_westrepair)]
 
@@ -1507,7 +1934,16 @@ UI_SCHEMA = [
               ("DOCTOR_DRY_RUN", "false"), ("DOCTOR_LOG_LEVEL", "INFO")]),
     ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
               ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""), ("ENABLE_SCRUBBER", ""),
+              ("ENABLE_WATCHLISTS", ""),
               ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", "")]),
+    ("Watchlists (Plex Home + friends -> arrs)", [
+              ("WATCHLISTS_FRIENDS", "alice:xxxx,bob:yyyy"),
+              ("WATCHLISTS_INCLUDE_HOME", "true|false"),
+              ("WATCHLISTS_HOME_PINS", "uuid1:1234,uuid2:5678"),
+              ("WATCHLISTS_QUALITY", "*=both,home/kids=1080p,alice=4k"),
+              ("WATCHLISTS_DEFAULT_QUALITY", "both"),
+              ("WATCHLISTS_MAX_ADDS_PER_SWEEP", "25"),
+              ("WATCHLISTS_PROFILES", "radarr=1,sonarr=4,radarr4k=5,sonarr4k=5")]),
     ("Scrubber (file integrity)", [
               ("SCRUBBER_PATHS", "/mnt/library/movies,/mnt/library/movies-4k,/mnt/library/tv,/mnt/library/tv-4k"),
               ("SCRUBBER_TIER", "2"), ("SCRUBBER_FULL_DECODE_ON_BAD", "false"),
