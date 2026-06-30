@@ -114,6 +114,7 @@ EN_WESTREPAIR = _b("ENABLE_WESTREPAIR", False)  # symlink repair via repair.py s
 EN_SCRUBBER   = _b("ENABLE_SCRUBBER", False)    # proactive file integrity scan (catches mid-file dead segments before playback)
 EN_WATCHLISTS = _b("ENABLE_WATCHLISTS", False)  # pull Plex Home/friends watchlists, add directly to *arr (bypasses Overseerr)
 EN_HOLIDAYS   = _b("ENABLE_HOLIDAYS", False)    # auto-build + pin pre-holiday themed Plex collections (curated per holiday)
+EN_BACKLOG    = _b("ENABLE_BACKLOG", False)     # trickle-search monitored-but-missing items that no backlog search ever found
 
 # westrepair config
 WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
@@ -304,6 +305,19 @@ HOL_STATE      = os.environ.get("HOLIDAYS_STATE_FILE", "/data/holidays.json")
 HOL_HTTP_TO    = _i("HOLIDAYS_HTTP_TIMEOUT", 40)
 HOL_MIN_INTERVAL = _i("HOLIDAYS_MIN_INTERVAL_HOURS", 12) * 3600       # holidays change daily; skip the Plex work between runs unless the active holiday changes (0=run every sweep)
 HOL_DEFS_JSON  = os.environ.get("HOLIDAYS_DEFINITIONS", "")          # JSON list to override the baked-in curated holidays
+
+# backlog: monitored-but-missing items that no search ever ran for (content that aired/released
+# before the indexers were wired up - RSS only looks forward, so these sit empty forever). Trickle
+# a few searches per sweep, gated on host load, with a per-item cooldown so genuinely-unavailable
+# titles are not re-hammered every sweep. Default scope is the 1080p instances (add 4k names later).
+BACKLOG_INSTANCES    = [s.strip() for s in os.environ.get("BACKLOG_INSTANCES", "sonarr,radarr").split(",") if s.strip()]
+BACKLOG_PER_SWEEP    = _i("BACKLOG_PER_SWEEP", 5)                    # max searches triggered per sweep
+BACKLOG_MIN_AGE_DAYS = _i("BACKLOG_MIN_AGE_DAYS", 7)                 # only items aired/released >= this many days ago (younger = leave to RSS)
+BACKLOG_RETRY_DAYS   = _i("BACKLOG_RETRY_DAYS", 7)                   # per-item cooldown: do not re-search within this window
+BACKLOG_LOAD_MAX     = _f("BACKLOG_LOAD_MAX", 12)                    # skip the whole check while host load is above this (0=ignore load)
+BACKLOG_MAX_FETCH    = _i("BACKLOG_MAX_FETCH", 2000)                 # cap on missing records pulled per instance per sweep
+BACKLOG_STATE        = os.environ.get("BACKLOG_STATE_FILE", "/data/backlog.json")
+BACKLOG_INTERVAL     = _i("BACKLOG_INTERVAL", 900)                   # min seconds between real backlog sweeps; event mode fires many sweeps/min, this throttles grab-rate + arr API load
 
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
@@ -1932,6 +1946,108 @@ def check_holidays():
     _hol_save_state(state)
 
 
+# =========================================================================== #
+# CHECK: backlog  (search monitored-but-missing items that RSS never grabbed)
+# =========================================================================== #
+
+def _backlog_load_state():
+    try: return json.load(open(BACKLOG_STATE))
+    except Exception: return {}
+
+def _backlog_save_state(s):
+    try:
+        os.makedirs(os.path.dirname(BACKLOG_STATE) or ".", exist_ok=True)
+        json.dump(s, open(BACKLOG_STATE, "w"))
+    except Exception as e:
+        log.debug("[backlog] state save failed: %s", e)
+
+def _backlog_age_days(rec, kind, now):
+    """Days since the item became available; None if it has no past air/release date (so skip it)."""
+    if kind == "sonarr":
+        cands = [rec.get("airDateUtc")]
+    else:
+        cands = [rec.get("digitalRelease"), rec.get("physicalRelease"), rec.get("inCinemas")]
+    best = None
+    for c in cands:
+        if not c: continue
+        try:
+            dt = datetime.datetime.fromisoformat(str(c).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=datetime.timezone.utc)
+        age = (now - dt).total_seconds() / 86400.0
+        if age < 0: continue                                  # not yet aired/released -> leave it
+        best = age if best is None else min(best, age)        # most-recent past date = smallest age
+    return best
+
+def check_backlog():
+    if not INSTANCES:
+        log.debug("[backlog] no arr instances"); return
+    if BACKLOG_LOAD_MAX and host_load() > BACKLOG_LOAD_MAX:
+        log.info("[backlog] host load over %.1f - skipping this sweep to keep Plex responsive", BACKLOG_LOAD_MAX); return
+    targets = [a for a in INSTANCES if a.kind in ("sonarr", "radarr") and a.name in BACKLOG_INSTANCES]
+    if not targets:
+        log.debug("[backlog] no enabled instances match BACKLOG_INSTANCES=%s", ",".join(BACKLOG_INSTANCES)); return
+    state = _backlog_load_state()
+    nowsec = time.time()
+    if BACKLOG_INTERVAL and not DRY_RUN:
+        last = float(state.get("_last_run", 0) or 0)
+        if nowsec - last < BACKLOG_INTERVAL:
+            log.debug("[backlog] last sweep %ds ago (< %ds) - throttled", int(nowsec - last), BACKLOG_INTERVAL); return
+        state["_last_run"] = nowsec
+        _backlog_save_state(state)                                  # claim the slot before any work so concurrent event-sweeps don't double-fire
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cooldown_cut = time.time() - BACKLOG_RETRY_DAYS * 86400
+    budget = max(0, BACKLOG_PER_SWEEP)
+    searched = 0
+    for arr in targets:
+        if budget <= 0: break
+        path = "/wanted/missing?monitored=true&pageSize=%d" % BACKLOG_MAX_FETCH
+        if arr.kind == "sonarr":
+            path += "&includeSeries=true"
+        data = arr.get_json(path)
+        recs = (data or {}).get("records", []) if isinstance(data, dict) else []
+        if not recs:
+            log.debug("[backlog:%s] no missing records", arr.name); continue
+        seen = state.setdefault(arr.name, {})
+        picked = []
+        for r in recs:
+            if len(picked) >= budget: break
+            iid = r.get("id")                                 # episodeId (sonarr) / movieId (radarr)
+            if not iid: continue
+            if seen.get(str(iid), 0) > cooldown_cut: continue # on cooldown
+            age = _backlog_age_days(r, arr.kind, now)
+            if age is None or age < BACKLOG_MIN_AGE_DAYS: continue   # too new (RSS will get it) or undated
+            picked.append(r)
+        if not picked:
+            continue
+        ids = [r["id"] for r in picked]
+        if arr.kind == "sonarr":
+            label = ", ".join("%s S%02dE%02d" % ((r.get("series", {}) or {}).get("title", "?"),
+                              r.get("seasonNumber") or 0, r.get("episodeNumber") or 0) for r in picked[:6])
+            body = {"name": "EpisodeSearch", "episodeIds": ids}
+        else:
+            label = ", ".join("%s (%s)" % (r.get("title", "?"), r.get("year", "")) for r in picked[:6])
+            body = {"name": "MoviesSearch", "movieIds": ids}
+        if DRY_RUN:
+            log.info("[backlog:%s] WOULD search %d missing: %s", arr.name, len(ids), label)
+            budget -= len(ids); searched += len(ids)
+            continue
+        res = arr.command(body)
+        if res is None:
+            log.warning("[backlog:%s] search command failed for %d items", arr.name, len(ids)); continue
+        nowts = time.time()
+        for i in ids: seen[str(i)] = nowts
+        budget -= len(ids); searched += len(ids)
+        log.info("[backlog:%s] searching %d missing: %s", arr.name, len(ids), label)
+    if not DRY_RUN:
+        _backlog_save_state(state)
+    if searched:
+        log.info("[backlog] triggered %d search(es) this sweep (cap %d, aged>=%dd)", searched, BACKLOG_PER_SWEEP, BACKLOG_MIN_AGE_DAYS)
+    else:
+        log.debug("[backlog] nothing eligible this sweep")
+
+
 _PROVIDER_KEYWORDS = ("indexer", "download client", "applications unavailable", "applications are unavailable")
 
 def check_providers():
@@ -2431,6 +2547,7 @@ CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_pr
           ("scrubber", EN_SCRUBBER, check_scrubber),
           ("watchlists", EN_WATCHLISTS, check_watchlists),
           ("holidays", EN_HOLIDAYS, check_holidays),
+          ("backlog", EN_BACKLOG, check_backlog),
           ("bazarr", EN_BAZARR, check_bazarr), ("seerr", EN_SEERR, check_seerr),
           ("westrepair", EN_WESTREPAIR, check_westrepair)]
 
@@ -2462,7 +2579,7 @@ UI_SCHEMA = [
               ("DOCTOR_DRY_RUN", "false"), ("DOCTOR_LOG_LEVEL", "INFO")]),
     ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
               ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""), ("ENABLE_SCRUBBER", ""),
-              ("ENABLE_WATCHLISTS", ""), ("ENABLE_HOLIDAYS", ""),
+              ("ENABLE_WATCHLISTS", ""), ("ENABLE_HOLIDAYS", ""), ("ENABLE_BACKLOG", ""),
               ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", "")]),
     ("Watchlists (Plex Home + friends -> arrs)", [
               ("WATCHLISTS_FRIENDS", "alice:xxxx,bob:yyyy"),
@@ -2487,6 +2604,11 @@ UI_SCHEMA = [
               ("SCRUBBER_REVERIFY_DAYS", "30"), ("SCRUBBER_DELETE_ARR_FILE", "true")]),
     ("Westrepair", [("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py"),
               ("WESTREPAIR_RUN_INTERVAL", "6h"), ("WESTREPAIR_REPAIR_INTERVAL", "1m")]),
+    ("Backlog (search monitored-missing)", [
+              ("BACKLOG_INSTANCES", "sonarr,radarr,sonarr4k,radarr4k"),
+              ("BACKLOG_PER_SWEEP", "5"), ("BACKLOG_MIN_AGE_DAYS", "7"),
+              ("BACKLOG_RETRY_DAYS", "7"), ("BACKLOG_LOAD_MAX", "12"),
+              ("BACKLOG_INTERVAL", "900"), ("BACKLOG_MAX_FETCH", "2000")]),
     ("Queue / churn brake", [("DOCTOR_MIN_STRIKES", "2"), ("DOCTOR_MAX_ACTIONS", "20"), ("DOCTOR_BLOCKLIST", "true"),
               ("DOCTOR_CONDITIONS", "downloadClientUnavailable,importBlocked,importFailed,importPending_warning,failedPending,stalled"),
               ("DOCTOR_CONDITION_ACTIONS", "stalled=research,importBlocked=force_import,downloadClientUnavailable=report"),
@@ -2560,6 +2682,7 @@ _UI_MULTI = {
     "DOCTOR_CONDITIONS": ["downloadClientUnavailable", "importBlocked", "importFailed",
                           "importPending_warning", "failedPending", "stalled"],
     "WARMER_SOURCES": ["ondeck", "next"],
+    "BACKLOG_INSTANCES": ["sonarr", "radarr", "sonarr4k", "radarr4k"],
 }
 _UI_BOOL = set([
     "DOCTOR_DRY_RUN", "WATCHLISTS_INCLUDE_HOME", "HOLIDAYS_PIN_HOME",

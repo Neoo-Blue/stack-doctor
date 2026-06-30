@@ -31,6 +31,7 @@ container, everything configured by env vars.
 | **scrubber** | **proactively** scans library files for bad parts that make Plex skip mid-play (dead NZB articles, torn containers, packet corruption) | quarantines the symlink (reversible) + deletes the *arr's `moviefile`/`episodefile` with `blocklist=true` so a clean release is re-searched |
 | **watchlists** | new titles on Plex Home users' + non-Home friends' watchlists that aren't in your library | adds them directly to Sonarr/Radarr (4K instance first, 1080p fallback), bypassing Overseerr entirely; per-sweep rate-cap so a dumped 300-item watchlist doesn't flood |
 | **holidays** | the calendar nearing a holiday (curated per-holiday definitions, e.g. Independence Day, Halloween, Christmas) | builds a themed movie collection a few days before and pins it to Plex Home (the recommended row), then takes it down a few days after |
+| **backlog** | monitored episodes/movies that are still **missing** and old enough that RSS will never reach back for them (e.g. content added after a source migration) | gently trickles interactive searches for them: a small per-sweep cap, a minimum age gate, a per-item cooldown, a load gate, and a minimum interval between sweeps so it never floods the download path |
 | **bazarr** | Bazarr unreachable | alerts |
 | **seerr** | Overseerr/Jellyseerr/Seerr requests stuck **FAILED** (the arr add timed out under load) | re-drives them so a transient blip self-heals (attempt-capped) |
 | **warmer** | what a viewer is about to watch (Plex On Deck + next episode) | precaches the file head so playback starts instantly |
@@ -512,6 +513,44 @@ lunar / solar-term holidays. Honors `DOCTOR_DRY_RUN` (logs each WOULD-create / W
 collection is a fixed set of ratingKeys (`smart=0`), so it is rebuilt fresh each season rather
 than tracking the library live. Out-of-season collections whose title matches one of the
 definitions are taken down automatically, so only the in-season row is ever pinned.
+
+## Backlog (drain monitored-but-missing, gently)
+
+RSS only looks **forward**: when you add a series/movie (or migrate to a new source), anything
+already aired/released in the past is monitored-missing but never searched again unless you do
+it by hand. This check trickles those searches automatically without ever flooding the download
+path, the *arr APIs, or the host.
+
+Each sweep it pulls `wanted/missing` from the chosen instances, picks the oldest items not on
+cooldown, and fires one interactive search command (`EpisodeSearch` / `MoviesSearch`). Five
+gates keep it gentle:
+
+- **`BACKLOG_PER_SWEEP`** - hard cap on searches triggered per sweep (shared across instances).
+- **`BACKLOG_MIN_AGE_DAYS`** - only items whose air/release date is this many days in the past
+  (younger ones are left to RSS / normal monitoring).
+- **`BACKLOG_RETRY_DAYS`** - per-item cooldown; once searched, an item is not retried within
+  this window even if it is still missing (so unavailable titles aren't re-hammered).
+- **`BACKLOG_LOAD_MAX`** - skip the whole sweep while host load is above this, so a busy host
+  (Plex playback, other downloads) is never piled onto.
+- **`BACKLOG_INTERVAL`** - minimum seconds between real sweeps. In `event` mode the daemon
+  sweeps on every webhook (each grab the backlog itself causes triggers more sweeps), so this
+  throttles the true grab-rate to `BACKLOG_PER_SWEEP` per interval regardless of webhook volume.
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_BACKLOG` | `false` | turn the check on |
+| `BACKLOG_INSTANCES` | `sonarr,radarr` | which instance names to drain (e.g. add `sonarr4k,radarr4k` later) |
+| `BACKLOG_PER_SWEEP` | `5` | max searches per sweep |
+| `BACKLOG_MIN_AGE_DAYS` | `7` | only search items aired/released at least this long ago |
+| `BACKLOG_RETRY_DAYS` | `7` | per-item cooldown before a still-missing item is searched again |
+| `BACKLOG_LOAD_MAX` | `12` | skip the sweep while host load exceeds this (`0` ignores load) |
+| `BACKLOG_INTERVAL` | `900` | minimum seconds between real sweeps (throttles grab-rate in event mode) |
+| `BACKLOG_MAX_FETCH` | `2000` | cap on missing records pulled per instance per sweep |
+| `BACKLOG_STATE_FILE` | `/data/backlog.json` | records per-item cooldowns + last-sweep timestamp |
+
+Honors `DOCTOR_DRY_RUN` (logs each WOULD-search, fires nothing). At the defaults it drains about
+`BACKLOG_PER_SWEEP` items every `BACKLOG_INTERVAL`, so a large backlog fills over days rather
+than in one flood, keeping Plex responsive throughout.
 
 ## Extending
 
