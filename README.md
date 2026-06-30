@@ -436,18 +436,25 @@ failing doesn't block 1080p and vice versa.
 Builds a themed movie collection a few days before each holiday and pins it to Plex Home (the
 recommended row your household sees on the home screen), then removes it a few days after. The
 curation is a hardcoded per-holiday definition (overridable via JSON). Each holiday matches
-films three ways, unioned:
+films four ways, unioned:
 
-- **`titles`** - exact film titles (case-insensitive), a true hand-curated list
-- **`keywords`** - substring match on the film title (catches the obvious ones automatically)
+- **`countries`** - every film whose Plex production-country tag matches (e.g. all Canadian
+  films for Canada Day, all China / Hong Kong / Taiwan films for Spring Festival). This is the
+  self-maintaining signal: national-cinema holidays grow automatically as the library grows, no
+  hand-curation. Friendly names resolve to Plex's exact tags (`korea` -> Republic of Korea,
+  `taiwan` -> Taiwan Province of China, `uk` -> United Kingdom)
 - **`genre`** - every film in a Plex genre (e.g. all Horror for Halloween)
+- **`keywords`** - substring match on the film title (catches the obvious ones automatically)
+- **`titles`** - exact film titles (case-insensitive), a true hand-curated list
 
 All matching is metadata-only (no file reads), so it is safe on a decypharr / FUSE library.
 
 **Pick your country (or several).** `HOLIDAYS_COUNTRIES` (default `us`) selects which curated
 sets to merge; shared holidays (New Year, Halloween, Christmas, ...) are deduped so only one
 collection is built per name. When several holidays overlap (late December stacks Christmas +
-Boxing Day + New Year), the one whose date is **nearest today** is the one shown.
+Boxing Day + New Year), the one whose date is **nearest today** is shown, except holidays from
+the **first country listed** outrank a nearer foreign one (so with `us,canada` Independence Day
+stays pinned through Jul 4 rather than yielding to the closer Canada Day on Jul 1).
 
 | country | sample holidays (themed collections) |
 |---|---|
@@ -461,8 +468,11 @@ Boxing Day + New Year), the one whose date is **nearest today** is the one shown
 
 Lunar / solar-term holidays (Spring Festival, Mid-Autumn, Seollal, Chuseok, Dragon Boat,
 Qingming) carry an explicit per-year date table (2026-2030 built in; extend in `doctor.py` or
-override via `HOLIDAYS_DEFINITIONS`). Themed matching leans on English title keywords + Plex
-genres, so a non-English library may match sparsely; tune any holiday with explicit `titles`.
+override via `HOLIDAYS_DEFINITIONS`). National-cinema holidays (Canada Day, Spring Festival,
+National Day, Shogatsu, Seollal/Chuseok/Liberation Day) match by Plex production country, so
+they populate from the whole library regardless of language and need no per-title curation. The
+purely themed rows (Christmas, Halloween, Valentine's, Independence Day, ...) still lean on
+English title keywords + Plex genres; tune any of those with explicit `titles`.
 
 | var | default | meaning |
 |---|---|---|
@@ -476,8 +486,8 @@ genres, so a non-English library may match sparsely; tune any holiday with expli
 | `HOLIDAYS_STATE_FILE` | `/data/holidays.json` | records the last-active / built / removed collection per run |
 | `HOLIDAYS_HTTP_TIMEOUT` | `40` | HTTP timeout for the Plex calls |
 
-Each definition is `{"name", "month", "day"}` plus any of `lead` / `post` / `keywords` /
-`titles` / `genre`. Floating dates use either `"rule":"thanksgiving"` (4th Thursday of November),
+Each definition is `{"name", "month", "day"}` plus any of `lead` / `post` / `countries` /
+`keywords` / `titles` / `genre`. Floating dates use either `"rule":"thanksgiving"` (4th Thursday of November),
 `"rule":"nth_weekday"` with `"weekday"` (Mon=0..Sun=6) + `"n"` (e.g. Canadian Thanksgiving =
 `month:10, weekday:0, n:2`), or a per-year `"dates":{"2026":"2026-02-17",...}` table for
 lunar / solar-term holidays. Honors `DOCTOR_DRY_RUN` (logs each WOULD-create / WOULD-remove, changes nothing). The

@@ -1482,7 +1482,7 @@ _HOLIDAY_SETS = {
     "canada": [
         _H_NEWYEAR, _H_VALENTINE,
         {"name": "Canada Day Movies", "month": 7, "day": 1, "lead": 10,
-         "keywords": ["canada", "canadian", "mountie", "hockey"]},
+         "countries": ["Canada"], "keywords": ["canadian", "mountie"]},
         {"name": "Canadian Thanksgiving Movies", "month": 10, "day": 1, "lead": 10,
          "rule": "nth_weekday", "weekday": 0, "n": 2, "keywords": ["thanksgiving", "turkey", "harvest"]},
         _H_HALLOWEEN, _H_XMAS, _H_BOXING,
@@ -1503,19 +1503,19 @@ _HOLIDAY_SETS = {
     ],
     "china": [
         {"name": "Spring Festival Movies", "dates": _D_LUNAR_NY, "lead": 14, "post": 7,
-         "keywords": ["new year", "spring festival", "kung fu", "dragon", "monkey king"]},
+         "countries": ["China", "Hong Kong", "Taiwan"], "keywords": ["spring festival"]},
         {"name": "Qingming Movies", "dates": _D_QINGMING, "lead": 5, "post": 3,
-         "keywords": ["ghost", "grave", "ancestor", "tomb"]},
+         "countries": ["China", "Hong Kong", "Taiwan"], "keywords": ["qingming", "tomb sweeping"]},
         {"name": "Dragon Boat Movies", "dates": _D_DRAGONBOAT, "lead": 5, "post": 3,
-         "keywords": ["dragon", "warrior", "hero"]},
+         "countries": ["China", "Hong Kong", "Taiwan"], "keywords": ["dragon boat"]},
         {"name": "Mid-Autumn Movies", "dates": _D_MIDAUTUMN, "lead": 7, "post": 3,
-         "keywords": ["moon", "chang'e", "mooncake"]},
+         "countries": ["China", "Hong Kong", "Taiwan"], "keywords": ["mid-autumn", "mooncake"]},
         {"name": "National Day Movies", "month": 10, "day": 1, "lead": 10, "post": 7,
-         "keywords": ["china", "chinese", "wolf warrior"]},
+         "countries": ["China", "Hong Kong"], "keywords": ["national day"]},
     ],
     "japan": [
         {"name": "New Year (Shogatsu) Movies", "month": 1, "day": 1, "lead": 7,
-         "keywords": ["new year", "shogatsu"]},
+         "countries": ["Japan"], "keywords": ["shogatsu"]},
         {"name": "Tanabata Movies", "month": 7, "day": 7, "lead": 7,
          "genre": "Romance", "keywords": ["tanabata", "star-crossed", "your name"]},
         {"name": "Obon Movies", "month": 8, "day": 13, "lead": 7, "post": 4,
@@ -1526,11 +1526,11 @@ _HOLIDAY_SETS = {
     ],
     "korea": [
         {"name": "Seollal Movies", "dates": _D_LUNAR_NY, "lead": 10, "post": 5,
-         "keywords": ["new year", "seollal", "family"]},
+         "countries": ["Republic of Korea"], "keywords": ["seollal"]},
         {"name": "Chuseok Movies", "dates": _D_MIDAUTUMN, "lead": 10, "post": 5,
-         "keywords": ["chuseok", "harvest", "family", "ancestor"]},
+         "countries": ["Republic of Korea"], "keywords": ["chuseok"]},
         {"name": "Liberation Day Movies", "month": 8, "day": 15, "lead": 7,
-         "keywords": ["korea", "korean", "liberation", "assassination"]},
+         "countries": ["Republic of Korea"], "keywords": ["liberation"]},
         _H_HALLOWEEN, _H_XMAS,
     ],
 }
@@ -1578,8 +1578,10 @@ def _hol_defs():
                 ex["keywords"] = sorted(set(ex.get("keywords", [])) | set(h.get("keywords", [])))
                 if h.get("titles"):
                     ex["titles"] = sorted(set(ex.get("titles", [])) | set(h.get("titles", [])))
+                if h.get("countries"):
+                    ex["countries"] = sorted(set(ex.get("countries", [])) | set(h.get("countries", [])))
             else:
-                merged[n] = dict(h); order.append(n)
+                merged[n] = dict(h); merged[n]["_country"] = c; order.append(n)
     if not merged:
         return list(_HOLIDAY_SETS["us"])
     return [merged[n] for n in order]
@@ -1643,6 +1645,43 @@ def _hol_genre_id(section, name):
             return str(g.get("key")).split("=")[-1]
     return None
 
+# Plex stores production country as a first-class tag (like genre); map friendly
+# names to Plex's exact titles so "korea"/"taiwan"/"uk" resolve.
+_HOL_COUNTRY_ALIASES = {
+    "us": "united states of america", "usa": "united states of america",
+    "united states": "united states of america", "america": "united states of america",
+    "uk": "united kingdom", "britain": "united kingdom", "great britain": "united kingdom",
+    "south korea": "republic of korea", "korea": "republic of korea",
+    "taiwan": "taiwan, province of china",
+}
+_HOL_COUNTRY_CACHE = {}
+
+def _hol_country_map(section):
+    if section not in _HOL_COUNTRY_CACHE:
+        d = _hol_getj("/library/sections/%s/country" % section)
+        m = {}
+        for c in d.get("MediaContainer", {}).get("Directory", []):
+            title = (c.get("title") or "").lower()
+            if title:
+                m[title] = str(c.get("key")).split("=")[-1]
+        _HOL_COUNTRY_CACHE[section] = m
+    return _HOL_COUNTRY_CACHE[section]
+
+def _hol_country_ids(section, names):
+    m = _hol_country_map(section)
+    ids = []
+    for raw in names:
+        n = _HOL_COUNTRY_ALIASES.get(raw.strip().lower(), raw.strip().lower())
+        cid = m.get(n)
+        if cid is None:
+            for title, tid in m.items():
+                if title.split(",")[0] == n:        # "taiwan, province of china" -> "taiwan"
+                    cid = tid
+                    break
+        if cid and cid not in ids:
+            ids.append(cid)
+    return ids
+
 def _hol_all_titles(section):
     d = _hol_getj("/library/sections/%s/all?X-Plex-Container-Start=0&X-Plex-Container-Size=8000" % section)
     return d.get("MediaContainer", {}).get("Metadata", [])
@@ -1656,6 +1695,11 @@ def _hol_match_keys(section, h, all_meta):
                           % (section, urllib.parse.quote(str(gid))))
             for m in d.get("MediaContainer", {}).get("Metadata", []):
                 keys.add(m["ratingKey"])
+    for cid in _hol_country_ids(section, h.get("countries", [])):
+        d = _hol_getj("/library/sections/%s/all?country=%s&X-Plex-Container-Size=8000"
+                      % (section, urllib.parse.quote(str(cid))))
+        for m in d.get("MediaContainer", {}).get("Metadata", []):
+            keys.add(m["ratingKey"])
     kws = [k.lower() for k in (list(h.get("keywords", [])) + list(h.get("extra", [])))]
     titles = set(t.lower() for t in h.get("titles", []))
     if kws or titles:
@@ -1703,6 +1747,10 @@ def check_holidays():
     names = [h.get("name") for h in defs if h.get("name")]
     today = datetime.date.today()
     inwin = _hol_in_window(defs, today)                      # nearest-date first
+    # home-country preference: the first country in HOLIDAYS_COUNTRIES wins an overlapping window
+    # even if a foreign holiday is calendar-nearer (e.g. keep Independence Day over Canada Day).
+    home = (HOL_COUNTRIES or ["us"])[0]
+    inwin.sort(key=lambda hd: (0 if hd[0].get("_country") == home else 1, hd[1]))
     sig = ",".join(sorted(h.get("name", "") for h, _ in inwin))
 
     # daily cadence: the set of in-window holidays only changes day-to-day, so between runs
