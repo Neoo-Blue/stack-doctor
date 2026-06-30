@@ -22,7 +22,7 @@ container, everything configured by env vars.
 
 | check | detects | fixes |
 |---|---|---|
-| **queue** | stuck/dead/blocked *arr download-queue items | removes + blocklists -> *arr re-searches a different release |
+| **queue** | stuck/dead/blocked *arr download-queue items | per-condition fix action: `report`, `research` (remove + blocklist -> re-search), `remove` (no blocklist), or `force_import` (ManualImport files already on disk) |
 | **providers** | failed indexers / download clients (sonarr/radarr/**prowlarr**) | runs the **Test** on them to re-validate + clear the failure |
 | **decypharr** | hung FUSE mount (read-test) + API down | runs your restart hook (`DECYPHARR_RESTART_CMD`) |
 | **plex** | Plex unresponsive | alerts (optional library refresh) |
@@ -59,21 +59,36 @@ Same `doctor.py`, same env vars; you just enable more checks where it has more p
 
 ## What the queue check fixes
 
-Each is a named **condition** you can enable/disable via `DOCTOR_CONDITIONS`:
+Each is a named **condition** you can enable/disable via `DOCTOR_CONDITIONS`, and each condition
+maps to a **fix action** you choose via `DOCTOR_CONDITION_ACTIONS` (so the remediation fits the
+failure, instead of one blunt response for everything):
 
-| condition | what it catches |
-|---|---|
-| `downloadClientUnavailable` | dead grabs the download client rejected (orphans that never go away) |
-| `importBlocked` | completed download the *arr refuses to import |
-| `importFailed` | import attempted and failed |
-| `importPending_warning` | completed but stuck pending with a warning, usually an **incomplete/corrupt file ffprobe can't parse** |
-| `failedPending` | failed download awaiting handling |
-| `stalled` | download flagged with a stall / "no files" warning |
+| condition | what it catches | default action |
+|---|---|---|
+| `downloadClientUnavailable` | the download client was unreachable for this grab | **`report`** |
+| `importBlocked` | completed download the *arr refuses to import | **`force_import`** |
+| `importPending_warning` | completed but stuck pending with a warning | **`force_import`** |
+| `importFailed` | import attempted and failed | **`research`** |
+| `failedPending` | failed download awaiting handling | **`research`** |
+| `stalled` | download flagged with a stall / "no files" warning | **`research`** |
 
-The fix is always the same and safe: `DELETE` the queue item with `removeFromClient=true`
-and (by default) `blocklist=true`. With `autoRedownloadFailed` on in your *arr (the default),
-that triggers a fresh search for another release. It's **self-limiting**, once every bad
-release for an item is blocklisted, there's nothing left to grab, so the churn stops.
+The four actions:
+
+| action | what it does | use it for |
+|---|---|---|
+| `report` | log only, change nothing | client-side blips (`downloadClientUnavailable`) where blocklisting a good release would be wrong |
+| `research` | `DELETE` the queue item (`removeFromClient=true`, `blocklist=DOCTOR_BLOCKLIST`) so the *arr searches a **different** release | genuinely dead/stalled/failed releases |
+| `remove` | same delete but **never** blocklists, so the *arr can re-grab the **same** release | flaky-but-not-bad releases you want retried, not banned |
+| `force_import` | calls the *arr's **ManualImport** on the files already on disk (`DOCTOR_IMPORT_MODE` = `auto`/`move`/`copy`) | imports that stalled even though the file is fine, no re-download |
+
+`research` (with `autoRedownloadFailed` on in your *arr) is **self-limiting**: once every bad
+release for an item is blocklisted there's nothing left to grab, so the churn stops. Anything
+not listed in `DOCTOR_CONDITION_ACTIONS` falls back to `DOCTOR_DEFAULT_ACTION` (`research`).
+
+Why `downloadClientUnavailable` defaults to `report`: when the client is briefly down, every
+in-flight grab reports that status. Removing + blocklisting them would ban perfectly good
+releases for a problem that wasn't theirs. The `providers` and `decypharr` checks handle an
+actually-down client; the queue check just waits.
 
 ---
 
@@ -170,7 +185,10 @@ LAN isn't trusted. In event mode the webhook listener (`DOCTOR_PORT`) and the da
 | `DOCTOR_INTERVAL` | `900` | cron: seconds between sweeps |
 | `DOCTOR_MIN_STRIKES` | `2` | item must be stuck this many consecutive checks before action (ignores transient blips like a download-client restart) |
 | `DOCTOR_MAX_ACTIONS` | `20` | max removals per sweep (rate limit, keeps re-searches gentle) |
-| `DOCTOR_BLOCKLIST` | `true` | blocklist removed grabs so a *different* release is fetched |
+| `DOCTOR_BLOCKLIST` | `true` | when a `research` action removes a grab, also blocklist it so a *different* release is fetched |
+| `DOCTOR_CONDITION_ACTIONS` | *(safe defaults)* | per-condition fix map, e.g. `stalled=research,importBlocked=force_import,downloadClientUnavailable=report`. Unset conditions use their built-in default (see condition table), then `DOCTOR_DEFAULT_ACTION` |
+| `DOCTOR_DEFAULT_ACTION` | `research` | fallback action for any condition not in the map: `report` / `research` / `remove` / `force_import` |
+| `DOCTOR_IMPORT_MODE` | `auto` | how `force_import` brings files in: `auto` (let the *arr decide), `move`, or `copy` |
 | `DOCTOR_CHURN_LIMIT` | `0` | churn brake: after this many dead grabs of the *same* episode/movie, stop the loop (`0` = off). Catches releases that re-grab despite blocklist, or titles where only dead releases exist |
 | `DOCTOR_CHURN_ACTION` | `report` | what the brake does: `report` (log only), `park` (un-monitor), or `backoff` (un-monitor, then auto re-monitor on the schedule below for a fresh try) |
 | `DOCTOR_CHURN_BACKOFF` | `10m,1h,24h` | `backoff`: escalating retry schedule (`s`/`m`/`h`/`d` units). Each park steps to the next delay; the last entry repeats. Default = retry 10m after the 1st park, 1h after the 2nd, every 24h after. (Legacy `DOCTOR_CHURN_COOLDOWN` still honored as a single fixed delay.) |

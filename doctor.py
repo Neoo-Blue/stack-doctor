@@ -153,6 +153,30 @@ if not CHURN_BACKOFF:
     CHURN_BACKOFF = [_dur(_legacy)] if _legacy else [600, 3600, 86400]
 DEFAULT_CONDITIONS = "downloadClientUnavailable,importBlocked,importFailed,importPending_warning,failedPending,stalled"
 ENABLED_CONDITIONS = [c.strip() for c in os.environ.get("DOCTOR_CONDITIONS", DEFAULT_CONDITIONS).split(",") if c.strip()]
+# per-condition remediation: each detected condition maps to a fix action.
+#   report       - log only, change nothing (e.g. client-unavailable: don't blocklist a good release)
+#   research     - remove + blocklist (honors DOCTOR_BLOCKLIST) so the arr re-searches a fresh release
+#   remove       - remove + re-search but never blocklist (give the same release another shot)
+#   force_import - call the arr's ManualImport on already-downloaded files (no re-download)
+_VALID_ACTIONS = ("report", "research", "remove", "force_import")
+_DEFAULT_ACTIONS = {
+    "downloadClientUnavailable": "report",        # client is down, not the release's fault -> never blocklist
+    "importBlocked":             "force_import",
+    "importPending_warning":     "force_import",
+    "importFailed":              "research",
+    "failedPending":             "research",
+    "stalled":                   "research",
+}
+DEFAULT_ACTION = os.environ.get("DOCTOR_DEFAULT_ACTION", "research").strip().lower()
+if DEFAULT_ACTION not in _VALID_ACTIONS:
+    DEFAULT_ACTION = "research"
+CONDITION_ACTIONS = dict(_DEFAULT_ACTIONS)
+for _kv in os.environ.get("DOCTOR_CONDITION_ACTIONS", "").split(","):
+    if "=" in _kv:
+        _c, _a = _kv.split("=", 1)
+        if _c.strip() and _a.strip().lower() in _VALID_ACTIONS:
+            CONDITION_ACTIONS[_c.strip()] = _a.strip().lower()
+IMPORT_MODE = os.environ.get("DOCTOR_IMPORT_MODE", "auto").strip().lower()   # auto|move|copy
 
 # resource thresholds (host load uses /proc/loadavg if mounted)
 LOAD_MAX        = _f("DOCTOR_LOAD_MAX", 0)         # queue check pauses above this (0=off)
@@ -366,6 +390,44 @@ def stuck_reason(rec):
             return name
     return None
 
+def _action_for(cond):
+    return CONDITION_ACTIONS.get(cond, DEFAULT_ACTION)
+
+def _force_import(arr, rec):
+    """Ask the arr to ManualImport the files already on disk for this download (no re-download).
+    Returns the number of files queued for import (0 = nothing importable)."""
+    did = rec.get("downloadId")
+    if not did:
+        return 0
+    cands = arr.get_json("/manualimport?downloadId=%s&filterExistingFiles=true"
+                         % urllib.parse.quote(str(did)))
+    if not isinstance(cands, list):
+        return 0
+    files = []
+    for it in cands:
+        if it.get("rejections"):                 # arr found a blocking reason (sample, unknown, etc.)
+            continue
+        f = {"path": it.get("path"), "folderName": it.get("folderName", ""),
+             "quality": it.get("quality"), "languages": it.get("languages"),
+             "releaseGroup": it.get("releaseGroup", ""), "indexerFlags": it.get("indexerFlags", 0),
+             "downloadId": did}
+        if arr.kind == "sonarr":
+            ser = it.get("series") or {}
+            eps = [e.get("id") for e in (it.get("episodes") or []) if e.get("id")]
+            if not ser.get("id") or not eps:
+                continue
+            f["seriesId"] = ser["id"]; f["episodeIds"] = eps
+        else:
+            mov = it.get("movie") or {}
+            if not mov.get("id"):
+                continue
+            f["movieId"] = mov["id"]
+        files.append(f)
+    if not files:
+        return 0
+    res = arr.command({"name": "ManualImport", "importMode": IMPORT_MODE, "files": files})
+    return len(files) if res is not None else 0
+
 class Arr:
     def __init__(self, name, kind, url, apikey):
         self.name, self.kind = name, kind                       # sonarr | radarr | prowlarr
@@ -392,8 +454,9 @@ class Arr:
         except Exception:
             return []
 
-    def remove(self, item_id):
-        q = "removeFromClient=%s&blocklist=%s" % (str(REMOVE_CLIENT).lower(), str(BLOCKLIST).lower())
+    def remove(self, item_id, blocklist=None):
+        bl = BLOCKLIST if blocklist is None else blocklist
+        q = "removeFromClient=%s&blocklist=%s" % (str(REMOVE_CLIENT).lower(), str(bl).lower())
         self._req("DELETE", "/queue/%d?%s" % (item_id, q))
 
     def post(self, path, t=150):
@@ -406,6 +469,19 @@ class Arr:
             except Exception: return []
         except Exception as ex:
             log.debug("[%s] POST %s err %s", self.name, path, str(ex)[:50]); return []
+
+    def get_json(self, path, t=None):
+        try:
+            return json.load(self._req("GET", path, t=t))
+        except Exception as e:
+            log.debug("[%s] GET %s err %s", self.name, path, str(e)[:60]); return None
+
+    def command(self, body, t=120):
+        """POST /command with a JSON body (e.g. ManualImport). Returns parsed JSON or None."""
+        try:
+            return json.load(self._req("POST", "/command", data=json.dumps(body).encode(), t=t))
+        except Exception as e:
+            log.warning("[%s] command %s failed: %s", self.name, body.get("name"), str(e)[:90]); return None
 
     def set_monitored(self, ids, monitored):
         """Bulk toggle monitoring for episodes (sonarr) / movies (radarr). Used by the churn brake."""
@@ -521,19 +597,38 @@ def check_queue(only=None):
             reason = stuck_reason(r)
             if not reason:
                 continue
+            action = _action_for(reason)
+            title = (r.get("title") or "")[:70]
+            if action == "report":
+                log.info("[queue:%s] %s (report-only, no change): %s", arr.name, reason, title)
+                continue
             stuck += 1; iid = str(r.get("id")); cnt = strikes.get(iid, 0) + 1; new[iid] = cnt
-            if cnt >= MIN_STRIKES and actions < MAX_ACTIONS:
-                title = (r.get("title") or "")[:70]
-                if DRY_RUN:
-                    log.info("[queue:%s] WOULD remove (%s strike %d): %s", arr.name, reason, cnt, title)
+            if cnt < MIN_STRIKES or actions >= MAX_ACTIONS:
+                continue
+            if DRY_RUN:
+                log.info("[queue:%s] WOULD %s (%s strike %d): %s", arr.name, action, reason, cnt, title)
+                continue
+            if action == "force_import":
+                try:
+                    n = _force_import(arr, r)
+                except Exception as e:
+                    log.warning("[queue:%s] force_import failed: %s", arr.name, str(e)[:90]); n = 0
+                if n:
+                    actions += 1; new.pop(iid, None)
+                    log.info("[queue:%s] force-imported %d file(s) (%s): %s", arr.name, n, reason, title)
                 else:
-                    parked = _churn_record(state, arr, r, title)   # un-monitor first so the remove can't re-search
-                    try:
-                        arr.remove(r["id"]); actions += 1; new.pop(iid, None)
-                        log.info("[queue:%s] removed (%s, blocklist=%s)%s: %s", arr.name, reason, BLOCKLIST,
-                                 " [parked, no re-search]" if parked else " -> re-search", title)
-                    except Exception as e:
-                        log.warning("[queue:%s] remove failed: %s", arr.name, e)
+                    log.info("[queue:%s] %s: nothing importable yet, leaving (strike %d): %s",
+                             arr.name, reason, cnt, title)
+            else:   # research (remove + blocklist) | remove (remove, never blocklist)
+                bl = BLOCKLIST if action == "research" else False
+                parked = _churn_record(state, arr, r, title)   # un-monitor first so the remove can't re-search
+                try:
+                    arr.remove(r["id"], blocklist=bl); actions += 1; new.pop(iid, None)
+                    log.info("[queue:%s] removed (%s, action=%s, blocklist=%s)%s: %s",
+                             arr.name, reason, action, str(bl).lower(),
+                             " [parked, no re-search]" if parked else " -> re-search", title)
+                except Exception as e:
+                    log.warning("[queue:%s] remove failed: %s", arr.name, e)
         state[arr.name] = new
         if stuck:
             log.info("[queue:%s] %d stuck tracked, %d acted", arr.name, stuck, actions)
@@ -2393,6 +2488,9 @@ UI_SCHEMA = [
     ("Westrepair", [("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py"),
               ("WESTREPAIR_RUN_INTERVAL", "6h"), ("WESTREPAIR_REPAIR_INTERVAL", "1m")]),
     ("Queue / churn brake", [("DOCTOR_MIN_STRIKES", "2"), ("DOCTOR_MAX_ACTIONS", "20"), ("DOCTOR_BLOCKLIST", "true"),
+              ("DOCTOR_CONDITIONS", "downloadClientUnavailable,importBlocked,importFailed,importPending_warning,failedPending,stalled"),
+              ("DOCTOR_CONDITION_ACTIONS", "stalled=research,importBlocked=force_import,downloadClientUnavailable=report"),
+              ("DOCTOR_DEFAULT_ACTION", "report|research|remove|force_import"), ("DOCTOR_IMPORT_MODE", "auto|move|copy"),
               ("DOCTOR_CHURN_LIMIT", "0"), ("DOCTOR_CHURN_ACTION", "report|park|backoff"), ("DOCTOR_CHURN_BACKOFF", "10m,1h,24h")]),
     ("Warmer", [("WARMER_PRECACHE_MB", "64"), ("WARMER_TAIL_MB", "8"), ("WARMER_SOURCES", "ondeck,next"),
               ("WARMER_ONDECK", "true|false"), ("WARMER_MAX_PER_CYCLE", "40"), ("WARMER_NEXT_EPISODES", "1"),
@@ -2457,11 +2555,36 @@ def _ui_westrepair():
     s["enabled"] = EN_WESTREPAIR
     return s
 
+_UI_MULTI = {
+    "HOLIDAYS_COUNTRIES": ["us", "canada", "uk", "china", "japan", "korea", "australia"],
+    "DOCTOR_CONDITIONS": ["downloadClientUnavailable", "importBlocked", "importFailed",
+                          "importPending_warning", "failedPending", "stalled"],
+    "WARMER_SOURCES": ["ondeck", "next"],
+}
+_UI_BOOL = set([
+    "DOCTOR_DRY_RUN", "WATCHLISTS_INCLUDE_HOME", "HOLIDAYS_PIN_HOME",
+    "SCRUBBER_FULL_DECODE_ON_BAD", "SCRUBBER_DELETE_ARR_FILE",
+    "DOCTOR_BLOCKLIST", "WARMER_ONDECK",
+])
+
+def _ui_control(k, ph):
+    """Pick a dashboard control kind for a config key: multi-checkbox, dropdown, or text."""
+    if k in _UI_MULTI:
+        return "multi", _UI_MULTI[k]
+    if k.startswith("ENABLE_") or k in _UI_BOOL:
+        return "bool", ["true", "false"]
+    if "|" in ph:
+        return "select", [o.strip() for o in ph.split("|") if o.strip()]
+    return "text", []
+
 def _ui_config():
     groups = []
     for g, items in UI_SCHEMA:
-        rows = [{"key": k, "val": ("" if _is_secret(k) else os.environ.get(k, "")), "ph": ph, "secret": _is_secret(k)}
-                for k, ph in items]
+        rows = []
+        for k, ph in items:
+            ct, opts = _ui_control(k, ph)
+            rows.append({"key": k, "val": ("" if _is_secret(k) else os.environ.get(k, "")),
+                         "ph": ph, "secret": _is_secret(k), "type": ct, "options": opts})
         groups.append({"group": g, "rows": rows})
     return {"groups": groups, "file": CONFIG_FILE}
 
@@ -2494,32 +2617,55 @@ def _ui_logs(n):
         return "log read error: " + str(e)[:80]
 
 UI_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>stack-doctor</title><style>
-:root{--bg:#0d1117;--card:#161b22;--bd:#21262d;--fg:#c9d1d9;--mut:#8b949e;--ok:#3fb950;--off:#6e7681;--bad:#f85149;--ac:#2f81f7;--warn:#d29922}
-*{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--fg)}
-header{padding:13px 18px;border-bottom:1px solid var(--bd);display:flex;gap:12px;align-items:baseline}
-h1{font-size:15px;margin:0;letter-spacing:.02em}.mut{color:var(--mut);font-size:12px}
-nav{display:flex;gap:6px;padding:10px 18px 0}
-nav button{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:6px 6px 0 0;padding:7px 14px;cursor:pointer;font-size:13px}
-nav button.active{color:#fff;background:var(--bg);border-color:var(--ac)}
-main{padding:14px 18px 40px}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:14px;margin:0 0 14px}
-h3{margin:0 0 10px;font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.07em}
-.badge{display:inline-block;padding:2px 9px;border-radius:11px;font-size:12px;font-weight:600}
-.b-on{background:rgba(63,185,80,.16);color:var(--ok)}.b-off{background:rgba(110,118,129,.16);color:var(--off)}.b-bad{background:rgba(248,81,73,.16);color:var(--bad)}
-.row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--bd)}.row:last-child{border:0}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
-.chip{display:flex;justify-content:space-between;align-items:center;background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:7px 10px}
-.big{font-size:26px;font-weight:700}
-table{width:100%;border-collapse:collapse;font-size:13px}td{padding:5px 6px;border-bottom:1px solid var(--bd)}td.why{color:var(--mut)}td.ago{color:var(--mut);text-align:right;white-space:nowrap}
-label{display:block;color:var(--mut);font-size:11px;margin:9px 0 3px}
-input{width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:5px;padding:6px 8px;font:13px ui-monospace,monospace}
-input:disabled{color:var(--mut)}
-.cfg{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:6px 12px}
-button.act{background:var(--ac);color:#fff;border:0;border-radius:6px;padding:9px 16px;cursor:pointer;font-size:13px;margin-right:8px}
-button.warn{background:var(--warn);color:#1a1a1a}
-pre{background:#010409;border:1px solid var(--bd);border-radius:8px;padding:12px;margin:0;max-height:66vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12px/1.45 ui-monospace,monospace}
-#toast{position:fixed;right:16px;bottom:16px;background:var(--card);border:1px solid var(--ac);padding:10px 14px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none}
+<meta name=viewport content="width=device-width,initial-scale=1"><title>stack-doctor</title>
+<link rel=preconnect href="https://fonts.googleapis.com"><link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel=stylesheet>
+<style>
+:root{--bg:#05070f;--card:rgba(18,26,46,.55);--card2:rgba(12,18,34,.72);--bd:rgba(120,160,255,.16);--bd2:rgba(120,160,255,.3);--fg:#dbe4ff;--mut:#7e8cb8;--ok:#34d399;--off:#5b6788;--bad:#fb7185;--ac:#22d3ee;--ac2:#a855f7;--warn:#fbbf24;--glow:0 0 18px rgba(34,211,238,.35);--sans:'Inter',system-ui,Segoe UI,sans-serif;--mono:'JetBrains Mono',ui-monospace,monospace}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;font:14px/1.55 var(--sans);background:var(--bg);color:var(--fg);-webkit-font-smoothing:antialiased}
+body::before{content:"";position:fixed;inset:0;z-index:-2;background:radial-gradient(900px 500px at 12% -10%,rgba(34,211,238,.16),transparent 60%),radial-gradient(800px 500px at 100% 0,rgba(168,85,247,.16),transparent 55%),radial-gradient(700px 600px at 50% 120%,rgba(56,189,248,.10),transparent 60%),var(--bg)}
+body::after{content:"";position:fixed;inset:0;z-index:-1;background-image:linear-gradient(rgba(120,160,255,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(120,160,255,.05) 1px,transparent 1px);background-size:42px 42px;-webkit-mask-image:radial-gradient(ellipse at 50% 0,#000,transparent 80%);mask-image:radial-gradient(ellipse at 50% 0,#000,transparent 80%)}
+header{padding:16px 22px;display:flex;gap:14px;align-items:baseline;border-bottom:1px solid var(--bd);background:linear-gradient(180deg,rgba(10,15,31,.7),transparent);backdrop-filter:blur(8px);position:sticky;top:0;z-index:5}
+h1{font-size:17px;margin:0;font-weight:700;letter-spacing:.04em;background:linear-gradient(90deg,var(--ac),var(--ac2));-webkit-background-clip:text;background-clip:text;color:transparent}
+h1::before{content:"\25C8 ";-webkit-text-fill-color:var(--ac);color:var(--ac)}
+.mut{color:var(--mut);font-size:12px}
+nav{display:flex;gap:8px;padding:14px 22px 0;flex-wrap:wrap}
+nav button{background:var(--card2);color:var(--mut);border:1px solid var(--bd);border-radius:9px;padding:8px 16px;cursor:pointer;font:600 13px var(--sans);letter-spacing:.02em;transition:.18s;backdrop-filter:blur(6px)}
+nav button:hover{color:var(--fg);border-color:var(--bd2)}
+nav button.active{color:#04121a;background:linear-gradient(90deg,var(--ac),#67e8f9);border-color:transparent;box-shadow:var(--glow)}
+main{padding:18px 22px 56px;max-width:1240px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:16px;margin:0 0 16px;backdrop-filter:blur(10px);box-shadow:0 1px 0 rgba(255,255,255,.03) inset,0 10px 30px rgba(0,0,0,.35)}
+h3{margin:0 0 12px;font-size:11px;color:var(--ac);text-transform:uppercase;letter-spacing:.16em;font-weight:600}
+.badge{display:inline-block;padding:3px 11px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid transparent}
+.b-on{background:rgba(52,211,153,.12);color:var(--ok);border-color:rgba(52,211,153,.35);box-shadow:0 0 12px rgba(52,211,153,.18)}
+.b-off{background:rgba(91,103,136,.12);color:var(--off);border-color:rgba(91,103,136,.3)}
+.b-bad{background:rgba(251,113,133,.12);color:var(--bad);border-color:rgba(251,113,133,.4);box-shadow:0 0 12px rgba(251,113,133,.18)}
+.row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--bd)}.row:last-child{border:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
+.chip{display:flex;justify-content:space-between;align-items:center;background:var(--card2);border:1px solid var(--bd);border-radius:10px;padding:9px 12px;transition:.18s}
+.chip:hover{border-color:var(--bd2);transform:translateY(-1px)}
+.big{font-size:28px;font-weight:700;color:#fff;text-shadow:0 0 18px rgba(34,211,238,.3)}
+table{width:100%;border-collapse:collapse;font-size:13px}td{padding:6px;border-bottom:1px solid var(--bd)}td.why{color:var(--mut)}td.ago{color:var(--mut);text-align:right;white-space:nowrap}
+label{display:block;color:var(--mut);font-size:11px;margin:11px 0 4px;letter-spacing:.02em;font-family:var(--mono)}
+input,select{width:100%;background:rgba(5,9,18,.8);color:var(--fg);border:1px solid var(--bd);border-radius:8px;padding:8px 10px;font:13px var(--mono);transition:.15s}
+input:focus,select:focus{outline:0;border-color:var(--ac);box-shadow:var(--glow)}
+input:disabled{color:var(--mut);opacity:.7}
+select{appearance:none;-webkit-appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--ac) 50%),linear-gradient(135deg,var(--ac) 50%,transparent 50%);background-position:calc(100% - 16px) 17px,calc(100% - 11px) 17px;background-size:5px 5px;background-repeat:no-repeat;cursor:pointer}
+select option{background:#0a0f1f;color:var(--fg)}
+.cfg{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px 16px}
+.multi{display:flex;flex-wrap:wrap;gap:6px;padding:2px 0}
+.multi label{display:inline-flex;align-items:center;gap:6px;margin:0;padding:5px 10px;background:rgba(5,9,18,.8);border:1px solid var(--bd);border-radius:999px;color:var(--fg);font-size:12px;font-family:var(--mono);cursor:pointer;transition:.15s}
+.multi label:hover{border-color:var(--bd2)}
+.multi label.on{border-color:var(--ac);color:var(--ac);box-shadow:0 0 10px rgba(34,211,238,.2)}
+.multi input{width:auto;accent-color:var(--ac)}
+button.act{background:linear-gradient(90deg,var(--ac),#3b82f6);color:#04121a;border:0;border-radius:9px;padding:10px 18px;cursor:pointer;font:600 13px var(--sans);margin-right:8px;box-shadow:var(--glow);transition:.18s}
+button.act:hover{filter:brightness(1.08);transform:translateY(-1px)}
+button.warn{background:linear-gradient(90deg,var(--warn),#f59e0b);color:#1a1304;box-shadow:0 0 16px rgba(251,191,36,.3)}
+pre{background:rgba(2,5,12,.85);border:1px solid var(--bd);border-radius:12px;padding:14px;margin:0;max-height:66vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12px/1.5 var(--mono);color:#aeb9e6}
+details summary{color:var(--ac)!important}
+#toast{position:fixed;right:18px;bottom:18px;background:var(--card2);border:1px solid var(--ac);color:var(--fg);padding:11px 16px;border-radius:10px;opacity:0;transition:.3s;pointer-events:none;backdrop-filter:blur(8px);box-shadow:var(--glow)}
+::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:rgba(120,160,255,.25);border-radius:6px}::-webkit-scrollbar-track{background:transparent}
 </style></head><body>
 <header><h1>stack-doctor</h1><span class=mut id=sub>loading</span></header>
 <nav><button data-t=dash class=active>Dashboard</button><button data-t=config>Config</button><button data-t=logs>Logs</button></nav>
@@ -2579,15 +2725,34 @@ function loadDash(){
   var lp=E('wr-logpre');if(lp)lp.scrollTop=lp.scrollHeight;});
 }
 function plexRescan(){fetch(q('/api/westrepair/rescan'),{method:'POST'}).then(function(r){return r.json()}).then(function(r){toast(r.msg||'triggered')})}
+function ctl(r){
+ if(r.secret)return '<input value="set in unit (hidden)" disabled>';
+ var k=esc(r.key),v=r.val==null?'':''+r.val;
+ if(r.type==='multi'){var set={};v.split(',').forEach(function(x){x=x.trim();if(x)set[x]=1});
+  var h='<div class=multi id="cf_'+k+'" data-ct=multi>';
+  for(var i=0;i<r.options.length;i++){var o=r.options[i],on=!!set[o];
+   h+='<label class="'+(on?'on':'')+'"><input type=checkbox value="'+esc(o)+'"'+(on?' checked':'')+" onchange=\"this.parentNode.classList.toggle('on',this.checked)\"> "+esc(o)+'</label>'}
+  return h+'</div>'}
+ if(r.type==='select'||r.type==='bool'){var has=false;
+  for(var i=0;i<r.options.length;i++)if(''+r.options[i]===v)has=true;
+  var h='<select id="cf_'+k+'" data-ct=select><option value=""'+(v===''?' selected':'')+'>(default)</option>';
+  for(var i=0;i<r.options.length;i++){var o=esc(r.options[i]);h+='<option'+(''+r.options[i]===v?' selected':'')+'>'+o+'</option>'}
+  if(v!==''&&!has)h+='<option selected>'+esc(v)+'</option>';
+  return h+'</select>'}
+ return '<input id="cf_'+k+'" data-ct=text value="'+esc(v)+'" placeholder="'+esc(r.ph)+'">';
+}
 function loadConfig(){fetch(q('/api/config')).then(function(r){return r.json()}).then(function(c){
   var h='';for(var g=0;g<c.groups.length;g++){var grp=c.groups[g];h+='<div class=card><h3>'+esc(grp.group)+'</h3><div class=cfg>';
-   for(var i=0;i<grp.rows.length;i++){var r=grp.rows[i];h+='<div><label>'+esc(r.key)+'</label>';
-    if(r.secret)h+='<input value="set in unit (hidden)" disabled>';
-    else h+='<input id="cf_'+esc(r.key)+'" value="'+esc(r.val)+'" placeholder="'+esc(r.ph)+'">';h+='</div>'}
+   for(var i=0;i<grp.rows.length;i++){var r=grp.rows[i];h+='<div><label>'+esc(r.key)+'</label>'+ctl(r)+'</div>'}
    h+='</div></div>'}
   h+='<div class=card><button class=act onclick=saveCfg()>Save</button><button class="act warn" onclick=restart()>Save and Restart</button> <span class=mut>changes apply after a restart</span></div>';
   E('config').innerHTML=h})}
-function gather(){var o={},els=document.querySelectorAll('[id^=cf_]');for(var i=0;i<els.length;i++)o[els[i].id.slice(3)]=els[i].value;return o}
+function gather(){var o={},els=document.querySelectorAll('[id^=cf_]');
+ for(var i=0;i<els.length;i++){var el=els[i],k=el.id.slice(3),ct=el.getAttribute('data-ct');
+  if(ct==='multi'){var cbs=el.querySelectorAll('input[type=checkbox]'),vals=[];
+   for(var j=0;j<cbs.length;j++)if(cbs[j].checked)vals.push(cbs[j].value);o[k]=vals.join(',')}
+  else o[k]=el.value}
+ return o}
 function saveCfg(){fetch(q('/api/config'),{method:'POST',body:JSON.stringify(gather())}).then(function(r){return r.json()}).then(function(r){toast(r.msg||'saved')})}
 function restart(){fetch(q('/api/config'),{method:'POST',body:JSON.stringify(gather())}).then(function(){return fetch(q('/api/restart'),{method:'POST'})}).then(function(){toast('restarting')}).then(function(){setTimeout(function(){show('dash')},4500)})}
 function loadLogs(){fetch(q('/api/logs?n=400')).then(function(r){return r.text()}).then(function(t){
