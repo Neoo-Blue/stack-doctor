@@ -30,6 +30,7 @@ container, everything configured by env vars.
 | **janitor** | permanently-dead usenet releases (from decypharr's log) | quarantines those library symlinks (reversible) |
 | **scrubber** | **proactively** scans library files for bad parts that make Plex skip mid-play (dead NZB articles, torn containers, packet corruption) | quarantines the symlink (reversible) + deletes the *arr's `moviefile`/`episodefile` with `blocklist=true` so a clean release is re-searched |
 | **watchlists** | new titles on Plex Home users' + non-Home friends' watchlists that aren't in your library | adds them directly to Sonarr/Radarr (4K instance first, 1080p fallback), bypassing Overseerr entirely; per-sweep rate-cap so a dumped 300-item watchlist doesn't flood |
+| **holidays** | the calendar nearing a holiday (curated per-holiday definitions, e.g. Independence Day, Halloween, Christmas) | builds a themed movie collection a few days before and pins it to Plex Home (the recommended row), then takes it down a few days after |
 | **bazarr** | Bazarr unreachable | alerts |
 | **seerr** | Overseerr/Jellyseerr/Seerr requests stuck **FAILED** (the arr add timed out under load) | re-drives them so a transient blip self-heals (attempt-capped) |
 | **warmer** | what a viewer is about to watch (Plex On Deck + next episode) | precaches the file head so playback starts instantly |
@@ -429,6 +430,60 @@ the arrs every sweep for the same items.
 fallback version). Single-quality adds fall back to the other tier on failure (so an
 unavailable 4K release still gets the 1080p drop). `both` runs each tier independently — 4K
 failing doesn't block 1080p and vice versa.
+
+## Holidays (pre-holiday themed Plex rows)
+
+Builds a themed movie collection a few days before each holiday and pins it to Plex Home (the
+recommended row your household sees on the home screen), then removes it a few days after. The
+curation is a hardcoded per-holiday definition (overridable via JSON). Each holiday matches
+films three ways, unioned:
+
+- **`titles`** - exact film titles (case-insensitive), a true hand-curated list
+- **`keywords`** - substring match on the film title (catches the obvious ones automatically)
+- **`genre`** - every film in a Plex genre (e.g. all Horror for Halloween)
+
+All matching is metadata-only (no file reads), so it is safe on a decypharr / FUSE library.
+
+**Pick your country (or several).** `HOLIDAYS_COUNTRIES` (default `us`) selects which curated
+sets to merge; shared holidays (New Year, Halloween, Christmas, ...) are deduped so only one
+collection is built per name. When several holidays overlap (late December stacks Christmas +
+Boxing Day + New Year), the one whose date is **nearest today** is the one shown.
+
+| country | sample holidays (themed collections) |
+|---|---|
+| `us` | New Year, Valentine's, St. Patrick's, Independence Day, Halloween, Thanksgiving (4th Thu Nov), Christmas |
+| `canada` | Canada Day, Canadian Thanksgiving (2nd Mon Oct), Halloween, Christmas, Boxing Day |
+| `uk` | Bonfire Night (Nov 5), Halloween, Christmas, Boxing Day |
+| `australia` | Australia Day (Jan 26), ANZAC Day (Apr 25), Halloween, Christmas, Boxing Day |
+| `china` | Spring Festival, Qingming, Dragon Boat, Mid-Autumn, National Day (Oct 1) |
+| `japan` | New Year (Shogatsu), Tanabata, Obon, Halloween, Christmas |
+| `korea` | Seollal, Chuseok, Liberation Day (Aug 15), Halloween, Christmas |
+
+Lunar / solar-term holidays (Spring Festival, Mid-Autumn, Seollal, Chuseok, Dragon Boat,
+Qingming) carry an explicit per-year date table (2026-2030 built in; extend in `doctor.py` or
+override via `HOLIDAYS_DEFINITIONS`). Themed matching leans on English title keywords + Plex
+genres, so a non-English library may match sparsely; tune any holiday with explicit `titles`.
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_HOLIDAYS` | `false` | turn the check on (needs `PLEX_URL` + `PLEX_TOKEN`) |
+| `HOLIDAYS_COUNTRIES` | `us` | comma list of countries to merge: `us,canada,uk,australia,china,japan,korea` |
+| `HOLIDAYS_MOVIE_SECTION` | *(auto)* | Plex movie library section id; blank auto-detects the first `movie`-type section |
+| `HOLIDAYS_LEAD_DAYS` | `7` | default days **before** the date to show the row (a per-holiday `lead` in the definition overrides it) |
+| `HOLIDAYS_POST_DAYS` | `3` | default days **after** the date to keep it before removing (per-holiday `post` overrides) |
+| `HOLIDAYS_PIN_HOME` | `true` | pin the active collection to Plex Home (Recommended / Own Home / Shared Home); `false` just creates the collection |
+| `HOLIDAYS_DEFINITIONS` | *(built-in)* | JSON list overriding the curated holidays, e.g. `[{"name":"Independence Day Movies","month":7,"day":4,"lead":12,"keywords":["independence day","patriot"],"titles":["Top Gun: Maverick"]}]` |
+| `HOLIDAYS_STATE_FILE` | `/data/holidays.json` | records the last-active / built / removed collection per run |
+| `HOLIDAYS_HTTP_TIMEOUT` | `40` | HTTP timeout for the Plex calls |
+
+Each definition is `{"name", "month", "day"}` plus any of `lead` / `post` / `keywords` /
+`titles` / `genre`. Floating dates use either `"rule":"thanksgiving"` (4th Thursday of November),
+`"rule":"nth_weekday"` with `"weekday"` (Mon=0..Sun=6) + `"n"` (e.g. Canadian Thanksgiving =
+`month:10, weekday:0, n:2`), or a per-year `"dates":{"2026":"2026-02-17",...}` table for
+lunar / solar-term holidays. Honors `DOCTOR_DRY_RUN` (logs each WOULD-create / WOULD-remove, changes nothing). The
+collection is a fixed set of ratingKeys (`smart=0`), so it is rebuilt fresh each season rather
+than tracking the library live. Out-of-season collections whose title matches one of the
+definitions are taken down automatically, so only the in-season row is ever pinned.
 
 ## Extending
 

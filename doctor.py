@@ -20,6 +20,8 @@ Modular checks, each toggled and configured by environment variables:
 Runs as a cron-style interval loop OR reacts to Sonarr/Radarr webhook events.
 Pure Python standard library, no dependencies.
 """
+import calendar
+import datetime
 import json
 import logging
 import logging.handlers
@@ -111,6 +113,7 @@ EN_SEERR      = _b("ENABLE_SEERR", False)       # Overseerr/Jellyseerr/Seerr: au
 EN_WESTREPAIR = _b("ENABLE_WESTREPAIR", False)  # symlink repair via repair.py subprocess
 EN_SCRUBBER   = _b("ENABLE_SCRUBBER", False)    # proactive file integrity scan (catches mid-file dead segments before playback)
 EN_WATCHLISTS = _b("ENABLE_WATCHLISTS", False)  # pull Plex Home/friends watchlists, add directly to *arr (bypasses Overseerr)
+EN_HOLIDAYS   = _b("ENABLE_HOLIDAYS", False)    # auto-build + pin pre-holiday themed Plex collections (curated per holiday)
 
 # westrepair config
 WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
@@ -262,6 +265,21 @@ WL_STATE           = os.environ.get("WATCHLISTS_STATE_FILE", "/data/watchlists.j
 WL_PROFILES        = os.environ.get("WATCHLISTS_PROFILES", "")       # override per-arr quality profile id, e.g. "radarr=1,sonarr=4,radarr4k=5,sonarr4k=5"
 WL_HTTP_TO         = _i("WATCHLISTS_HTTP_TIMEOUT", 20)
 WL_PAGE_SIZE       = _i("WATCHLISTS_PAGE_SIZE", 100)                 # Plex Discover caps Container-Size; 100 is safe
+
+# holidays (pre-holiday themed Plex collections, auto-built then pinned to Plex Home)
+# Each holiday is a curated definition: match films by exact title list, by keyword-in-title,
+# and/or by genre, then create a collection a few days before the date and remove it a few days
+# after. The default set is baked in (HOLIDAYS_DEFINITIONS overrides it with JSON). Titles only:
+# metadata-only Plex calls, safe on a decypharr/FUSE library (no file reads).
+HOL_COUNTRIES  = [c.strip().lower() for c in os.environ.get("HOLIDAYS_COUNTRIES", "us").split(",") if c.strip()]  # us,canada,uk,china,japan,korea,australia,...
+HOL_SECTION    = os.environ.get("HOLIDAYS_MOVIE_SECTION", "")        # movie library section id; blank = auto-detect first movie section
+HOL_LEAD_DAYS  = _i("HOLIDAYS_LEAD_DAYS", 7)                         # default days before the date to show the row (per-holiday "lead" overrides)
+HOL_POST_DAYS  = _i("HOLIDAYS_POST_DAYS", 3)                         # default days after the date to keep it (per-holiday "post" overrides)
+HOL_PIN_HOME   = _b("HOLIDAYS_PIN_HOME", True)                       # pin the active collection to Plex Home (the recommended row)
+HOL_STATE      = os.environ.get("HOLIDAYS_STATE_FILE", "/data/holidays.json")
+HOL_HTTP_TO    = _i("HOLIDAYS_HTTP_TIMEOUT", 40)
+HOL_MIN_INTERVAL = _i("HOLIDAYS_MIN_INTERVAL_HOURS", 12) * 3600       # holidays change daily; skip the Plex work between runs unless the active holiday changes (0=run every sweep)
+HOL_DEFS_JSON  = os.environ.get("HOLIDAYS_DEFINITIONS", "")          # JSON list to override the baked-in curated holidays
 
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
@@ -1405,6 +1423,372 @@ def check_watchlists():
              acts, skipped_in_lib, skipped_cached, skipped_noid)
 
 
+# =========================================================================== #
+# holidays: build a themed movie collection a few days before each holiday and
+# pin it to Plex Home (the recommended row), then take it down a few days after.
+#
+# Curation is a hardcoded per-holiday definition (overridable via JSON). Each
+# holiday matches films three ways, unioned:
+#   - "titles":   exact film titles (case-insensitive) -> a true curated list
+#   - "keywords": substring match on the film title     -> catches the obvious ones
+#   - "genre":    every film in a Plex genre            -> e.g. all Horror for Halloween
+# All matching is metadata-only (no file reads), so it is safe on a
+# decypharr/FUSE library. The collection is a fixed set of ratingKeys (smart=0).
+# =========================================================================== #
+
+# Shared holidays celebrated across many of the countries below. Defined once and reused; when
+# multiple selected countries include the same-named holiday the definitions are merged (keywords
+# unioned) so only one collection is ever built per name.
+_H_NEWYEAR   = {"name": "New Year Movies",   "month": 1,  "day": 1,  "lead": 7,
+                "keywords": ["new year", "new year's", "new years"]}
+_H_VALENTINE = {"name": "Valentine's Movies", "month": 2, "day": 14, "lead": 14,
+                "genre": "Romance", "keywords": ["valentine"]}
+_H_HALLOWEEN = {"name": "Halloween Movies",  "month": 10, "day": 31, "lead": 21,
+                "genre": "Horror", "keywords": ["halloween"]}
+_H_XMAS      = {"name": "Christmas Movies",   "month": 12, "day": 25, "lead": 35,
+                "keywords": ["christmas", "xmas", "santa", "noel", "elf", "grinch", "scrooge",
+                             "jingle", "reindeer", "frosty", "krampus", "nativity", "nutcracker",
+                             "polar express", "home alone", "klaus", "miracle on 34", "holiday inn",
+                             "love actually", "die hard"]}
+_H_BOXING    = {"name": "Boxing Day Movies",  "month": 12, "day": 26, "lead": 2,
+                "keywords": ["boxing day"]}
+
+# Lunar / solar-term holidays have no fixed Gregorian date, so they carry an explicit per-year
+# date table (extend as needed; a year missing from the table is simply skipped that year).
+_D_LUNAR_NY   = {"2026": "2026-02-17", "2027": "2027-02-06", "2028": "2028-01-26",
+                 "2029": "2029-02-13", "2030": "2030-02-03"}   # Chinese/Korean Lunar New Year
+_D_MIDAUTUMN  = {"2026": "2026-09-25", "2027": "2027-09-15", "2028": "2028-10-03",
+                 "2029": "2029-09-22", "2030": "2030-09-12"}   # Mid-Autumn / Chuseok
+_D_DRAGONBOAT = {"2026": "2026-06-19", "2027": "2027-06-09", "2028": "2028-05-28",
+                 "2029": "2029-06-16", "2030": "2030-06-05"}   # Duanwu / Dragon Boat
+_D_QINGMING   = {"2026": "2026-04-05", "2027": "2027-04-05", "2028": "2028-04-04",
+                 "2029": "2029-04-04", "2030": "2030-04-05"}   # Qingming / Tomb-Sweeping
+
+# Curated per-country holiday sets. HOLIDAYS_COUNTRIES selects which to merge (default "us").
+# Themed matching leans on English title keywords + Plex genres, so non-English libraries may
+# match sparsely; tune any holiday with explicit "titles"/"keywords" via HOLIDAYS_DEFINITIONS.
+_HOLIDAY_SETS = {
+    "us": [
+        _H_NEWYEAR, _H_VALENTINE,
+        {"name": "St. Patrick's Movies", "month": 3, "day": 17, "lead": 10,
+         "keywords": ["leprechaun", "irish", "st patrick", "st. patrick"]},
+        {"name": "Independence Day Movies", "month": 7, "day": 4, "lead": 12,
+         "keywords": ["independence day", "patriot", "american sniper", "top gun", "born on the fourth"]},
+        _H_HALLOWEEN,
+        {"name": "Thanksgiving Movies", "month": 11, "day": 1, "lead": 14, "rule": "thanksgiving",
+         "keywords": ["thanksgiving", "turkey", "planes trains"]},
+        _H_XMAS,
+    ],
+    "canada": [
+        _H_NEWYEAR, _H_VALENTINE,
+        {"name": "Canada Day Movies", "month": 7, "day": 1, "lead": 10,
+         "keywords": ["canada", "canadian", "mountie", "hockey"]},
+        {"name": "Canadian Thanksgiving Movies", "month": 10, "day": 1, "lead": 10,
+         "rule": "nth_weekday", "weekday": 0, "n": 2, "keywords": ["thanksgiving", "turkey", "harvest"]},
+        _H_HALLOWEEN, _H_XMAS, _H_BOXING,
+    ],
+    "uk": [
+        _H_NEWYEAR, _H_VALENTINE,
+        {"name": "Bonfire Night Movies", "month": 11, "day": 5, "lead": 7,
+         "keywords": ["v for vendetta", "guy fawkes", "gunpowder"]},
+        _H_HALLOWEEN, _H_XMAS, _H_BOXING,
+    ],
+    "australia": [
+        _H_NEWYEAR,
+        {"name": "Australia Day Movies", "month": 1, "day": 26, "lead": 10,
+         "keywords": ["australia", "australian", "aussie", "outback", "crocodile", "mad max"]},
+        {"name": "ANZAC Day Movies", "month": 4, "day": 25, "lead": 7,
+         "keywords": ["gallipoli", "anzac", "war", "kokoda"]},
+        _H_HALLOWEEN, _H_XMAS, _H_BOXING,
+    ],
+    "china": [
+        {"name": "Spring Festival Movies", "dates": _D_LUNAR_NY, "lead": 14, "post": 7,
+         "keywords": ["new year", "spring festival", "kung fu", "dragon", "monkey king"]},
+        {"name": "Qingming Movies", "dates": _D_QINGMING, "lead": 5, "post": 3,
+         "keywords": ["ghost", "grave", "ancestor", "tomb"]},
+        {"name": "Dragon Boat Movies", "dates": _D_DRAGONBOAT, "lead": 5, "post": 3,
+         "keywords": ["dragon", "warrior", "hero"]},
+        {"name": "Mid-Autumn Movies", "dates": _D_MIDAUTUMN, "lead": 7, "post": 3,
+         "keywords": ["moon", "chang'e", "mooncake"]},
+        {"name": "National Day Movies", "month": 10, "day": 1, "lead": 10, "post": 7,
+         "keywords": ["china", "chinese", "wolf warrior"]},
+    ],
+    "japan": [
+        {"name": "New Year (Shogatsu) Movies", "month": 1, "day": 1, "lead": 7,
+         "keywords": ["new year", "shogatsu"]},
+        {"name": "Tanabata Movies", "month": 7, "day": 7, "lead": 7,
+         "genre": "Romance", "keywords": ["tanabata", "star-crossed", "your name"]},
+        {"name": "Obon Movies", "month": 8, "day": 13, "lead": 7, "post": 4,
+         "genre": "Horror", "keywords": ["ghost", "spirit", "yokai", "ju-on", "ringu"]},
+        _H_HALLOWEEN,
+        {"name": "Christmas Movies", "month": 12, "day": 25, "lead": 21,
+         "genre": "Romance", "keywords": ["christmas", "xmas", "tokyo godfathers"]},
+    ],
+    "korea": [
+        {"name": "Seollal Movies", "dates": _D_LUNAR_NY, "lead": 10, "post": 5,
+         "keywords": ["new year", "seollal", "family"]},
+        {"name": "Chuseok Movies", "dates": _D_MIDAUTUMN, "lead": 10, "post": 5,
+         "keywords": ["chuseok", "harvest", "family", "ancestor"]},
+        {"name": "Liberation Day Movies", "month": 8, "day": 15, "lead": 7,
+         "keywords": ["korea", "korean", "liberation", "assassination"]},
+        _H_HALLOWEEN, _H_XMAS,
+    ],
+}
+
+_HOL_MACHINE = [None]
+
+def _hol_req(method, path, t=None):
+    """Plex request with token header. Raises on HTTP/network error (caller guards)."""
+    url = PLEX_URL.rstrip("/") + path
+    data = b"" if method in ("POST", "PUT") else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Accept": "application/json", "X-Plex-Token": PLEX_TOKEN})
+    return urllib.request.urlopen(req, timeout=t or HOL_HTTP_TO)
+
+def _hol_getj(path):
+    return json.load(_hol_req("GET", path))
+
+def _hol_machine():
+    if not _HOL_MACHINE[0]:
+        _HOL_MACHINE[0] = _hol_getj("/")["MediaContainer"]["machineIdentifier"]
+    return _HOL_MACHINE[0]
+
+def _hol_defs():
+    # explicit JSON override wins outright
+    if HOL_DEFS_JSON.strip():
+        try:
+            d = json.loads(HOL_DEFS_JSON)
+            if isinstance(d, list) and d:
+                return d
+            log.warning("[holidays] HOLIDAYS_DEFINITIONS not a non-empty list; using country sets")
+        except Exception as e:
+            log.warning("[holidays] bad HOLIDAYS_DEFINITIONS JSON (%s); using country sets", str(e)[:80])
+    # merge the selected countries' curated sets, deduping by collection name (unioning keywords/titles)
+    merged, order = {}, []
+    for c in (HOL_COUNTRIES or ["us"]):
+        if c not in _HOLIDAY_SETS:
+            log.warning("[holidays] unknown country '%s' (known: %s)", c, ",".join(sorted(_HOLIDAY_SETS)))
+            continue
+        for h in _HOLIDAY_SETS[c]:
+            n = h.get("name")
+            if not n:
+                continue
+            if n in merged:
+                ex = merged[n]
+                ex["keywords"] = sorted(set(ex.get("keywords", [])) | set(h.get("keywords", [])))
+                if h.get("titles"):
+                    ex["titles"] = sorted(set(ex.get("titles", [])) | set(h.get("titles", [])))
+            else:
+                merged[n] = dict(h); order.append(n)
+    if not merged:
+        return list(_HOLIDAY_SETS["us"])
+    return [merged[n] for n in order]
+
+def _hol_section():
+    if HOL_SECTION.strip():
+        return HOL_SECTION.strip()
+    d = _hol_getj("/library/sections")
+    for s in d.get("MediaContainer", {}).get("Directory", []):
+        if s.get("type") == "movie":
+            return s.get("key")
+    return None
+
+def _nth_weekday(year, month, weekday, n):
+    """nth occurrence of a weekday (Mon=0..Sun=6) in a month, e.g. 4th Thursday of November."""
+    days = [d for d in calendar.Calendar().itermonthdates(year, month)
+            if d.month == month and d.weekday() == weekday]
+    return days[n - 1]
+
+def _hol_date(h, year):
+    # explicit per-year table (lunar / solar-term holidays); year absent -> no date this year
+    table = h.get("dates")
+    if table:
+        v = table.get(str(year)) or table.get(year)
+        if not v:
+            return None
+        y, m, d = (int(x) for x in str(v).split("-"))
+        return datetime.date(y, m, d)
+    rule = h.get("rule") or h.get("date")
+    if rule == "thanksgiving":
+        return _nth_weekday(year, 11, 3, 4)             # 4th Thursday of November
+    if rule == "nth_weekday":
+        return _nth_weekday(year, int(h["month"]), int(h["weekday"]), int(h["n"]))
+    return datetime.date(year, int(h["month"]), int(h["day"]))
+
+def _hol_in_window(defs, today):
+    """Holidays whose lead/post window contains today, nearest-date first: [(h, dist), ...].
+    With several countries merged, windows overlap (late December stacks Christmas + Boxing Day +
+    New Year); the caller walks these nearest-first and pins the closest one that has films."""
+    out = []
+    for h in defs:
+        lead = int(h.get("lead", HOL_LEAD_DAYS))
+        post = int(h.get("post", HOL_POST_DAYS))
+        for y in (today.year - 1, today.year, today.year + 1):
+            try:
+                hd = _hol_date(h, y)
+            except Exception:
+                continue
+            if hd is None:
+                continue
+            if hd - datetime.timedelta(days=lead) <= today <= hd + datetime.timedelta(days=post):
+                out.append((h, abs((hd - today).days)))
+                break
+    out.sort(key=lambda x: x[1])
+    return out
+
+def _hol_genre_id(section, name):
+    d = _hol_getj("/library/sections/%s/genre" % section)
+    for g in d.get("MediaContainer", {}).get("Directory", []):
+        if (g.get("title") or "").lower() == name.lower():
+            return str(g.get("key")).split("=")[-1]
+    return None
+
+def _hol_all_titles(section):
+    d = _hol_getj("/library/sections/%s/all?X-Plex-Container-Start=0&X-Plex-Container-Size=8000" % section)
+    return d.get("MediaContainer", {}).get("Metadata", [])
+
+def _hol_match_keys(section, h, all_meta):
+    keys = set()
+    if h.get("genre"):
+        gid = _hol_genre_id(section, h["genre"])
+        if gid is not None:
+            d = _hol_getj("/library/sections/%s/all?genre=%s&X-Plex-Container-Size=5000"
+                          % (section, urllib.parse.quote(str(gid))))
+            for m in d.get("MediaContainer", {}).get("Metadata", []):
+                keys.add(m["ratingKey"])
+    kws = [k.lower() for k in (list(h.get("keywords", [])) + list(h.get("extra", [])))]
+    titles = set(t.lower() for t in h.get("titles", []))
+    if kws or titles:
+        for m in all_meta:
+            t = (m.get("title") or "").lower()
+            if (kws and any(k in t for k in kws)) or (titles and t in titles):
+                keys.add(m["ratingKey"])
+    return keys
+
+def _hol_find_coll(section, title):
+    d = _hol_getj("/library/sections/%s/collections" % section)
+    for c in d.get("MediaContainer", {}).get("Metadata", []):
+        if c.get("title") == title:
+            return c.get("ratingKey")
+    return None
+
+def _hol_create(section, title, keys):
+    kl = ",".join(sorted(keys, key=lambda x: int(x)))
+    uri = "server://%s/com.plexapp.plugins.library/library/metadata/%s" % (_hol_machine(), kl)
+    params = urllib.parse.urlencode({"type": 1, "title": title, "smart": 0,
+                                     "sectionId": section, "uri": uri})
+    meta = json.load(_hol_req("POST", "/library/collections?" + params))["MediaContainer"]["Metadata"][0]
+    return meta["ratingKey"]
+
+def _hol_pin(section, rk):
+    pp = urllib.parse.urlencode({"metadataItemId": rk, "promotedToRecommended": 1,
+                                 "promotedToOwnHome": 1, "promotedToSharedHome": 1})
+    _hol_req("POST", "/hubs/sections/%s/manage?%s" % (section, pp))
+
+def _hol_load_state():
+    try: return json.load(open(HOL_STATE))
+    except Exception: return {}
+
+def _hol_save_state(s):
+    try:
+        os.makedirs(os.path.dirname(HOL_STATE) or ".", exist_ok=True)
+        json.dump(s, open(HOL_STATE, "w"))
+    except Exception as e:
+        log.debug("[holidays] state save failed: %s", e)
+
+def check_holidays():
+    if not (PLEX_URL and PLEX_TOKEN):
+        log.debug("[holidays] PLEX_URL/PLEX_TOKEN not set"); return
+    defs = _hol_defs()
+    names = [h.get("name") for h in defs if h.get("name")]
+    today = datetime.date.today()
+    inwin = _hol_in_window(defs, today)                      # nearest-date first
+    sig = ",".join(sorted(h.get("name", "") for h, _ in inwin))
+
+    # daily cadence: the set of in-window holidays only changes day-to-day, so between runs
+    # (event/sweep can fire often) skip the Plex round-trips unless a window just opened/closed.
+    state = _hol_load_state()
+    now = int(time.time())
+    if (HOL_MIN_INTERVAL and state.get("ts") and state.get("sig") == sig
+            and now - int(state.get("ts", 0)) < HOL_MIN_INTERVAL):
+        log.debug("[holidays] no window change (%s); skipping until next daily run", sig or "none")
+        return
+
+    try:
+        section = _hol_section()
+    except Exception as e:
+        log.error("[holidays] cannot reach Plex: %s", str(e)[:120]); return
+    if not section:
+        log.warning("[holidays] no movie library section found (set HOLIDAYS_MOVIE_SECTION)"); return
+
+    # Pick the row to show: the nearest in-window holiday that is either already built or has
+    # matching films. This stops an empty holiday (e.g. Canada Day with 0 themed films) from
+    # shadowing a nearby one that does have films (e.g. Independence Day).
+    chosen = chosen_keys = None
+    all_meta = None
+    for h, _dist in inwin:
+        try:
+            if _hol_find_coll(section, h["name"]):
+                chosen = h; chosen_keys = None; break        # already built -> keep it
+        except Exception as e:
+            log.debug("[holidays] lookup %s failed: %s", h.get("name"), str(e)[:80]); continue
+        if all_meta is None:
+            all_meta = _hol_all_titles(section)
+        keys = _hol_match_keys(section, h, all_meta)
+        if keys:
+            chosen = h; chosen_keys = keys; break
+        log.debug("[holidays] '%s' in window but 0 matching films; trying next", h.get("name"))
+    chosen_name = chosen["name"] if chosen else None
+
+    # take down managed collections that are not the chosen row (out of season, or empty/overlapped)
+    removed = []
+    for name in names:
+        if name == chosen_name:
+            continue
+        try:
+            rk = _hol_find_coll(section, name)
+        except Exception as e:
+            log.debug("[holidays] lookup %s failed: %s", name, str(e)[:80]); continue
+        if not rk:
+            continue
+        if DRY_RUN:
+            log.info("[holidays] WOULD remove collection: %s", name); removed.append(name); continue
+        try:
+            _hol_req("DELETE", "/library/collections/%s" % rk); removed.append(name)
+            log.info("[holidays] removed collection: %s", name)
+        except Exception as e:
+            log.warning("[holidays] remove %s failed: %s", name, str(e)[:80])
+
+    built = None
+    if chosen:
+        existing = _hol_find_coll(section, chosen_name)
+        if existing:
+            log.info("[holidays] active collection present: %s", chosen_name); built = chosen_name
+            if HOL_PIN_HOME and not DRY_RUN:
+                try: _hol_pin(section, existing)
+                except Exception: pass
+        elif DRY_RUN:
+            log.info("[holidays] WOULD create+pin '%s' (%d films)", chosen_name, len(chosen_keys or [])); built = chosen_name
+        else:
+            try:
+                rk = _hol_create(section, chosen_name, chosen_keys)
+                if HOL_PIN_HOME:
+                    _hol_pin(section, rk)
+                log.warning("[holidays] created%s collection '%s' (%d films)",
+                            " + pinned to Home" if HOL_PIN_HOME else "", chosen_name, len(chosen_keys))
+                built = chosen_name
+            except Exception as e:
+                log.error("[holidays] create '%s' failed: %s", chosen_name, str(e)[:120])
+    elif inwin:
+        log.info("[holidays] in window (%s) but none have matching films", sig)
+    else:
+        log.info("[holidays] no holiday active today (%s)", today.isoformat())
+
+    state.update({"active": chosen_name, "built": built, "removed": removed,
+                  "sig": sig, "ts": int(time.time()), "date": today.isoformat()})
+    _hol_save_state(state)
+
+
 _PROVIDER_KEYWORDS = ("indexer", "download client", "applications unavailable", "applications are unavailable")
 
 def check_providers():
@@ -1903,6 +2287,7 @@ CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_pr
           ("resources", EN_RESOURCES, check_resources), ("janitor", EN_JANITOR, check_janitor),
           ("scrubber", EN_SCRUBBER, check_scrubber),
           ("watchlists", EN_WATCHLISTS, check_watchlists),
+          ("holidays", EN_HOLIDAYS, check_holidays),
           ("bazarr", EN_BAZARR, check_bazarr), ("seerr", EN_SEERR, check_seerr),
           ("westrepair", EN_WESTREPAIR, check_westrepair)]
 
@@ -1934,7 +2319,7 @@ UI_SCHEMA = [
               ("DOCTOR_DRY_RUN", "false"), ("DOCTOR_LOG_LEVEL", "INFO")]),
     ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
               ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""), ("ENABLE_SCRUBBER", ""),
-              ("ENABLE_WATCHLISTS", ""),
+              ("ENABLE_WATCHLISTS", ""), ("ENABLE_HOLIDAYS", ""),
               ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", "")]),
     ("Watchlists (Plex Home + friends -> arrs)", [
               ("WATCHLISTS_FRIENDS", "alice:xxxx,bob:yyyy"),
@@ -1944,6 +2329,12 @@ UI_SCHEMA = [
               ("WATCHLISTS_DEFAULT_QUALITY", "both"),
               ("WATCHLISTS_MAX_ADDS_PER_SWEEP", "25"),
               ("WATCHLISTS_PROFILES", "radarr=1,sonarr=4,radarr4k=5,sonarr4k=5")]),
+    ("Holidays (pre-holiday themed Plex rows)", [
+              ("HOLIDAYS_COUNTRIES", "us,canada,uk,china,japan,korea,australia"),
+              ("HOLIDAYS_MOVIE_SECTION", "5"),
+              ("HOLIDAYS_LEAD_DAYS", "7"), ("HOLIDAYS_POST_DAYS", "3"),
+              ("HOLIDAYS_PIN_HOME", "true|false"), ("HOLIDAYS_MIN_INTERVAL_HOURS", "12"),
+              ("HOLIDAYS_DEFINITIONS", '[{"name":"...","month":7,"day":4,"lead":12,"keywords":[...]}]')]),
     ("Scrubber (file integrity)", [
               ("SCRUBBER_PATHS", "/mnt/library/movies,/mnt/library/movies-4k,/mnt/library/tv,/mnt/library/tv-4k"),
               ("SCRUBBER_TIER", "2"), ("SCRUBBER_FULL_DECODE_ON_BAD", "false"),
