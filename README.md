@@ -32,6 +32,8 @@ container, everything configured by env vars.
 | **watchlists** | new titles on Plex Home users' + non-Home friends' watchlists that aren't in your library | adds them directly to Sonarr/Radarr (4K instance first, 1080p fallback), bypassing Overseerr entirely; per-sweep rate-cap so a dumped 300-item watchlist doesn't flood |
 | **holidays** | the calendar nearing a holiday (curated per-holiday definitions, e.g. Independence Day, Halloween, Christmas) | builds a themed movie collection a few days before and pins it to Plex Home (the recommended row), then takes it down a few days after |
 | **backlog** | monitored episodes/movies that are still **missing** and old enough that RSS will never reach back for them (e.g. content added after a source migration) | gently trickles interactive searches for them: a small per-sweep cap, a minimum age gate, a per-item cooldown, a load gate, and a minimum interval between sweeps so it never floods the download path |
+| **riven** | a [Riven](https://github.com/rivenmedia/riven) backend that is unhealthy / has a down service, plus items wedged in a working state (Scraped/Downloaded) or never resolved (Requested/Indexed/Failed) | reports health + down services every sweep; gently retries stuck/missing items through Riven's own state machine, throttled exactly like backlog (per-sweep cap, per-item cooldown, load gate, minimum interval) |
+| **mediastorm** | a [mediastorm](https://github.com/godver3/mediastorm) server that is down / not answering `/health` | alerts (health-only: mediastorm has no import queue or monitored-missing list to drain) |
 | **bazarr** | Bazarr unreachable | alerts |
 | **seerr** | Overseerr/Jellyseerr/Seerr requests stuck **FAILED** (the arr add timed out under load) | re-drives them so a transient blip self-heals (attempt-capped) |
 | **warmer** | what a viewer is about to watch (Plex On Deck + next episode) | precaches the file head so playback starts instantly |
@@ -129,6 +131,14 @@ services:
       INSTANCE_3_TYPE: prowlarr
       INSTANCE_3_URL: http://prowlarr:9696
       INSTANCE_3_APIKEY: your_prowlarr_key
+      # Riven / mediastorm backends use the same INSTANCE_N_* slots (TYPE selects the client):
+      # INSTANCE_4_NAME: riven
+      # INSTANCE_4_TYPE: riven            # rivenmedia/riven (needs ENABLE_RIVEN + INSTANCE_4_APIKEY = its x-api-key)
+      # INSTANCE_4_URL: http://riven:8080
+      # INSTANCE_4_APIKEY: your_riven_key
+      # INSTANCE_5_NAME: mediastorm
+      # INSTANCE_5_TYPE: mediastorm       # godver3/mediastorm (needs ENABLE_MEDIASTORM; APIKEY optional, /health is unauth)
+      # INSTANCE_5_URL: http://mediastorm:7777
 
       # ---------- warmer: precache likely-next media so playback starts instantly ----------
       ENABLE_WARMER: "true"
@@ -551,6 +561,52 @@ gates keep it gentle:
 Honors `DOCTOR_DRY_RUN` (logs each WOULD-search, fires nothing). At the defaults it drains about
 `BACKLOG_PER_SWEEP` items every `BACKLOG_INTERVAL`, so a large backlog fills over days rather
 than in one flood, keeping Plex responsive throughout.
+
+## Riven (health + retry stuck/missing)
+
+If you run [Riven](https://github.com/rivenmedia/riven) as a media backend, this check watches it
+the same way the *arr checks watch Sonarr/Radarr. Configure Riven as an instance with
+`INSTANCE_N_TYPE: riven` (the `INSTANCE_N_APIKEY` is Riven's `x-api-key`), set `ENABLE_RIVEN: true`,
+and stack-doctor does two things:
+
+- **Health + services, every sweep (read-only):** hits Riven's `/health` and `/services`. An
+  unhealthy backend or any service Riven reports as down (a dead scraper / downloader) is logged
+  as a warning, and the instance shows up in the dashboard health row.
+- **Gentle retries, throttled:** items wedged in a *working* state (`RIVEN_STUCK_STATES`, e.g.
+  `Scraped`/`Downloaded`/`PartiallyCompleted`) or that *never resolved* (`RIVEN_MISSING_STATES`,
+  e.g. `Requested`/`Indexed`/`Failed`) are re-run through Riven's own state machine via
+  `POST /items/retry`. The retry path uses the exact same four gates as backlog so it can't
+  self-amplify in event mode: a per-sweep cap, a per-item cooldown, a host-load gate, and a
+  minimum interval between real retry sweeps. (Health/services reporting is **not** throttled.)
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_RIVEN` | `false` | turn the check on |
+| `RIVEN_PER_SWEEP` | `5` | max item retries triggered per sweep (per instance) |
+| `RIVEN_INTERVAL` | `900` | minimum seconds between real retry sweeps (health still runs every sweep) |
+| `RIVEN_RETRY_DAYS` | `3` | per-item cooldown before a still-stuck item is retried again |
+| `RIVEN_LOAD_MAX` | `12` | skip retries while host load exceeds this (`0` ignores load); health still runs |
+| `RIVEN_MAX_FETCH` | `500` | cap on items pulled per state-group per sweep |
+| `RIVEN_STUCK_STATES` | `Scraped,Downloaded,PartiallyCompleted` | working states to nudge along |
+| `RIVEN_MISSING_STATES` | `Requested,Indexed,Failed` | unresolved states to re-drive |
+| `RIVEN_STATE_FILE` | `/data/riven.json` | records per-item cooldowns + last-sweep timestamp |
+
+Honors `DOCTOR_DRY_RUN` (logs each WOULD-retry, calls nothing). If the backend is unhealthy, the
+retry pass is skipped entirely so a down Riven is never hammered.
+
+## Mediastorm (health watch)
+
+[mediastorm](https://github.com/godver3/mediastorm) is a streaming server with no Sonarr-style
+import queue or monitored-missing list, so there is nothing to drain or retry. Support is
+deliberately **health-only**: configure it with `INSTANCE_N_TYPE: mediastorm`, set
+`ENABLE_MEDIASTORM: true`, and each sweep stack-doctor probes its `/health` endpoint and warns if
+the server is down. The `INSTANCE_N_APIKEY` is optional (mediastorm's `/health` is unauthenticated;
+supply a key only if you front it with auth, and it is sent as a bearer token).
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_MEDIASTORM` | `false` | turn the check on |
+| `MEDIASTORM_TIMEOUT` | `8` | per-probe HTTP timeout (seconds) for `/health` |
 
 ## Extending
 

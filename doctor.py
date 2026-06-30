@@ -115,6 +115,8 @@ EN_SCRUBBER   = _b("ENABLE_SCRUBBER", False)    # proactive file integrity scan 
 EN_WATCHLISTS = _b("ENABLE_WATCHLISTS", False)  # pull Plex Home/friends watchlists, add directly to *arr (bypasses Overseerr)
 EN_HOLIDAYS   = _b("ENABLE_HOLIDAYS", False)    # auto-build + pin pre-holiday themed Plex collections (curated per holiday)
 EN_BACKLOG    = _b("ENABLE_BACKLOG", False)     # trickle-search monitored-but-missing items that no backlog search ever found
+EN_RIVEN      = _b("ENABLE_RIVEN", False)       # Riven (rivenmedia/riven): health + services watch, retry stuck/missing items
+EN_MEDIASTORM = _b("ENABLE_MEDIASTORM", False)  # mediastorm (godver3/mediastorm): up/health watch (no import queue to manage)
 
 # westrepair config
 WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
@@ -319,6 +321,24 @@ BACKLOG_MAX_FETCH    = _i("BACKLOG_MAX_FETCH", 2000)                 # cap on mi
 BACKLOG_STATE        = os.environ.get("BACKLOG_STATE_FILE", "/data/backlog.json")
 BACKLOG_INTERVAL     = _i("BACKLOG_INTERVAL", 900)                   # min seconds between real backlog sweeps; event mode fires many sweeps/min, this throttles grab-rate + arr API load
 
+# riven (rivenmedia/riven): symlink-library manager with its own state machine. We watch /health and
+# /services every sweep (cheap, read-only) and gently retry items wedged in a working state or never
+# resolved. Retries are throttled like backlog (interval guard + load gate + per-item cooldown) so the
+# event-mode feedback loop cannot self-amplify. Stuck = items that started but stalled; missing = items
+# requested/indexed/failed that never produced a file.
+RIVEN_PER_SWEEP    = _i("RIVEN_PER_SWEEP", 5)                        # max item retries triggered per sweep
+RIVEN_INTERVAL     = _i("RIVEN_INTERVAL", 900)                       # min seconds between real retry sweeps (health/services still reported every sweep)
+RIVEN_RETRY_DAYS   = _i("RIVEN_RETRY_DAYS", 3)                       # per-item cooldown: do not re-retry the same item within this window
+RIVEN_LOAD_MAX     = _f("RIVEN_LOAD_MAX", 12)                        # skip retries while host load is above this (0=ignore load); health still runs
+RIVEN_MAX_FETCH    = _i("RIVEN_MAX_FETCH", 500)                      # cap on items pulled per state-group per sweep
+RIVEN_STUCK_STATES   = [s.strip() for s in os.environ.get("RIVEN_STUCK_STATES", "Scraped,Downloaded,PartiallyCompleted").split(",") if s.strip()]
+RIVEN_MISSING_STATES = [s.strip() for s in os.environ.get("RIVEN_MISSING_STATES", "Requested,Indexed,Failed").split(",") if s.strip()]
+RIVEN_STATE        = os.environ.get("RIVEN_STATE_FILE", "/data/riven.json")
+
+# mediastorm (godver3/mediastorm): Go streaming server. Architecturally it has no Sonarr-style import
+# queue or monitored-missing list, so there is nothing to drain/retry - we only watch that it is up.
+MEDIASTORM_TIMEOUT = _i("MEDIASTORM_TIMEOUT", 8)                     # per-probe HTTP timeout for /health
+
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
 
@@ -515,7 +535,80 @@ class Arr:
         """Stable id of what a queue record is FOR (episode for sonarr, movie for radarr)."""
         return rec.get("episodeId") if self.kind == "sonarr" else rec.get("movieId") if self.kind == "radarr" else None
 
+class Riven:
+    """rivenmedia/riven client (REST /api/v1, auth header x-api-key). Read-mostly: health/services
+    watch plus item retry. We deliberately keep this OUT of the Arr list so the *arr sweeps never
+    call Riven-only methods."""
+    kind = "riven"
+
+    def __init__(self, name, url, apikey):
+        self.name = name
+        self.base = url.rstrip("/") + "/api/v1"
+        self.apikey = apikey
+
+    def _req(self, method, path, t=None):
+        req = urllib.request.Request(self.base + path, method=method, headers={"x-api-key": self.apikey})
+        return urllib.request.urlopen(req, timeout=t or TIMEOUT)
+
+    def health(self):
+        """(ok, detail). Riven returns {"message":"True"} when healthy."""
+        try:
+            d = json.load(self._req("GET", "/health", t=8))
+            msg = str(d.get("message", "")).strip().lower()
+            return (msg in ("true", "running", "ok", "initialized", "")), (msg or "ok")
+        except Exception as e:
+            return False, str(e)[:60]
+
+    def services_down(self):
+        """List of service names Riven reports as not-connected (e.g. a dead scraper/downloader)."""
+        try:
+            d = json.load(self._req("GET", "/services", t=8))
+            return sorted([k for k, v in d.items() if not v]) if isinstance(d, dict) else []
+        except Exception:
+            return []
+
+    def items(self, states, limit):
+        """Items in any of `states` (oldest first), movies + shows."""
+        q = "/items?limit=%d&page=1&sort=date_asc&type=movie&type=show" % limit
+        for s in states:
+            q += "&states=" + urllib.parse.quote(s)
+        try:
+            d = json.load(self._req("GET", q, t=20))
+            return d.get("items", []) if isinstance(d, dict) else []
+        except Exception as e:
+            log.debug("[riven:%s] items fetch failed: %s", self.name, str(e)[:60]); return []
+
+    def retry(self, ids):
+        """Re-run the state machine for the given item ids (re-scrape/re-download)."""
+        try:
+            self._req("POST", "/items/retry?ids=" + ",".join(str(i) for i in ids), t=60); return True
+        except Exception as e:
+            log.warning("[riven:%s] retry failed: %s", self.name, str(e)[:80]); return False
+
+class Mediastorm:
+    """godver3/mediastorm client. Only /health is unauthenticated and there is no import queue to
+    manage, so support is health-only."""
+    kind = "mediastorm"
+
+    def __init__(self, name, url, apikey=""):
+        self.name = name
+        self.url = url.rstrip("/")
+        self.apikey = apikey
+
+    def health(self):
+        try:
+            h = {"Authorization": "Bearer " + self.apikey} if self.apikey else None
+            code = http_code(self.url + "/health", headers=h, t=MEDIASTORM_TIMEOUT)
+            return code == 200, "HTTP %d" % code
+        except Exception as e:
+            return False, str(e)[:60]
+
 def load_instances():
+    """Build the *arr list (INSTANCES) and populate the isolated RIVENS / MEDIASTORMS globals.
+    Riven and mediastorm are branched off BEFORE the sonarr/radarr fallback so they are never
+    mis-typed as an *arr."""
+    global RIVENS, MEDIASTORMS
+    RIVENS, MEDIASTORMS = [], []
     out = []
     for n in range(1, 51):
         url = os.environ.get("INSTANCE_%d_URL" % n)
@@ -523,6 +616,14 @@ def load_instances():
             continue
         key = os.environ.get("INSTANCE_%d_APIKEY" % n, "")
         kind = os.environ.get("INSTANCE_%d_TYPE" % n, "").strip().lower()
+        if kind == "riven":
+            name = os.environ.get("INSTANCE_%d_NAME" % n, "riven-%d" % n)
+            if not key:
+                log.warning("INSTANCE_%d (riven) has no APIKEY, skipping", n); continue
+            RIVENS.append(Riven(name, url, key)); continue
+        if kind == "mediastorm":
+            name = os.environ.get("INSTANCE_%d_NAME" % n, "mediastorm-%d" % n)
+            MEDIASTORMS.append(Mediastorm(name, url, key)); continue   # health-only, apikey optional
         if kind not in ("sonarr", "radarr", "prowlarr"):
             kind = ("radarr" if "radarr" in url.lower() else
                     "prowlarr" if "prowlarr" in url.lower() else "sonarr")
@@ -533,6 +634,8 @@ def load_instances():
     return out
 
 INSTANCES = []
+RIVENS = []
+MEDIASTORMS = []
 
 def _load_state():
     try:
@@ -2048,6 +2151,99 @@ def check_backlog():
         log.debug("[backlog] nothing eligible this sweep")
 
 
+def _riven_load_state():
+    try: return json.load(open(RIVEN_STATE))
+    except Exception: return {}
+
+def _riven_save_state(s):
+    try:
+        os.makedirs(os.path.dirname(RIVEN_STATE) or ".", exist_ok=True)
+        json.dump(s, open(RIVEN_STATE, "w"))
+    except Exception as e:
+        log.debug("[riven] state save failed: %s", e)
+
+def check_riven():
+    """Per Riven instance: report health + any down services every sweep (cheap, read-only), then
+    gently retry items wedged in a working state (stuck) or never resolved (missing). Retries are
+    throttled by RIVEN_INTERVAL + host load + a per-item cooldown so event-mode sweeps cannot
+    self-amplify - exactly like check_backlog."""
+    if not RIVENS:
+        log.debug("[riven] no riven instances"); return
+    state = _riven_load_state()
+    # --- health + services: every sweep ---
+    for rv in RIVENS:
+        ok, detail = rv.health()
+        if not ok:
+            log.warning("[riven:%s] unhealthy: %s", rv.name, detail); continue
+        down = rv.services_down()
+        if down:
+            log.warning("[riven:%s] services down: %s", rv.name, ", ".join(down))
+        else:
+            log.debug("[riven:%s] healthy (%s)", rv.name, detail)
+    # --- retries: throttled ---
+    if not (RIVEN_STUCK_STATES or RIVEN_MISSING_STATES):
+        return
+    nowsec = time.time()
+    if RIVEN_INTERVAL and not DRY_RUN:
+        last = float(state.get("_last_run", 0) or 0)
+        if nowsec - last < RIVEN_INTERVAL:
+            log.debug("[riven] last retry sweep %ds ago (< %ds) - throttled", int(nowsec - last), RIVEN_INTERVAL); return
+        state["_last_run"] = nowsec
+        _riven_save_state(state)                                     # claim the slot before any work so concurrent event-sweeps don't double-fire
+    if RIVEN_LOAD_MAX and host_load() > RIVEN_LOAD_MAX:
+        log.info("[riven] host load over %.1f - skipping retries this sweep to keep Plex responsive", RIVEN_LOAD_MAX); return
+    cooldown_cut = nowsec - RIVEN_RETRY_DAYS * 86400
+    retried_total = 0
+    for rv in RIVENS:
+        ok, _ = rv.health()
+        if not ok:
+            continue                                                # already warned above; don't hammer a dead backend
+        seen = state.setdefault(rv.name, {})
+        budget = max(0, RIVEN_PER_SWEEP)
+        for group in (RIVEN_STUCK_STATES, RIVEN_MISSING_STATES):
+            if budget <= 0 or not group: break
+            items = rv.items(group, RIVEN_MAX_FETCH)
+            picked = []
+            for it in items:
+                if len(picked) >= budget: break
+                iid = it.get("id")
+                if iid is None: continue
+                if seen.get(str(iid), 0) > cooldown_cut: continue   # on cooldown
+                picked.append(it)
+            if not picked:
+                continue
+            ids = [it["id"] for it in picked]
+            label = ", ".join("%s [%s]" % (it.get("title") or it.get("log_string") or "?", it.get("state", "?")) for it in picked[:6])
+            if DRY_RUN:
+                log.info("[riven:%s] WOULD retry %d item(s): %s", rv.name, len(ids), label)
+                budget -= len(ids); retried_total += len(ids)
+                continue
+            if not rv.retry(ids):
+                continue
+            for i in ids: seen[str(i)] = nowsec
+            budget -= len(ids); retried_total += len(ids)
+            log.info("[riven:%s] retrying %d item(s): %s", rv.name, len(ids), label)
+    if not DRY_RUN:
+        _riven_save_state(state)
+    if retried_total:
+        log.info("[riven] retried %d item(s) this sweep (cap %d/instance, cooldown %dd)", retried_total, RIVEN_PER_SWEEP, RIVEN_RETRY_DAYS)
+    else:
+        log.debug("[riven] nothing eligible to retry this sweep")
+
+
+def check_mediastorm():
+    """mediastorm has no import queue or monitored-missing list, so there is nothing to drain. We
+    only watch that the server is up and answering /health."""
+    if not MEDIASTORMS:
+        log.debug("[mediastorm] no mediastorm instances"); return
+    for ms in MEDIASTORMS:
+        ok, detail = ms.health()
+        if ok:
+            log.debug("[mediastorm:%s] up (%s)", ms.name, detail)
+        else:
+            log.warning("[mediastorm:%s] down: %s", ms.name, detail)
+
+
 _PROVIDER_KEYWORDS = ("indexer", "download client", "applications unavailable", "applications are unavailable")
 
 def check_providers():
@@ -2548,6 +2744,8 @@ CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_pr
           ("watchlists", EN_WATCHLISTS, check_watchlists),
           ("holidays", EN_HOLIDAYS, check_holidays),
           ("backlog", EN_BACKLOG, check_backlog),
+          ("riven", EN_RIVEN, check_riven),
+          ("mediastorm", EN_MEDIASTORM, check_mediastorm),
           ("bazarr", EN_BAZARR, check_bazarr), ("seerr", EN_SEERR, check_seerr),
           ("westrepair", EN_WESTREPAIR, check_westrepair)]
 
@@ -2580,6 +2778,7 @@ UI_SCHEMA = [
     ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
               ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""), ("ENABLE_SCRUBBER", ""),
               ("ENABLE_WATCHLISTS", ""), ("ENABLE_HOLIDAYS", ""), ("ENABLE_BACKLOG", ""),
+              ("ENABLE_RIVEN", ""), ("ENABLE_MEDIASTORM", ""),
               ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", "")]),
     ("Watchlists (Plex Home + friends -> arrs)", [
               ("WATCHLISTS_FRIENDS", "alice:xxxx,bob:yyyy"),
@@ -2609,6 +2808,13 @@ UI_SCHEMA = [
               ("BACKLOG_PER_SWEEP", "5"), ("BACKLOG_MIN_AGE_DAYS", "7"),
               ("BACKLOG_RETRY_DAYS", "7"), ("BACKLOG_LOAD_MAX", "12"),
               ("BACKLOG_INTERVAL", "900"), ("BACKLOG_MAX_FETCH", "2000")]),
+    ("Riven (health + retry stuck/missing)", [
+              ("RIVEN_PER_SWEEP", "5"), ("RIVEN_INTERVAL", "900"),
+              ("RIVEN_RETRY_DAYS", "3"), ("RIVEN_LOAD_MAX", "12"),
+              ("RIVEN_MAX_FETCH", "500"),
+              ("RIVEN_STUCK_STATES", "Scraped,Downloaded,PartiallyCompleted"),
+              ("RIVEN_MISSING_STATES", "Requested,Indexed,Failed")]),
+    ("Mediastorm (health watch)", [("MEDIASTORM_TIMEOUT", "8")]),
     ("Queue / churn brake", [("DOCTOR_MIN_STRIKES", "2"), ("DOCTOR_MAX_ACTIONS", "20"), ("DOCTOR_BLOCKLIST", "true"),
               ("DOCTOR_CONDITIONS", "downloadClientUnavailable,importBlocked,importFailed,importPending_warning,failedPending,stalled"),
               ("DOCTOR_CONDITION_ACTIONS", "stalled=research,importBlocked=force_import,downloadClientUnavailable=report"),
@@ -2646,6 +2852,11 @@ def _ui_health():
     if SEERR_URL:
         jobs.append(("seerr", "seerr", lambda: (http_code(SEERR_URL.rstrip("/") + "/api/v1/status",
             headers={"X-Api-Key": SEERR_APIKEY} if SEERR_APIKEY else None, t=5) == 200, "")))
+    for rv in RIVENS:
+        jobs.append((rv.name, "riven", (lambda r: lambda: (http_code(r.base + "/health",
+            headers={"x-api-key": r.apikey}, t=5) == 200, ", ".join(r.services_down()[:3])))(rv)))
+    for ms in MEDIASTORMS:
+        jobs.append((ms.name, "mediastorm", (lambda m: lambda: (http_code(m.url + "/health", t=5) == 200, m.url))(ms)))
     out = [None] * len(jobs)
     def run(i, name, kind, fn):
         try:
@@ -2683,6 +2894,10 @@ _UI_MULTI = {
                           "importPending_warning", "failedPending", "stalled"],
     "WARMER_SOURCES": ["ondeck", "next"],
     "BACKLOG_INSTANCES": ["sonarr", "radarr", "sonarr4k", "radarr4k"],
+    "RIVEN_STUCK_STATES": ["Unreleased", "Ongoing", "Requested", "Indexed", "Scraped",
+                           "Downloaded", "Symlinked", "Completed", "PartiallyCompleted", "Failed", "Paused"],
+    "RIVEN_MISSING_STATES": ["Unreleased", "Ongoing", "Requested", "Indexed", "Scraped",
+                             "Downloaded", "Symlinked", "Completed", "PartiallyCompleted", "Failed", "Paused"],
 }
 _UI_BOOL = set([
     "DOCTOR_DRY_RUN", "WATCHLISTS_INCLUDE_HOME", "HOLIDAYS_PIN_HOME",
@@ -2965,9 +3180,10 @@ def main():
     if not enabled and not warmer_on and not EN_UI:
         log.error("nothing enabled. Set ENABLE_QUEUE / ENABLE_DECYPHARR / ENABLE_PLEX / ENABLE_RESOURCES / ENABLE_JANITOR / ENABLE_WARMER / ENABLE_UI.")
         sys.exit(2)
+    extra = [r.name + "(riven)" for r in RIVENS] + [m.name + "(mediastorm)" for m in MEDIASTORMS]
     log.info("stack-doctor v%s | mode=%s | checks=[%s]%s%s | instances=%s | dry_run=%s",
              VERSION, MODE, ",".join(enabled), " +warmer" if warmer_on else "", " +ui" if EN_UI else "",
-             ", ".join(a.name for a in INSTANCES) or "-", DRY_RUN)
+             ", ".join([a.name for a in INSTANCES] + extra) or "-", DRY_RUN)
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
