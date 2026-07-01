@@ -185,9 +185,28 @@ Set `ENABLE_UI=true` and open `http://<host>:12345` for a simple, dependency-fre
 - **Setup**: a first-run onboarding wizard (see below).
 - **Logs**: a live tail of `DOCTOR_LOG_FILE`.
 
+The whole UI runs on a token-driven theme system. Pick a look from the **theme** dropdown in the
+header; the choice is saved to `localStorage` and applied before first paint, so it sticks across
+tabs and reloads. Two themes ship today: **Pencil** (the hand-drawn paper look, the default) and
+**Cyber** (the original dark neon). Adding another is deliberately small (see
+[Adding a theme](#adding-a-theme)).
+
 It runs inside the daemon's own process (no extra container). Gate it with `DOCTOR_UI_TOKEN` if your
 LAN isn't trusted. In event mode the webhook listener (`DOCTOR_PORT`) and the dashboard
 (`DOCTOR_UI_PORT`) run side by side.
+
+### Adding a theme
+
+Every color, font, radius, shadow and background in the UI is a CSS custom property (a token). A
+theme is just one override block plus one registry entry, both in the `UI_HTML` string:
+
+1. In the `<style>` block, copy the `html[data-theme=cyber]{...}` block, rename it to your id (for
+   example `html[data-theme=blueprint]{...}`), and set the tokens you want to change. Anything you
+   leave out falls back to the Pencil defaults in `:root`.
+2. In the boot script, add `{id:'blueprint',name:'Blueprint'}` to the `THEMES` array.
+
+That is the whole change. The dropdown, persistence, and app-wide application are automatic, and
+every tab (Dashboard, Scout, Config, Logs, Setup) recolors from the same tokens.
 
 ---
 
