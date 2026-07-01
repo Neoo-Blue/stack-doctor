@@ -182,11 +182,39 @@ Set `ENABLE_UI=true` and open `http://<host>:12345` for a simple, dependency-fre
   section below.
 - **Config**: edit the common tuning knobs and save. Changes write to `DOCTOR_CONFIG_FILE` and apply
   on restart (there's a "Save and Restart" button). Secrets (API keys, tokens) are never shown.
+- **Setup**: a first-run onboarding wizard (see below).
 - **Logs**: a live tail of `DOCTOR_LOG_FILE`.
 
 It runs inside the daemon's own process (no extra container). Gate it with `DOCTOR_UI_TOKEN` if your
 LAN isn't trusted. In event mode the webhook listener (`DOCTOR_PORT`) and the dashboard
 (`DOCTOR_UI_PORT`) run side by side.
+
+---
+
+## Onboarding (Setup wizard)
+
+If you start the container with nothing configured (no instances and no `PLEX_URL`), stack-doctor
+comes up in onboarding mode and the dashboard opens straight onto the **Setup** tab, drawn in the
+same hand-sketch style as Scout. You do not have to hand-write env vars or the compose file first;
+just set `ENABLE_UI=true`, start it, and open the dashboard.
+
+- **Auto-detect**: probes the usual container names, `localhost`, and the docker host for Radarr,
+  Sonarr, Prowlarr, Plex, decypharr, Riven, Overseerr/Jellyseerr and Bazarr. It fills in the URLs it
+  finds. It is a short, targeted probe of well-known names and ports, not a subnet scan. API keys
+  cannot be read from another container, so you paste those (each row has a **Test** button that
+  validates the URL + key live).
+- **Manual add** (Advanced mode): add any service by hand, pick its type, paste URL + key.
+- **Easy vs Advanced**: Easy shows the essentials and picks sensible `ENABLE_*` defaults from what you
+  filled in. Advanced exposes every service, the warmer mount, decypharr, and per-check toggles.
+- **Warmer volume hint**: the warmer reads media files straight off disk, so it needs your library
+  bind-mounted into the container. If no library mount is visible, the wizard shows exactly what to
+  add to `docker-compose.yml` (and when to set `WARMER_PATH_MAP`).
+- **Save & start**: writes everything (including `DOCTOR_ONBOARDED=true`) to `DOCTOR_CONFIG_FILE`,
+  then offers a one-click restart to apply. Nothing is applied until you restart. The **Setup** tab
+  stays available afterward so you can re-run it to add or change services.
+
+Onboarding only writes to `DOCTOR_CONFIG_FILE`; it never edits your compose file. Make sure that path
+is on a writable volume (the wizard warns you up front if it is not).
 
 ---
 

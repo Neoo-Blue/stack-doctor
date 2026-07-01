@@ -3550,6 +3550,212 @@ def _ui_logs(n):
     except Exception as e:
         return "log read error: " + str(e)[:80]
 
+# --------------------------------------------------------------------------- #
+# onboarding: first-run setup wizard (auto-detect + manual, writes config.json)
+# --------------------------------------------------------------------------- #
+
+# (type, default docker-compose service name, default port, probe kind, host-fallback)
+# host-fallback False for the 4k/alt variants so a localhost probe can't collide with
+# the primary on the same port and get mis-detected.
+_ONB_SERVICES = [
+    ("radarr",     "radarr",     7878,  "arr",   True),
+    ("radarr4k",   "radarr4k",   7878,  "arr",   False),
+    ("sonarr",     "sonarr",     8989,  "arr",   True),
+    ("sonarr4k",   "sonarr4k",   8989,  "arr",   False),
+    ("prowlarr",   "prowlarr",   9696,  "arr",   True),
+    ("plex",       "plex",       32400, "plex",  True),
+    ("decypharr",  "decypharr",  8282,  "web",   True),
+    ("riven",      "riven",      8080,  "web",   True),
+    ("overseerr",  "overseerr",  5055,  "web",   True),
+    ("jellyseerr", "jellyseerr", 5055,  "web",   False),
+    ("bazarr",     "bazarr",     6767,  "web",   True),
+]
+_ONB_LIBRARY_GUESSES = ["/mnt/library", "/media", "/data", "/mnt/unionfs", "/mnt"]
+
+def _default_gateway():
+    """Container's default gateway (the docker host, seen from inside), or '' if unknown."""
+    try:
+        for line in open("/proc/net/route").readlines()[1:]:
+            p = line.split()
+            if len(p) > 3 and p[1] == "00000000":
+                g = int(p[2], 16)
+                return "%d.%d.%d.%d" % (g & 0xff, (g >> 8) & 0xff, (g >> 16) & 0xff, (g >> 24) & 0xff)
+    except Exception:
+        pass
+    return ""
+
+def _onb_hosts():
+    hosts = ["127.0.0.1", "host.docker.internal"]
+    gw = _default_gateway()
+    if gw and gw not in hosts:
+        hosts.append(gw)
+    return hosts
+
+def _onb_probe(kind, url):
+    """(reachable, needs_key, note) for a candidate base url, short timeout."""
+    u = url.rstrip("/")
+    if kind == "arr":
+        for api in ("/api/v3/system/status", "/api/v1/system/status"):   # v1 = prowlarr
+            c = http_code(u + api, t=2)
+            if c == 401: return True, True, "found, needs API key"
+            if c == 200: return True, False, "found (open)"
+        return False, False, ""
+    if kind == "plex":
+        c = http_code(u + "/identity", t=2)
+        if c == 200: return True, False, "found"
+        if c == 401: return True, True, "found, needs token"
+        return False, False, ""
+    c = http_code(u + "/", t=2)                                          # web: any response = reachable
+    if c: return True, False, "reachable"
+    return False, False, ""
+
+def _onb_detect():
+    hosts = _onb_hosts()
+    found, seen, lock = [], set(), threading.Lock()
+    order = [s[0] for s in _ONB_SERVICES]
+    def probe(typ, sname, port, kind, hostfb):
+        for h in ([sname] + hosts if hostfb else [sname]):
+            ok, needs, note = _onb_probe(kind, "http://%s:%d" % (h, port))
+            if ok:
+                with lock:
+                    if typ in seen: return
+                    seen.add(typ)
+                    found.append({"type": typ, "kind": kind, "name": typ,
+                                  "url": "http://%s:%d" % (h, port), "needs_key": needs, "note": note})
+                return
+    threads = [threading.Thread(target=probe, args=s) for s in _ONB_SERVICES]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout=6)
+    found.sort(key=lambda r: order.index(r["type"]) if r["type"] in order else 99)
+    return {"hosts": hosts, "found": found}
+
+def _onb_test(typ, url, apikey):
+    u = (url or "").strip().rstrip("/"); t = (typ or "").strip().lower()
+    if not u: return False, "empty url"
+    try:
+        if "prowlarr" in t:
+            req = urllib.request.Request(u + "/api/v1/system/status", headers={"X-Api-Key": apikey or ""})
+            st = json.load(urllib.request.urlopen(req, timeout=5)); return True, "Prowlarr v%s" % st.get("version", "?")
+        if "radarr" in t or "sonarr" in t or t == "arr":
+            req = urllib.request.Request(u + "/api/v3/system/status", headers={"X-Api-Key": apikey or ""})
+            st = json.load(urllib.request.urlopen(req, timeout=5)); return True, "%s v%s" % (st.get("appName", "arr"), st.get("version", "?"))
+        if "plex" in t:
+            c = http_code(u + "/library/sections?X-Plex-Token=" + urllib.parse.quote(apikey or ""), t=5)
+            return (c == 200), ("token ok" if c == 200 else ("bad token" if c == 401 else "unreachable (%s)" % c))
+        c = http_code(u + "/", t=5)
+        return (c > 0), ("reachable" if c else "unreachable")
+    except urllib.error.HTTPError as e:
+        return False, ("bad API key" if e.code == 401 else "http %d" % e.code)
+    except Exception as e:
+        return False, str(e)[:80]
+
+def _onb_library_status():
+    out = []
+    for p in _ONB_LIBRARY_GUESSES:
+        try:
+            if os.path.isdir(p):
+                out.append({"path": p, "entries": len(os.listdir(p))})
+        except Exception:
+            pass
+    return out
+
+def _onb_warmer_hint():
+    return ("The warmer reads your media files straight off disk to precache them, so playback starts "
+            "instantly. Bind-mount your library into this container at the SAME path Plex uses. In "
+            "docker-compose.yml, under the stack-doctor service:\n\n"
+            "    volumes:\n"
+            "      - /path/to/your/media:/mnt/library:ro\n\n"
+            "If Plex sees a different path than the container, also set WARMER_PATH_MAP as "
+            "plexPrefix:hostPrefix (for example /data/media:/mnt/library).")
+
+def _onb_is_configured():
+    return bool(INSTANCES) or bool(PLEX_URL) or _b("DOCTOR_ONBOARDED", False)
+
+def _onb_state():
+    try:
+        d = os.path.dirname(CONFIG_FILE) or "."
+        writable = os.access(CONFIG_FILE, os.W_OK) if os.path.exists(CONFIG_FILE) else os.access(d, os.W_OK)
+    except Exception:
+        writable = False
+    return {"configured": _onb_is_configured(), "instances": len(INSTANCES),
+            "rivens": len(RIVENS), "mediastorms": len(MEDIASTORMS),
+            "plex": bool(PLEX_URL), "decypharr": bool(DECY_URL),
+            "config_file": CONFIG_FILE, "writable": writable,
+            "library_mounts": _onb_library_status(), "warmer_hint": _onb_warmer_hint()}
+
+def _config_write(updates, drop_prefixes=()):
+    try:
+        ov = json.load(open(CONFIG_FILE))
+    except Exception:
+        ov = {}
+    if drop_prefixes:
+        for k in list(ov.keys()):
+            if any(k.startswith(p) for p in drop_prefixes):
+                del ov[k]
+    for k, v in updates.items():
+        ov[str(k)] = str(v); os.environ[str(k)] = str(v)
+    os.makedirs(os.path.dirname(CONFIG_FILE) or ".", exist_ok=True)
+    json.dump(ov, open(CONFIG_FILE, "w"), indent=1)
+
+def _onb_save(body):
+    try:
+        d = json.loads(body or b"{}")
+    except Exception:
+        return False, {"error": "bad json"}
+    updates, i = {}, 0
+    for inst in (d.get("instances") or []):
+        url = (inst.get("url") or "").strip()
+        if not url:
+            continue
+        typ = (inst.get("type") or "").strip().lower()
+        real = ("radarr" if "radarr" in typ else "sonarr" if "sonarr" in typ else
+                "prowlarr" if "prowlarr" in typ else "riven" if typ == "riven" else
+                "mediastorm" if typ == "mediastorm" else "sonarr")
+        i += 1
+        updates["INSTANCE_%d_URL" % i] = url
+        updates["INSTANCE_%d_APIKEY" % i] = (inst.get("apikey") or "").strip()
+        updates["INSTANCE_%d_TYPE" % i] = real
+        updates["INSTANCE_%d_NAME" % i] = (inst.get("name") or typ or real).strip()
+    plex = d.get("plex") or {}
+    if (plex.get("url") or "").strip():
+        updates["PLEX_URL"] = plex["url"].strip()
+        updates["PLEX_TOKEN"] = (plex.get("token") or "").strip()
+    decy = d.get("decypharr") or {}
+    if (decy.get("url") or "").strip():
+        updates["DECYPHARR_URL"] = decy["url"].strip()
+        if (decy.get("mount") or "").strip():
+            updates["DECYPHARR_MOUNT_TEST"] = decy["mount"].strip()
+    seerr = d.get("seerr") or {}
+    if (seerr.get("url") or "").strip():
+        updates["SEERR_URL"] = seerr["url"].strip()
+        if (seerr.get("apikey") or "").strip():
+            updates["SEERR_APIKEY"] = seerr["apikey"].strip()
+    bz = d.get("bazarr") or {}
+    if (bz.get("url") or "").strip():
+        updates["BAZARR_URL"] = bz["url"].strip()
+        if (bz.get("apikey") or "").strip():
+            updates["BAZARR_APIKEY"] = bz["apikey"].strip()
+    warmer = d.get("warmer") or {}
+    if (warmer.get("path_map") or "").strip():
+        updates["WARMER_PATH_MAP"] = warmer["path_map"].strip()
+    for k, v in (d.get("checks") or {}).items():
+        if str(k).startswith("ENABLE_"):
+            updates[str(k)] = "true" if (v is True or str(v).lower() in ("1", "true", "on", "yes")) else "false"
+    if warmer.get("enabled"):
+        updates["ENABLE_WARMER"] = "true"
+    updates["ENABLE_UI"] = "true"
+    updates["DOCTOR_ONBOARDED"] = "true"
+    try:
+        _config_write(updates, drop_prefixes=("INSTANCE_",))
+    except Exception as e:
+        return False, {"error": str(e)[:120]}
+    libs = _onb_library_status()
+    guide = {"config_file": CONFIG_FILE, "saved": len(updates), "restart_needed": True,
+             "instances": i, "library_mounts": libs}
+    if updates.get("ENABLE_WARMER") == "true" and not libs:
+        guide["warmer_hint"] = _onb_warmer_hint()
+    return True, guide
+
 UI_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>stack-doctor</title>
 <link rel=preconnect href="https://fonts.googleapis.com"><link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
@@ -3674,10 +3880,122 @@ details summary{color:var(--ac)!important}
  .sk-poster{height:118px}
  .sk-step:not(.cur) .sk-steplab{display:none}
 }
+/* ---- Onboarding: pencil-sketch setup wizard ---- */
+#onboard{font-family:'Patrick Hand','Inter',sans-serif}
+#onboard *{font-family:'Patrick Hand','Inter',sans-serif}
+.ob-sub{font-size:16px;color:#6a6358;margin:2px 0 0}
+.ob-modebar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:14px 0 6px}
+.ob-modehint{font-size:15px;color:#6a6358}
+.ob-sec{margin-top:20px}
+.ob-sectitle{font-family:'Caveat',cursive;font-weight:700;font-size:24px;margin:0 0 4px}
+.ob-sectip{font-size:15px;color:#6a6358;margin:0 0 10px}
+.ob-svc{background:#fffdf7;border:2px solid #2c2a26;border-radius:12px;padding:11px 13px;margin-bottom:12px;box-shadow:3px 4px 0 rgba(44,42,38,.12);transform:rotate(-.2deg)}
+.ob-svc:nth-child(2n){transform:rotate(.25deg)}
+.ob-svchd{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+.ob-svcname{font-size:19px;font-weight:700;text-transform:capitalize}
+.ob-svctag{font-size:13px;border:1.5px solid #2c2a26;border-radius:6px;padding:0 8px}
+.ob-svcnote{font-size:14px;color:#6a6358}
+.ob-x{background:none;border:0;font-size:20px;cursor:pointer;color:#8a8276;line-height:1;padding:0 4px;margin-left:auto}
+.ob-x:hover{color:#b3261e}
+.ob-grid{display:grid;grid-template-columns:1fr 1fr auto;gap:8px 10px;align-items:end}
+.ob-f{display:flex;flex-direction:column;gap:2px;min-width:0}
+.ob-f.wide{grid-column:1 / -2}
+.ob-f label{margin:0;font:14px 'Patrick Hand';color:#6a6358;text-transform:none;letter-spacing:0}
+.ob-in{width:100%;background:#fffdf7;color:#2c2a26;border:2px solid #2c2a26;border-radius:120px 8px 120px 8px/8px 110px 8px 110px;padding:7px 12px;font:16px 'Patrick Hand';box-shadow:2px 2px 0 rgba(44,42,38,.1)}
+.ob-in:focus{outline:0;box-shadow:2px 2px 0 rgba(44,42,38,.3)}
+.ob-test{align-self:end;font-size:15px;padding:7px 15px}
+.ob-res{font-size:14px;margin-top:5px;min-height:18px}
+.ob-res.ok{color:#3f7a2e}
+.ob-res.bad{color:#b3261e}
+.ob-note{background:#fff6cc;border:2px solid #2c2a26;border-radius:10px;padding:11px 13px;box-shadow:3px 4px 0 rgba(44,42,38,.14);transform:rotate(-.3deg);white-space:pre-wrap;font-size:15px;line-height:1.4;color:#3a362d;margin-top:8px}
+.ob-note code,.ob-mono{font-family:'JetBrains Mono',monospace;font-size:13px}
+.ob-checks{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}
+.ob-chk{display:inline-flex;align-items:center;gap:7px;background:#fffdf7;border:2px solid #2c2a26;border-radius:999px;padding:6px 13px;font-size:15px;cursor:pointer;box-shadow:2px 2px 0 rgba(44,42,38,.1)}
+.ob-chk input{width:auto;accent-color:#2c2a26}
+.ob-chk.on{background:#ffe7a3}
+.ob-lib{font-size:14px;color:#6a6358;margin-top:6px}
+.ob-lib b{color:#3f7a2e}
+.ob-foot{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:22px}
+.ob-big{font-size:20px;padding:11px 26px;background:#bfe3b0}
+.ob-done{background:#fffdf7;border:2px solid #2c2a26;border-radius:12px;padding:14px 16px;margin-top:14px;box-shadow:3px 4px 0 rgba(44,42,38,.14)}
+.ob-warnbanner{background:#ffd7d0;border:2px solid #b3261e;border-radius:10px;padding:9px 13px;font-size:15px;color:#7a1c15;margin-top:10px}
+.ob-adv{display:none}
+#onboard.adv .ob-adv{display:block}
+#onboard.adv .ob-adv.ob-inline{display:inline-flex}
+@media(max-width:560px){.ob-grid{grid-template-columns:1fr}.ob-f.wide{grid-column:auto}.ob-test{width:100%;text-align:center}}
 </style></head><body>
 <header><h1>stack-doctor</h1><span class=mut id=sub>loading</span></header>
-<nav><button data-t=dash class=active>Dashboard</button><button data-t=scout>Scout</button><button data-t=config>Config</button><button data-t=logs>Logs</button></nav>
+<nav><button data-t=dash class=active>Dashboard</button><button data-t=scout>Scout</button><button data-t=config>Config</button><button data-t=logs>Logs</button><button data-t=onboard id=nav-setup>Setup</button></nav>
 <main>
+<div id=onboard style=display:none>
+ <div class=sk-wrap>
+  <div class=sk-head>
+   <div class=sk-title>Set up your stack</div>
+   <div class=ob-sub id=ob-sub>let's get stack-doctor talking to your services</div>
+  </div>
+  <div id=ob-warn></div>
+  <div class=ob-modebar>
+   <div class=sk-seg id=ob-mode>
+    <button class="sk-segb on" data-m=easy>Easy</button>
+    <button class=sk-segb data-m=adv>Advanced</button>
+   </div>
+   <button id=ob-detect class="sk-btn">Auto-detect</button>
+   <span class=ob-modehint id=ob-modehint>Easy: find services, drop in keys, go.</span>
+  </div>
+
+  <div class=ob-sec>
+   <div class=ob-sectitle>Services</div>
+   <div class=ob-sectip id=ob-svctip>Run auto-detect, or add each one by hand. Paste the API key and hit Test.</div>
+   <div id=ob-services></div>
+   <button id=ob-add class="sk-btn ob-adv ob-inline" style="font-size:15px;padding:7px 15px">+ Add service</button>
+  </div>
+
+  <div class=ob-sec>
+   <div class=ob-sectitle>Plex</div>
+   <div class=ob-sectip>Needed for Scout play links, the warmer, and holiday rows. <a href="https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/" target=_blank rel=noopener>Where's my token?</a></div>
+   <div class=ob-svc>
+    <div class=ob-grid>
+     <div class="ob-f wide"><label>Plex URL</label><input id=ob-plex-url class=ob-in placeholder="http://plex:32400"></div>
+     <div class=ob-f><label>X-Plex-Token</label><input id=ob-plex-token class=ob-in placeholder="paste token"></div>
+     <button class="sk-btn ob-test" onclick="obTestPlex()">Test</button>
+    </div>
+    <div class="ob-res" id=ob-plex-res></div>
+   </div>
+  </div>
+
+  <div class="ob-sec ob-adv">
+   <div class=ob-sectitle>Warmer <span style="font-size:15px;color:#6a6358">(precache for instant playback)</span></div>
+   <label class="ob-chk" id=ob-warmer-lab style="margin-bottom:6px"><input type=checkbox id=ob-warmer> Enable the warmer</label>
+   <div class=ob-lib id=ob-libs></div>
+   <div class=ob-note id=ob-warmer-note style="display:none"></div>
+   <div class="ob-f" style="max-width:420px;margin-top:8px"><label>WARMER_PATH_MAP (optional, plexPrefix:hostPrefix)</label><input id=ob-warmer-map class=ob-in placeholder="/data/media:/mnt/library"></div>
+  </div>
+
+  <div class="ob-sec ob-adv">
+   <div class=ob-sectitle>Decypharr <span style="font-size:15px;color:#6a6358">(debrid/usenet mount)</span></div>
+   <div class=ob-svc>
+    <div class=ob-grid>
+     <div class="ob-f wide"><label>Decypharr URL</label><input id=ob-decy-url class=ob-in placeholder="http://decypharr:8282"></div>
+     <div class=ob-f><label>Mount test dir (optional)</label><input id=ob-decy-mount class=ob-in placeholder="/mnt/decypharr/__all__"></div>
+     <button class="sk-btn ob-test" onclick="obTestDecy()">Test</button>
+    </div>
+    <div class="ob-res" id=ob-decy-res></div>
+   </div>
+  </div>
+
+  <div class="ob-sec">
+   <div class=ob-sectitle>What should run?</div>
+   <div class=ob-sectip id=ob-checktip>Easy mode picks sensible defaults. Switch to Advanced to fine-tune.</div>
+   <div class=ob-checks id=ob-checks></div>
+  </div>
+
+  <div class=ob-foot>
+   <button id=ob-save class="sk-btn ob-big">Save &amp; start</button>
+   <span class=ob-modehint id=ob-savehint></span>
+  </div>
+  <div id=ob-result></div>
+ </div>
+</div>
 <div id=dash>
  <div class=card><h3>Checks</h3><div class=grid id=checks></div></div>
  <div class=card><h3>Monitored services</h3><div id=health></div></div>
@@ -3716,11 +4034,12 @@ function toast(m){var e=E('toast');e.textContent=m;e.style.opacity=1;setTimeout(
 function ago(s){if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago'}
 var timer;
 function show(t){var b=document.querySelectorAll('nav button');for(var i=0;i<b.length;i++)b[i].classList.toggle('active',b[i].dataset.t===t);
- E('dash').style.display=t==='dash'?'':'none';E('scout').style.display=t==='scout'?'':'none';E('config').style.display=t==='config'?'':'none';E('logs').style.display=t==='logs'?'':'none';
+ E('dash').style.display=t==='dash'?'':'none';E('scout').style.display=t==='scout'?'':'none';E('config').style.display=t==='config'?'':'none';E('logs').style.display=t==='logs'?'':'none';E('onboard').style.display=t==='onboard'?'':'none';
  clearInterval(timer);
  if(t==='dash'){loadDash();timer=setInterval(loadDash,5000)}
  if(t==='scout'){loadScoutMeta();loadScoutStatus();timer=setInterval(loadScoutStatus,4000)}
  if(t==='config')loadConfig();
+ if(t==='onboard')loadOnboard();
  if(t==='logs'){loadLogs();timer=setInterval(loadLogs,4000)}}
 var nb=document.querySelectorAll('nav button');for(var i=0;i<nb.length;i++)nb[i].onclick=(function(t){return function(){show(t)}})(nb[i].dataset.t);
 function loadDash(){
@@ -3879,7 +4198,112 @@ function scoutClear(id){fetch(q('/api/scout/clear'),{method:'POST',body:JSON.str
    for(var j=0;j<seg.length;j++)seg[j].classList.toggle('on',seg[j]===b);if(skResults.length)scoutSearch()}})(seg[i]);
   E('sk-go').onclick=scoutSearch;
   E('sk-q').addEventListener('keydown',function(e){if(e.key==='Enter'||e.keyCode===13)scoutSearch()})})();
-show('dash');
+/* ---------------- onboarding ---------------- */
+var obMode='easy',obServices=[],obChecks={},obState={};
+var OB_INSTANCE_TYPES={radarr:1,radarr4k:1,sonarr:1,sonarr4k:1,prowlarr:1,riven:1,mediastorm:1};
+var OB_ADDABLE=['radarr','radarr4k','sonarr','sonarr4k','prowlarr','riven','mediastorm','seerr','bazarr'];
+var OB_CHECKS=[['ENABLE_QUEUE','queue'],['ENABLE_SCOUT','scout'],['ENABLE_PLEX','plex'],['ENABLE_DECYPHARR','decypharr'],
+ ['ENABLE_PROVIDERS','providers'],['ENABLE_RESOURCES','resources'],['ENABLE_JANITOR','janitor'],['ENABLE_WATCHLISTS','watchlists'],
+ ['ENABLE_HOLIDAYS','holidays'],['ENABLE_BACKLOG','backlog'],['ENABLE_RIVEN','riven'],['ENABLE_MEDIASTORM','mediastorm'],
+ ['ENABLE_SEERR','seerr'],['ENABLE_BAZARR','bazarr'],['ENABLE_SCRUBBER','scrubber'],['ENABLE_WARMER','warmer']];
+function obHas(t){for(var i=0;i<obServices.length;i++)if(obServices[i].type===t)return true;return false}
+function obHasUrl(u){for(var i=0;i<obServices.length;i++)if(obServices[i].url===u)return true;return false}
+function obDefaultChecks(){var c={ENABLE_QUEUE:true,ENABLE_SCOUT:true,ENABLE_RESOURCES:true};
+ if(E('ob-plex-url').value.trim())c.ENABLE_PLEX=true;
+ if(E('ob-decy-url').value.trim())c.ENABLE_DECYPHARR=true;
+ if(obHas('riven'))c.ENABLE_RIVEN=true;
+ if(obHas('seerr'))c.ENABLE_SEERR=true;
+ if(obHas('bazarr'))c.ENABLE_BAZARR=true;
+ if(obHas('mediastorm'))c.ENABLE_MEDIASTORM=true;
+ if(E('ob-warmer').checked)c.ENABLE_WARMER=true;
+ return c}
+function obSetMode(m){obMode=m;E('onboard').classList.toggle('adv',m==='adv');
+ var seg=E('ob-mode').querySelectorAll('.sk-segb');for(var i=0;i<seg.length;i++)seg[i].classList.toggle('on',seg[i].dataset.m===m);
+ E('ob-modehint').textContent=m==='easy'?'Easy: find services, drop in keys, go.':'Advanced: every service, the warmer mount, and per-check toggles.';
+ E('ob-checktip').textContent=m==='easy'?'Easy mode picks sensible defaults from what you filled in.':'Tick exactly what you want stack-doctor to run.';
+ if(m==='easy')obChecks=obDefaultChecks();obRenderChecks()}
+function obRenderChecks(){var h='';for(var i=0;i<OB_CHECKS.length;i++){var k=OB_CHECKS[i][0],on=!!obChecks[k];
+  h+='<label class="ob-chk'+(on?' on':'')+'"><input type=checkbox '+(on?'checked':'')+' onchange="obToggleCheck(\''+k+'\',this.checked)"> '+esc(OB_CHECKS[i][1])+'</label>'}
+ E('ob-checks').innerHTML=h}
+function obToggleCheck(k,v){obChecks[k]=v;obRenderChecks()}
+function obTypeOpts(sel){var h='';for(var i=0;i<OB_ADDABLE.length;i++){var t=OB_ADDABLE[i];h+='<option'+(t===sel?' selected':'')+'>'+esc(t)+'</option>'}return h}
+function obApiLabel(t){return t==='plex'?'token':'API key'}
+function obRenderServices(){var h='';
+ for(var i=0;i<obServices.length;i++){var s=obServices[i];
+  h+='<div class=ob-svc><div class=ob-svchd>'+
+     '<select class=ob-in style="width:auto;padding:5px 12px;border-radius:8px" onchange="obSvcType('+i+',this.value)">'+obTypeOpts(s.type)+'</select>'+
+     (s.note?'<span class=ob-svcnote>'+esc(s.note)+'</span>':'')+
+     '<button class=ob-x title=remove onclick="obDelSvc('+i+')">&times;</button></div>'+
+     '<div class=ob-grid>'+
+      '<div class="ob-f wide"><label>URL</label><input class=ob-in id="obs_url_'+i+'" value="'+esc(s.url||'')+'" oninput="obSvcField('+i+',\'url\',this.value)" placeholder="http://host:port"></div>'+
+      '<div class=ob-f><label>'+esc(obApiLabel(s.type))+'</label><input class=ob-in id="obs_key_'+i+'" value="'+esc(s.apikey||'')+'" oninput="obSvcField('+i+',\'apikey\',this.value)" placeholder="paste key"></div>'+
+      '<button class="sk-btn ob-test" onclick="obTestSvc('+i+')">Test</button>'+
+     '</div><div class="ob-res" id="obs_res_'+i+'"></div></div>'}
+ if(!obServices.length)h='<div class=sk-note>No services yet. Hit Auto-detect, or switch to Advanced to add one by hand.</div>';
+ E('ob-services').innerHTML=h}
+function obSvcField(i,f,v){obServices[i][f]=v}
+function obSvcType(i,v){obServices[i].type=v;obRenderServices()}
+function obDelSvc(i){obServices.splice(i,1);obRenderServices()}
+function obAddSvc(){obServices.push({type:'radarr',url:'',apikey:'',note:'manual'});obRenderServices()}
+function obTestSvc(i){var s=obServices[i],res=E('obs_res_'+i);res.className='ob-res';res.textContent='testing...';
+ fetch(q('/api/onboard/test'),{method:'POST',body:JSON.stringify({type:s.type,url:s.url,apikey:s.apikey})}).then(function(r){return r.json()}).then(function(j){
+  res.className='ob-res '+(j.ok?'ok':'bad');res.textContent=(j.ok?'ok - ':'x - ')+(j.msg||'')})}
+function obTestPlex(){var res=E('ob-plex-res');res.className='ob-res';res.textContent='testing...';
+ fetch(q('/api/onboard/test'),{method:'POST',body:JSON.stringify({type:'plex',url:E('ob-plex-url').value,apikey:E('ob-plex-token').value})}).then(function(r){return r.json()}).then(function(j){
+  res.className='ob-res '+(j.ok?'ok':'bad');res.textContent=(j.ok?'ok - ':'x - ')+(j.msg||'');if(obMode==='easy'){obChecks=obDefaultChecks();obRenderChecks()}})}
+function obTestDecy(){var res=E('ob-decy-res');res.className='ob-res';res.textContent='testing...';
+ fetch(q('/api/onboard/test'),{method:'POST',body:JSON.stringify({type:'decypharr',url:E('ob-decy-url').value})}).then(function(r){return r.json()}).then(function(j){
+  res.className='ob-res '+(j.ok?'ok':'bad');res.textContent=(j.ok?'ok - ':'x - ')+(j.msg||'')})}
+function obDetect(){var btn=E('ob-detect');btn.textContent='scanning...';btn.disabled=true;
+ fetch(q('/api/onboard/detect')).then(function(r){return r.json()}).then(function(d){
+  btn.textContent='Auto-detect';btn.disabled=false;var f=d.found||[],added=0;
+  for(var i=0;i<f.length;i++){var s=f[i],t=s.type;
+   if(t==='plex'){if(!E('ob-plex-url').value)E('ob-plex-url').value=s.url;continue}
+   if(t==='decypharr'){if(!E('ob-decy-url').value)E('ob-decy-url').value=s.url;continue}
+   var norm=(t==='overseerr'||t==='jellyseerr')?'seerr':t;
+   if(!obHas(norm)&&!obHasUrl(s.url)){obServices.push({type:norm,url:s.url,apikey:'',note:s.note});added++}}
+  obRenderServices();if(obMode==='easy'){obChecks=obDefaultChecks();obRenderChecks()}
+  toast(added?('found '+added+' service'+(added>1?'s':'')):'nothing new found');
+  E('ob-svctip').textContent=added?'Detected below. Paste each API key and hit Test.':'Nothing auto-detected. Add services by hand in Advanced mode.'})}
+function obRenderLibs(){var libs=obState.library_mounts||[],h='';
+ if(libs.length){var parts=[];for(var i=0;i<libs.length;i++)parts.push('<b>'+esc(libs[i].path)+'</b> ('+libs[i].entries+')');h='Library paths visible in this container: '+parts.join(', ')}
+ else h='No media library mount detected inside this container yet.';
+ E('ob-libs').innerHTML=h}
+function obWarmerToggle(){var on=E('ob-warmer').checked;E('ob-warmer-lab').classList.toggle('on',on);
+ var note=E('ob-warmer-note');
+ if(on&&(!obState.library_mounts||!obState.library_mounts.length)){note.style.display='';note.textContent=obState.warmer_hint||''}else note.style.display='none';
+ if(obMode==='easy'){obChecks=obDefaultChecks();obRenderChecks()}}
+function obSave(){var insts=[],seerr=null,bazarr=null;
+ for(var i=0;i<obServices.length;i++){var s=obServices[i];if(!s.url||!s.url.trim())continue;
+  if(s.type==='seerr'){seerr={url:s.url,apikey:s.apikey};continue}
+  if(s.type==='bazarr'){bazarr={url:s.url,apikey:s.apikey};continue}
+  if(OB_INSTANCE_TYPES[s.type])insts.push({type:s.type,name:s.type,url:s.url,apikey:s.apikey})}
+ var body={instances:insts,plex:{url:E('ob-plex-url').value,token:E('ob-plex-token').value},
+  decypharr:{url:E('ob-decy-url').value,mount:E('ob-decy-mount').value},
+  warmer:{enabled:E('ob-warmer').checked,path_map:E('ob-warmer-map').value},
+  checks:(obMode==='easy'?obDefaultChecks():obChecks)};
+ if(seerr)body.seerr=seerr;if(bazarr)body.bazarr=bazarr;
+ var btn=E('ob-save');btn.disabled=true;btn.textContent='saving...';
+ fetch(q('/api/onboard/save'),{method:'POST',body:JSON.stringify(body)}).then(function(r){return r.json()}).then(function(j){
+  btn.disabled=false;btn.textContent='Save & start';
+  if(!j.ok){E('ob-result').innerHTML='<div class=ob-warnbanner>Save failed: '+esc(j.error||'unknown')+'</div>';return}
+  var h='<div class=ob-done><div class=ob-sectitle>Saved to '+esc(j.config_file||'config')+'</div>'+
+   '<div class=ob-sub>'+j.instances+' service(s) wired. A restart applies everything.</div>';
+  if(j.warmer_hint)h+='<div class=ob-note>'+esc(j.warmer_hint)+'</div>';
+  h+='<div class=ob-foot><button class="sk-btn ob-big" onclick="obRestart()">Restart now</button><span class=ob-modehint>or restart later from Config</span></div></div>';
+  E('ob-result').innerHTML=h;E('ob-result').scrollIntoView({behavior:'smooth'})})}
+function obRestart(){fetch(q('/api/restart'),{method:'POST'}).then(function(){toast('restarting...');setTimeout(function(){location.reload()},4500)})}
+function loadOnboard(){fetch(q('/api/onboard/state')).then(function(r){return r.json()}).then(function(s){obState=s;
+  E('ob-warn').innerHTML=s.writable?'':'<div class=ob-warnbanner>Heads up: '+esc(s.config_file)+' is not writable by this process, so setup will not persist. Fix the volume/permissions or point DOCTOR_CONFIG_FILE at a writable path.</div>';
+  E('ob-sub').textContent=s.configured?'already configured - re-run to add or change services':"let's get stack-doctor talking to your services";
+  obRenderLibs();obRenderServices();
+  if(obMode==='easy')obChecks=obDefaultChecks();obRenderChecks()})}
+(function(){var seg=E('ob-mode').querySelectorAll('.sk-segb');
+ for(var i=0;i<seg.length;i++)seg[i].onclick=(function(b){return function(){obSetMode(b.dataset.m)}})(seg[i]);
+ E('ob-detect').onclick=obDetect;E('ob-add').onclick=obAddSvc;
+ E('ob-save').onclick=obSave;E('ob-warmer').onchange=obWarmerToggle})();
+fetch(q('/api/onboard/state')).then(function(r){return r.json()}).then(function(s){obState=s;
+  show(s.configured?'dash':'onboard')}).catch(function(){show('dash')});
 </script></body></html>"""
 
 def _build_server(port):
@@ -3913,6 +4337,8 @@ def _build_server(port):
             if path == "/api/warmer":      return self._send(200, "application/json", json.dumps(_ui_warmer()))
             if path == "/api/westrepair":  return self._send(200, "application/json", json.dumps(_ui_westrepair()))
             if path == "/api/config":      return self._send(200, "application/json", json.dumps(_ui_config()))
+            if path == "/api/onboard/state":  return self._send(200, "application/json", json.dumps(_onb_state()))
+            if path == "/api/onboard/detect": return self._send(200, "application/json", json.dumps(_onb_detect()))
             if path == "/api/scout/meta":   return self._send(200, "application/json", json.dumps(_scout_meta()))
             if path == "/api/scout/status": return self._send(200, "application/json", json.dumps(_scout_status()))
             if path == "/api/scout/search":
@@ -3928,9 +4354,18 @@ def _build_server(port):
             path = urlparse(self.path).path
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else b""
-            if path in ("/api/config", "/api/restart", "/api/westrepair/rescan", "/api/scout/get", "/api/scout/clear"):
+            if path in ("/api/config", "/api/restart", "/api/westrepair/rescan", "/api/scout/get",
+                        "/api/scout/clear", "/api/onboard/test", "/api/onboard/save"):
                 if not EN_UI or not self._authed():
                     return self._send(401, "text/plain", "unauthorized")
+                if path == "/api/onboard/test":
+                    try: od = json.loads(body or b"{}")
+                    except Exception: od = {}
+                    ok, msg = _onb_test(od.get("type", ""), od.get("url", ""), od.get("apikey", ""))
+                    return self._send(200, "application/json", json.dumps({"ok": ok, "msg": msg}))
+                if path == "/api/onboard/save":
+                    ok, info = _onb_save(body)
+                    return self._send(200 if ok else 400, "application/json", json.dumps(dict(info, ok=ok)))
                 if path == "/api/scout/get":
                     ok, info = _scout_get(body)
                     return self._send(200 if ok else 400, "application/json", json.dumps(dict(info, ok=ok)))
@@ -3968,7 +4403,10 @@ def main():
     warmer_on = EN_WARMER and bool(PLEX_URL)
     if EN_WARMER and not PLEX_URL:
         log.warning("ENABLE_WARMER set but PLEX_URL is empty -> warmer disabled")
-    if EN_QUEUE and not INSTANCES:
+    onboarding = EN_UI and not _onb_is_configured()
+    if onboarding:
+        log.info("no config detected -> onboarding mode; open the dashboard and run Setup")
+    if EN_QUEUE and not INSTANCES and not onboarding:
         log.error("queue check enabled but no instances. Set INSTANCE_1_URL / _APIKEY / _TYPE.")
         sys.exit(2)
     if not enabled and not warmer_on and not EN_UI:
