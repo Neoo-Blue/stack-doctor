@@ -185,10 +185,12 @@ Set `ENABLE_UI=true` and open `http://<host>:12345` for a simple, dependency-fre
 - **Setup**: a first-run onboarding wizard (see below).
 - **Logs**: a live tail of `DOCTOR_LOG_FILE`.
 
-The whole UI runs on a token-driven theme system. Pick a look from the **theme** dropdown in the
-header; the choice is saved to `localStorage` and applied before first paint, so it sticks across
-tabs and reloads. Two themes ship today: **Pencil** (the hand-drawn paper look, the default) and
-**Cyber** (the original dark neon). Adding another is deliberately small (see
+The whole UI runs on a token-driven theme system with two independent axes: a **theme** dropdown and
+a **light / dark** switch, both in the header. Each is saved to `localStorage` (`sd-theme`, `sd-mode`)
+and applied before first paint, so the look sticks across tabs and reloads. Two themes ship today,
+each with a light and a dark palette: **Pencil** (hand-drawn paper by day, chalkboard by night, the
+default) and **Cyber** (neon on glass, dark or daylight). Theme and mode are independent, so any of
+the four combinations is one click apart. Adding another theme is deliberately small (see
 [Adding a theme](#adding-a-theme)).
 
 It runs inside the daemon's own process (no extra container). Gate it with `DOCTOR_UI_TOKEN` if your
@@ -198,15 +200,17 @@ LAN isn't trusted. In event mode the webhook listener (`DOCTOR_PORT`) and the da
 ### Adding a theme
 
 Every color, font, radius, shadow and background in the UI is a CSS custom property (a token). A
-theme is just one override block plus one registry entry, both in the `UI_HTML` string:
+theme is two palette blocks (one per mode) plus one registry entry, all in the `UI_HTML` string:
 
-1. In the `<style>` block, copy the `html[data-theme=cyber]{...}` block, rename it to your id (for
-   example `html[data-theme=blueprint]{...}`), and set the tokens you want to change. Anything you
-   leave out falls back to the Pencil defaults in `:root`.
+1. In the `<style>` block, copy the two `html[data-theme=cyber][data-mode=light]{...}` and
+   `html[data-theme=cyber][data-mode=dark]{...}` blocks, rename them to your id (for example
+   `html[data-theme=blueprint][data-mode=light]{...}` and `...[data-mode=dark]{...}`), and set the
+   tokens. Each block is a complete, self-contained palette, so define every token; the shared font
+   families in `:root` are the only thing you inherit.
 2. In the boot script, add `{id:'blueprint',name:'Blueprint'}` to the `THEMES` array.
 
-That is the whole change. The dropdown, persistence, and app-wide application are automatic, and
-every tab (Dashboard, Scout, Config, Logs, Setup) recolors from the same tokens.
+That is the whole change. The dropdown, the light/dark switch, persistence, and app-wide application
+are automatic, and every tab (Dashboard, Scout, Config, Logs, Setup) recolors from the same tokens.
 
 ---
 
@@ -676,6 +680,19 @@ It does not add a new backend: it drives whatever you already run.
   item's Riven state.
 - With no acquisition backend, the tab shows a clear "nothing to drive" banner.
 
+**Search by title or by actor.** A `Title / Actor` toggle sits next to the search box. In **Actor**
+mode you type a name and Scout returns that person's filmography as cards, most-popular first, each
+with a **Get** button, so you can pull a whole body of work without knowing individual titles. The
+arr `/lookup` endpoints are title-only, so actor search rides a separate metadata provider:
+
+- If `SCOUT_TMDB_API_KEY` is set, Scout queries TMDB directly. This needs **no Overseerr/Jellyseerr**.
+- Otherwise, if `SEERR_URL` + `SEERR_APIKEY` are set, Scout uses seerr's person API.
+- If neither is configured, the Actor toggle stays hidden and the tab explains what to set.
+
+Person cards carry a TMDB id; Scout resolves the TVDB id a show needs (and checks whether the item is
+already in your library) at **Get** time, so search stays fast. Actor search is offered only in the
+Sonarr/Radarr backend mode, since that is the path that can add a TMDB-identified pick.
+
 Search hits that are already playable in Plex skip the queue entirely: instead of a **Get** button they
 show a **Play in Plex** button straight away. Presence is resolved against Plex at search time (matching
 by IMDb/TMDB/TVDB guid, then title and year), not against the arr's `hasFile`, because on a debrid/Riven
@@ -725,7 +742,9 @@ writes, and it honours `DOCTOR_DRY_RUN`: in dry-run nothing is submitted and the
 | `SCOUT_SHOW_INSTANCE` | _(first sonarr)_ | which sonarr name to acquire shows through |
 | `SCOUT_QUALITY_PROFILE` | _(instance default)_ | quality profile name or id to add new items with |
 | `SCOUT_ROOT_FOLDER` | _(instance default)_ | root folder path to add new items into |
-| `SCOUT_MAX_RESULTS` | `20` | cap on search results shown |
+| `SCOUT_MAX_RESULTS` | `20` | cap on title search results shown |
+| `SCOUT_TMDB_API_KEY` | _(none)_ | optional TMDB v3 key; enables actor/actress search with no seerr. If blank, Scout falls back to seerr's person API; if neither is set the Actor toggle is hidden |
+| `SCOUT_PERSON_MAX` | `40` | cap on filmography cards an actor search returns (most-popular first) |
 | `SCOUT_RETAIN` | `40` | how many recent requests the activity feed keeps |
 | `SCOUT_TTL_HOURS` | `48` | drop a finished request from the feed after this long |
 | `SCOUT_STATE_FILE` | `/data/scout.json` | where in-flight requests are persisted |

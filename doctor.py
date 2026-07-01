@@ -360,6 +360,9 @@ SCOUT_MAX_GRAB_GB    = _i("SCOUT_MAX_GRAB_GB", 30)                  # Scout pick
 SCOUT_GRAB_TRIES     = _i("SCOUT_GRAB_TRIES", 4)                    # how many fetchable releases to try (best first) before falling back to the arr's own auto search
 SCOUT_GRAB_WAIT      = _i("SCOUT_GRAB_WAIT", 18)                    # seconds to watch a grabbed release for import/failure before moving to the next candidate
 SCOUT_SEARCH_TIMEOUT = _i("SCOUT_SEARCH_TIMEOUT", 90)              # timeout for Scout's interactive release search against the indexers
+SCOUT_TMDB_API_KEY   = os.environ.get("SCOUT_TMDB_API_KEY", "")    # optional TMDB v3 key. Lets Scout do actor/actress search WITHOUT Overseerr/Jellyseerr; if blank, Scout falls back to seerr's person API, and if neither is set actor search is unavailable
+SCOUT_PERSON_MAX     = _i("SCOUT_PERSON_MAX", 40)                   # cap on filmography cards an actor search returns (sorted most-popular first)
+TMDB_IMG             = "https://image.tmdb.org/t/p/w500"           # poster base; TMDB and seerr both hand back the same posterPath
 
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
@@ -2853,6 +2856,8 @@ UI_SCHEMA = [
               ("WARMER_COOLDOWN", "3600"), ("WARMER_LOAD_MAX", "0")]),
     ("Resources", [("RES_LOAD_WARN", "40"), ("RES_SWAP_WARN_MB", "7000"), ("RES_MEM_MIN_MB", "800")]),
     ("Seerr (failed-request retry)", [("SEERR_URL", "http://seerr:5055"), ("SEERR_RETRY_MAX", "10"), ("SEERR_MAX_ATTEMPTS", "5")]),
+    ("Scout (acquire tab)", [("SCOUT_TMDB_API_KEY", "tmdb v3 key -> enables actor search without seerr"),
+              ("SCOUT_PERSON_MAX", "40"), ("SCOUT_QUALITY_PROFILE", ""), ("SCOUT_MAX_RESULTS", "20")]),
 ]
 UI_KEYS = set(k for _, items in UI_SCHEMA for k, _ in items)
 
@@ -2959,8 +2964,11 @@ def _scout_meta():
     label = {"arr": "Sonarr / Radarr", "riven": "Riven", "none": "no acquisition backend"}[mode]
     caps = {"movie": bool(_scout_arr("movie")) if mode == "arr" else (mode == "riven"),
             "show":  bool(_scout_arr("show"))  if mode == "arr" else (mode == "riven")}
+    prov = _scout_person_provider()
+    person_ok = bool(prov) and mode == "arr"                       # person cards give tmdb ids; only the arr path can add those
     return {"enabled": EN_SCOUT, "available": EN_SCOUT and mode != "none", "mode": mode,
-            "backend": label, "caps": caps, "dry_run": DRY_RUN, "plex": bool(PLEX_URL)}
+            "backend": label, "caps": caps, "dry_run": DRY_RUN, "plex": bool(PLEX_URL),
+            "person": person_ok, "person_src": (prov.label if prov else "")}
 
 def _scout_profile(arr):
     if arr.name in _scout_pcache: return _scout_pcache[arr.name]
@@ -2995,11 +3003,101 @@ def _scout_norm_arr(it, kind, arr):
             "tmdbId": it.get("tmdbId"), "tvdbId": it.get("tvdbId"), "imdbId": it.get("imdbId") or "",
             "arr": arr.name, "inLibrary": bool(it.get("id")), "hasFile": hasfile, "arr_id": it.get("id") or 0}
 
-def _scout_search(qstr, kind):
+# --- actor / actress search -------------------------------------------------
+# Radarr/Sonarr's /lookup is title-only, so person search rides a separate
+# metadata provider. We prefer a direct TMDB key (works with NO seerr), and
+# fall back to seerr's person API if that's all the user has. Either way we
+# build Scout cards straight from the filmography credits; tvdb (needed to add
+# a show to Sonarr) is resolved lazily at Get time so search stays two calls.
+class _TmdbProvider:
+    label = "TMDB"; snake = True
+    def __init__(self, key): self.key = key
+    def _get(self, path, params=None):
+        params = dict(params or {}); params["api_key"] = self.key
+        url = "https://api.themoviedb.org/3" + path + "?" + urllib.parse.urlencode(params)
+        return json.load(urllib.request.urlopen(url, timeout=TIMEOUT))
+    def search_person(self, name):
+        return (self._get("/search/person", {"query": name}) or {}).get("results") or []
+    def credits(self, pid):
+        d = self._get("/person/%s/combined_credits" % pid) or {}
+        return (d.get("cast") or []) + (d.get("crew") or [])
+    def tv_tvdb(self, tid):
+        return (self._get("/tv/%s/external_ids" % tid) or {}).get("tvdb_id")
+
+class _SeerrProvider:
+    label = "Overseerr / Jellyseerr"; snake = False
+    def __init__(self, url, key): self.s = Seerr(url, key)
+    def search_person(self, name):
+        d = json.load(self.s._req("GET", "/search?query=" + urllib.parse.quote(name), t=15)) or {}
+        return [r for r in (d.get("results") or []) if r.get("mediaType") == "person"]
+    def credits(self, pid):
+        d = json.load(self.s._req("GET", "/person/%s/combined_credits" % pid, t=20)) or {}
+        return (d.get("cast") or []) + (d.get("crew") or [])
+    def tv_tvdb(self, tid):
+        d = json.load(self.s._req("GET", "/tv/%s" % tid, t=15)) or {}
+        return (d.get("externalIds") or {}).get("tvdbId")
+
+def _scout_person_provider():
+    if SCOUT_TMDB_API_KEY: return _TmdbProvider(SCOUT_TMDB_API_KEY)
+    if SEERR_URL and SEERR_APIKEY: return _SeerrProvider(SEERR_URL, SEERR_APIKEY)
+    return None
+
+def _scout_norm_credit(c, snake):
+    mt = c.get("media_type" if snake else "mediaType")
+    if mt not in ("movie", "tv"): return None
+    title = c.get("title") or c.get("name") or "?"
+    date = (c.get("release_date") or c.get("first_air_date")) if snake else (c.get("releaseDate") or c.get("firstAirDate"))
+    poster = c.get("poster_path" if snake else "posterPath")
+    return {"id": c.get("id"), "mediaType": mt, "title": title, "year": ((date or "")[:4]),
+            "poster": (TMDB_IMG + poster) if poster else "", "popularity": c.get("popularity") or 0,
+            "overview": (c.get("overview") or "")[:240]}
+
+def _scout_person_search(qstr, kind):
+    prov = _scout_person_provider()
+    if not prov:
+        return {"mode": _scout_mode(), "results": [],
+                "error": "actor search needs a TMDB API key (set SCOUT_TMDB_API_KEY) or Overseerr/Jellyseerr"}
+    try:
+        people = prov.search_person(qstr)
+    except Exception as e:
+        log.warning("[scout] person search failed: %s", str(e)[:100])
+        return {"mode": _scout_mode(), "results": [], "error": "person lookup failed via %s" % prov.label}
+    if not people:
+        return {"mode": _scout_mode(), "results": [], "person": ""}
+    person = people[0]
+    try:
+        creds = prov.credits(person.get("id"))
+    except Exception as e:
+        log.warning("[scout] credits fetch failed: %s", str(e)[:100])
+        return {"mode": _scout_mode(), "results": [], "error": "could not fetch filmography via %s" % prov.label}
+    want = {"movie": "movie", "show": "tv"}.get(kind)                # 'both'/'' -> no filter
+    seen, cards = set(), []
+    for c in creds:
+        nc = _scout_norm_credit(c, prov.snake)
+        if not nc or not nc["id"]: continue
+        if want and nc["mediaType"] != want: continue
+        k = "movie" if nc["mediaType"] == "movie" else "show"
+        uid = k + ":tmdb:" + str(nc["id"])
+        if uid in seen: continue
+        seen.add(uid)
+        cards.append({"uid": uid, "kind": k, "title": nc["title"], "year": nc["year"],
+                      "overview": nc["overview"], "poster": nc["poster"], "tmdbId": nc["id"],
+                      "tvdbId": None, "imdbId": "", "arr": "", "inLibrary": False, "hasFile": False,
+                      "arr_id": 0, "_pop": nc["popularity"]})
+    cards.sort(key=lambda x: x.get("_pop") or 0, reverse=True)
+    cards = cards[:SCOUT_PERSON_MAX]
+    for c in cards: c.pop("_pop", None)
+    out = {"mode": _scout_mode(), "results": cards, "person": person.get("name") or qstr}
+    _scout_plex_annotate(cards, qstr)                                # light up anything already in Plex
+    return out
+
+def _scout_search(qstr, kind, stype="title"):
     qstr = (qstr or "").strip()
     mode = _scout_mode()
     if not qstr or not EN_SCOUT or mode == "none":
         return {"mode": mode, "results": []}
+    if stype == "person":
+        return _scout_person_search(qstr, kind)
     res = []
     if mode == "arr":
         kinds = ["movie", "show"] if kind in ("both", "", None) else [kind]
@@ -3117,6 +3215,33 @@ def _scout_launch_grab(arr, movie_id, title):
     if DRY_RUN or not movie_id: return
     threading.Thread(target=_scout_interactive_grab, args=(arr, movie_id, title), daemon=True).start()
 
+def _scout_find_existing(arr, kind, req):
+    """Resolve a tmdb-only request (e.g. an actor-search card) against the arr's library.
+    For shows it also fills req['tvdbId'] (needed to add to Sonarr), resolving it via the
+    person provider when absent. Returns (arr_id, has_file); (0, False) when not present."""
+    try:
+        if kind == "movie":
+            tid = req.get("tmdbId")
+            if not tid: return 0, False
+            hits = arr.get_json("/movie?tmdbId=%s" % tid, t=15) or []
+            if hits: return hits[0].get("id") or 0, bool(hits[0].get("hasFile"))
+            return 0, False
+        tvid = req.get("tvdbId")
+        if not tvid and req.get("tmdbId"):
+            prov = _scout_person_provider()
+            if prov:
+                try: tvid = prov.tv_tvdb(req["tmdbId"])
+                except Exception as e: log.debug("[scout] tvdb resolve failed: %s", str(e)[:80])
+        if tvid: req["tvdbId"] = tvid
+        if tvid:
+            hits = arr.get_json("/series?tvdbId=%s" % tvid, t=15) or []
+            if hits:
+                hf = ((hits[0].get("statistics") or {}).get("episodeFileCount", 0) > 0)
+                return hits[0].get("id") or 0, hf
+        return 0, False
+    except Exception as e:
+        log.debug("[scout] find-existing failed: %s", str(e)[:80]); return 0, False
+
 def _scout_get(body):
     try: p = json.loads(body or b"{}")
     except Exception: return False, {"error": "bad request"}
@@ -3137,9 +3262,13 @@ def _scout_get(body):
         if not arr: return False, {"error": "no %s instance" % ("radarr" if kind == "movie" else "sonarr")}
         req["arr"] = arr.name
         arr_id = int(p.get("arr_id") or 0)
+        has_file = bool(p.get("hasFile"))
+        if arr_id <= 0:                                           # actor-card / not-yet-looked-up: check the arr's library, resolve tvdb for shows
+            ex_id, ex_has = _scout_find_existing(arr, kind, req)
+            if ex_id: arr_id, has_file = ex_id, ex_has
         if arr_id > 0:
             req["target_id"] = arr_id
-            if not p.get("hasFile"):
+            if not has_file:
                 if kind == "movie": _scout_launch_grab(arr, arr_id, req["title"])
                 else: arr.command({"name": "SeriesSearch", "seriesId": arr_id})
         else:
@@ -3763,17 +3892,24 @@ UI_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <link href="https://fonts.googleapis.com/css2?family=Patrick+Hand&family=Caveat:wght@600;700&display=swap" rel=stylesheet>
 <style>
 /* ============================================================
-   THEME TOKENS. Every color/font/shape below is a token, so a
-   new theme is just one block: html[data-theme=NAME]{...}.
-   Register it in the THEMES array (see the boot script) and it
-   shows up in the header picker. Default (:root) = pencil.
+   THEME TOKENS. Colors/fonts/shapes are all tokens. A theme is
+   two palette blocks, one per mode:
+     html[data-theme=NAME][data-mode=light]{...}
+     html[data-theme=NAME][data-mode=dark]{...}
+   Register the theme id in the THEMES array (see the boot
+   script) and it shows in the header picker; the light/dark
+   switch flips [data-mode]. :root defaults to pencil / light.
+   Shared font families live in :root; everything else is per
+   (theme, mode) so each block is a complete, copyable palette.
    ============================================================ */
 :root{
  --sans:'Inter',system-ui,Segoe UI,sans-serif;
  --mono:'JetBrains Mono',ui-monospace,monospace;
  --hand:'Patrick Hand','Inter',sans-serif;
  --script:'Caveat',cursive;
- /* pencil (default) */
+}
+/* pencil : light (default) */
+:root, html[data-theme=pencil][data-mode=light]{
  --bg:#efe9db;
  --bg-img:radial-gradient(1100px 620px at 14% -10%,rgba(255,255,255,.55),transparent 62%),radial-gradient(900px 600px at 100% 0,rgba(255,247,214,.5),transparent 55%);
  --grid:transparent;
@@ -3789,7 +3925,25 @@ UI_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
  --glow:2px 2px 0 rgba(44,42,38,.3);
  --font-display:var(--script); --font-body:var(--hand); --font-ui:var(--hand);
 }
-html[data-theme=cyber]{
+/* pencil : dark (chalkboard) */
+html[data-theme=pencil][data-mode=dark]{
+ --bg:#242320;
+ --bg-img:radial-gradient(1100px 620px at 14% -10%,rgba(255,255,255,.06),transparent 62%),radial-gradient(900px 600px at 100% 0,rgba(255,247,214,.06),transparent 55%);
+ --grid:transparent;
+ --paper:#2c2b26; --paper2:#282722; --note:rgba(255,246,204,.12);
+ --ink:#efe9db; --mut:#b3ab9a; --faint:#8a8276;
+ --bd:#efe9db; --bd-soft:rgba(239,233,219,.28); --bd-w:2px;
+ --radius:12px;
+ --field-radius:120px 8px 120px 8px/8px 110px 8px 110px;
+ --btn-radius:150px 11px 150px 11px/11px 130px 11px 130px;
+ --accent:#d9c48a; --accent-ink:#242320; --accent-2:#ffd34d;
+ --ok:#7ac35f; --ok-bg:rgba(122,195,95,.2); --bad:#ff6f61; --bad-bg:rgba(255,111,97,.2); --warn:#e0a13a; --warn-bg:rgba(224,161,58,.2); --off:#8a8276;
+ --shadow:3px 4px 0 rgba(0,0,0,.4); --shadow-sm:2px 2px 0 rgba(0,0,0,.34);
+ --glow:2px 2px 0 rgba(239,233,219,.25);
+ --font-display:var(--script); --font-body:var(--hand); --font-ui:var(--hand);
+}
+/* cyber : dark */
+html[data-theme=cyber][data-mode=dark]{
  --bg:#05070f;
  --bg-img:radial-gradient(900px 500px at 12% -10%,rgba(34,211,238,.16),transparent 60%),radial-gradient(800px 500px at 100% 0,rgba(168,85,247,.16),transparent 55%),radial-gradient(700px 600px at 50% 120%,rgba(56,189,248,.10),transparent 60%);
  --grid:rgba(120,160,255,.05);
@@ -3804,6 +3958,22 @@ html[data-theme=cyber]{
  --glow:0 0 18px rgba(34,211,238,.35);
  --font-display:var(--sans); --font-body:var(--sans); --font-ui:var(--sans);
 }
+/* cyber : light (daylight neon) */
+html[data-theme=cyber][data-mode=light]{
+ --bg:#eaf0fb;
+ --bg-img:radial-gradient(900px 500px at 12% -10%,rgba(6,182,212,.14),transparent 60%),radial-gradient(800px 500px at 100% 0,rgba(168,85,247,.12),transparent 55%),radial-gradient(700px 600px at 50% 120%,rgba(56,189,248,.1),transparent 60%);
+ --grid:rgba(60,110,200,.06);
+ --paper:rgba(255,255,255,.85); --paper2:rgba(236,242,252,.9); --note:rgba(56,189,248,.12);
+ --ink:#0f1a33; --mut:#4a5878; --faint:#8390b5;
+ --bd:rgba(30,80,160,.22); --bd-soft:rgba(30,80,160,.34); --bd-w:1px;
+ --radius:14px;
+ --field-radius:8px; --btn-radius:9px;
+ --accent:#0891b2; --accent-ink:#ffffff; --accent-2:#06b6d4;
+ --ok:#0e9f6e; --ok-bg:rgba(16,185,129,.16); --bad:#e11d48; --bad-bg:rgba(225,29,72,.12); --warn:#b45309; --warn-bg:rgba(245,158,11,.18); --off:#8390b5;
+ --shadow:0 10px 30px rgba(30,60,120,.14); --shadow-sm:0 4px 14px rgba(30,60,120,.12);
+ --glow:0 0 18px rgba(8,145,178,.3);
+ --font-display:var(--sans); --font-body:var(--sans); --font-ui:var(--sans);
+}
 *{box-sizing:border-box}html,body{height:100%}
 body{margin:0;font:15px/1.55 var(--font-body);background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased}
 body::before{content:"";position:fixed;inset:0;z-index:-2;background:var(--bg-img),var(--bg)}
@@ -3815,6 +3985,9 @@ h1::before{content:"\25C8 ";color:var(--accent-2)}
 .tp{margin-left:auto;display:flex;align-items:center;gap:8px}
 .tp label{margin:0;font:13px var(--font-ui);color:var(--mut);letter-spacing:0;text-transform:none}
 .tp select{width:auto;padding:5px 28px 5px 12px;font:14px var(--font-ui);background-position:calc(100% - 13px) 15px,calc(100% - 8px) 15px}
+.tp .modetog{width:auto;padding:5px 13px;font:14px var(--font-ui);cursor:pointer;color:var(--ink);background:var(--paper);border:var(--bd-w) solid var(--bd);border-radius:var(--btn-radius);text-transform:capitalize;box-shadow:var(--shadow-sm)}
+.tp .modetog:hover{background:var(--note)}
+.tp .modetog::before{content:"\25D0 ";color:var(--accent-2)}
 nav{display:flex;gap:8px;padding:14px 22px 0;flex-wrap:wrap}
 nav button{background:var(--paper);color:var(--ink);border:var(--bd-w) solid var(--bd);border-radius:var(--radius);padding:8px 16px;cursor:pointer;font:600 15px var(--font-ui);letter-spacing:.01em;transition:transform .12s,box-shadow .12s;box-shadow:var(--shadow-sm)}
 nav button:hover{border-color:var(--bd-soft);transform:translateY(-1px)}
@@ -3968,8 +4141,8 @@ details summary{color:var(--ink)!important;cursor:pointer;font-weight:600}
 #onboard.adv .ob-f.ob-adv{display:flex}
 #onboard.adv .ob-adv.ob-inline{display:inline-flex}
 @media(max-width:560px){.ob-grid{grid-template-columns:1fr}.ob-f.wide{grid-column:auto}.ob-test{width:100%;text-align:center}}
-</style><script>try{var _t=localStorage.getItem('sd-theme');if(_t)document.documentElement.setAttribute('data-theme',_t)}catch(e){}</script></head><body>
-<header><h1>stack-doctor</h1><span class=mut id=sub>loading</span><span class=tp><label for=theme-sel>theme</label><select id=theme-sel></select></span></header>
+</style><script>try{var _t=localStorage.getItem('sd-theme');document.documentElement.setAttribute('data-theme',_t||'pencil');var _m=localStorage.getItem('sd-mode');document.documentElement.setAttribute('data-mode',_m||'light')}catch(e){}</script></head><body>
+<header><h1>stack-doctor</h1><span class=mut id=sub>loading</span><span class=tp><label for=theme-sel>theme</label><select id=theme-sel></select><button id=mode-tog class=modetog type=button title="light / dark">light</button></span></header>
 <nav><button data-t=dash class=active>Dashboard</button><button data-t=scout>Scout</button><button data-t=config>Config</button><button data-t=logs>Logs</button><button data-t=onboard id=nav-setup>Setup</button></nav>
 <main>
 <div id=onboard style=display:none>
@@ -4055,6 +4228,10 @@ details summary{color:var(--ink)!important;cursor:pointer;font-weight:600}
   </div>
   <div class=sk-searchbar>
    <input id=sk-q class=sk-input placeholder="what do you want to watch?" autocomplete=off>
+   <div class=sk-seg id=sk-type style=display:none>
+    <button class="sk-segb on" data-t=title>Title</button>
+    <button class=sk-segb data-t=person>Actor</button>
+   </div>
    <div class=sk-seg id=sk-kind>
     <button class="sk-segb on" data-k=both>Both</button>
     <button class=sk-segb data-k=movie>Movie</button>
@@ -4077,16 +4254,23 @@ function E(i){return document.getElementById(i)}
 function esc(s){return (s==null?'':''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;')}
 function toast(m){var e=E('toast');e.textContent=m;e.style.opacity=1;setTimeout(function(){e.style.opacity=0},2600)}
 function ago(s){if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago'}
-/* ---- themes: add one = push {id,name} here + a html[data-theme=id]{} block in CSS ---- */
+/* ---- themes: add one = push {id,name} here + light+dark html[data-theme=id][data-mode=*]{} blocks in CSS ---- */
 var THEMES=[{id:'pencil',name:'Pencil'},{id:'cyber',name:'Cyber'}];
 function applyTheme(id){var ok=false;for(var i=0;i<THEMES.length;i++)if(THEMES[i].id===id)ok=true;if(!ok)id=THEMES[0].id;
  document.documentElement.setAttribute('data-theme',id);
  try{localStorage.setItem('sd-theme',id)}catch(e){}
  var sel=E('theme-sel');if(sel)sel.value=id}
-function initTheme(){var saved=THEMES[0].id;try{saved=localStorage.getItem('sd-theme')||THEMES[0].id}catch(e){}
+function applyMode(m){if(m!=='light'&&m!=='dark')m='light';
+ document.documentElement.setAttribute('data-mode',m);
+ try{localStorage.setItem('sd-mode',m)}catch(e){}
+ var b=E('mode-tog');if(b){b.textContent=m;b.title=(m==='dark'?'switch to light':'switch to dark')}}
+function initTheme(){var saved=THEMES[0].id,mode='light';
+ try{saved=localStorage.getItem('sd-theme')||THEMES[0].id}catch(e){}
+ try{mode=localStorage.getItem('sd-mode')||'light'}catch(e){}
  var sel=E('theme-sel');if(sel){var h='';for(var i=0;i<THEMES.length;i++)h+='<option value="'+THEMES[i].id+'">'+esc(THEMES[i].name)+'</option>';sel.innerHTML=h;
   sel.onchange=function(){applyTheme(sel.value)}}
- applyTheme(saved)}
+ var b=E('mode-tog');if(b)b.onclick=function(){var cur=document.documentElement.getAttribute('data-mode')||'light';applyMode(cur==='dark'?'light':'dark')};
+ applyTheme(saved);applyMode(mode)}
 initTheme();
 var timer;
 function show(t){var b=document.querySelectorAll('nav button');for(var i=0;i<b.length;i++)b[i].classList.toggle('active',b[i].dataset.t===t);
@@ -4162,7 +4346,7 @@ function restart(){fetch(q('/api/config'),{method:'POST',body:JSON.stringify(gat
 function loadLogs(){fetch(q('/api/logs?n=400')).then(function(r){return r.text()}).then(function(t){
   var d=E('logs');if(!d.dataset.i){d.innerHTML='<pre id=lp></pre>';d.dataset.i=1}
   var lp=E('lp'),bot=lp.scrollTop+lp.clientHeight>=lp.scrollHeight-40;lp.textContent=t;if(bot)lp.scrollTop=lp.scrollHeight})}
-var skResults=[];var skKind='both';var skMeta={};var skActiveByUid={};
+var skResults=[];var skKind='both';var skType='title';var skPerson='';var skMeta={};var skActiveByUid={};
 function loadScoutMeta(){fetch(q('/api/scout/meta')).then(function(r){return r.json()}).then(function(m){skMeta=m;
   var el=E('sk-backend');
   if(!m.enabled){el.textContent='Scout is turned off in config.';E('sk-go').disabled=true;return}
@@ -4170,13 +4354,20 @@ function loadScoutMeta(){fetch(q('/api/scout/meta')).then(function(r){return r.j
   E('sk-go').disabled=false;
   var line='via '+esc(m.backend);if(m.dry_run)line+=' (DRY-RUN: nothing will download)';if(!m.plex)line+=' (no Plex link)';
   el.textContent=line;
-  var ms=E('sk-kind');ms.style.display=(m.mode==='riven')?'none':''})}
+  var ms=E('sk-kind');ms.style.display=(m.mode==='riven')?'none':'';
+  var ty=E('sk-type');if(ty)ty.style.display=m.person?'':'none';
+  if(!m.person&&skType==='person'){skType='title';skPerson='';
+   var tb=ty?ty.querySelectorAll('.sk-segb'):[];for(var i=0;i<tb.length;i++)tb[i].classList.toggle('on',tb[i].dataset.t==='title');
+   E('sk-q').placeholder='what do you want to watch?'}})}
 function scoutSearch(){var v=E('sk-q').value;if(!v.trim())return;
   E('sk-results').innerHTML='<div class=sk-note>sketching results...</div>';
-  fetch(q('/api/scout/search?kind='+encodeURIComponent(skKind)+'&q='+encodeURIComponent(v))).then(function(r){return r.json()}).then(function(d){
+  fetch(q('/api/scout/search?type='+encodeURIComponent(skType)+'&kind='+encodeURIComponent(skKind)+'&q='+encodeURIComponent(v))).then(function(r){return r.json()}).then(function(d){
+   if(d.error){skResults=[];skPerson='';E('sk-results').innerHTML='<div class="sk-note sk-bad">'+esc(d.error)+'</div>';return}
+   skPerson=(skType==='person')?(d.person||''):'';
    skResults=d.results||[];renderResults()}).catch(function(){E('sk-results').innerHTML='<div class="sk-note sk-bad">search failed</div>'})}
 function renderResults(){var h='';
-  if(!skResults.length){E('sk-results').innerHTML='<div class=sk-note>nothing found. try another title.</div>';return}
+  if(!skResults.length){E('sk-results').innerHTML='<div class=sk-note>'+(skPerson?('no on-screen credits found for '+esc(skPerson)):'nothing found. try another '+(skType==='person'?'name':'title')+'.')+'</div>';return}
+  if(skPerson)h+='<div class="sk-note sk-detail" style="grid-column:1/-1">filmography for '+esc(skPerson)+' (pick what to grab)</div>';
   for(var i=0;i<skResults.length;i++){var r=skResults[i];r._i=i;
    var pos=r.poster?'<img class=sk-poster src="'+esc(r.poster)+'" alt="" onerror="this.style.display=\'none\'">':'<div class="sk-poster sk-noimg">no art</div>';
    var yr=r.year?(' ('+esc(r.year)+')'):'';
@@ -4252,6 +4443,11 @@ function scoutClear(id){fetch(q('/api/scout/clear'),{method:'POST',body:JSON.str
 (function(){var seg=E('sk-kind').querySelectorAll('.sk-segb');
   for(var i=0;i<seg.length;i++)seg[i].onclick=(function(b){return function(){skKind=b.dataset.k;
    for(var j=0;j<seg.length;j++)seg[j].classList.toggle('on',seg[j]===b);if(skResults.length)scoutSearch()}})(seg[i]);
+  var tyb=E('sk-type').querySelectorAll('.sk-segb');
+  for(var t=0;t<tyb.length;t++)tyb[t].onclick=(function(b){return function(){skType=b.dataset.t;
+   for(var j=0;j<tyb.length;j++)tyb[j].classList.toggle('on',tyb[j]===b);
+   E('sk-q').placeholder=(skType==='person')?'actor or actress name':'what do you want to watch?';
+   if(E('sk-q').value.trim())scoutSearch()}})(tyb[t]);
   E('sk-go').onclick=scoutSearch;
   E('sk-q').addEventListener('keydown',function(e){if(e.key==='Enter'||e.keyCode===13)scoutSearch()})})();
 /* ---------------- onboarding ---------------- */
@@ -4401,7 +4597,7 @@ def _build_server(port):
             if path == "/api/scout/search":
                 qd = parse_qs(urlparse(self.path).query)
                 return self._send(200, "application/json", json.dumps(
-                    _scout_search(qd.get("q", [""])[0], qd.get("kind", ["both"])[0])))
+                    _scout_search(qd.get("q", [""])[0], qd.get("kind", ["both"])[0], qd.get("type", ["title"])[0])))
             if path == "/api/logs":
                 try: n = min(int(parse_qs(urlparse(self.path).query).get("n", ["300"])[0]), 3000)
                 except Exception: n = 300
