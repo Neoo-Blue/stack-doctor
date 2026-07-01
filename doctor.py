@@ -2101,6 +2101,9 @@ def _backlog_age_days(rec, kind, now):
 def check_backlog():
     if not INSTANCES:
         log.debug("[backlog] no arr instances"); return
+    _act = _scout_active()
+    if _act:
+        log.info("[backlog] yielding to %d active Scout request(s) - skipping this sweep so the explicit pick lands first", _act); return
     if BACKLOG_LOAD_MAX and host_load() > BACKLOG_LOAD_MAX:
         log.info("[backlog] host load over %.1f - skipping this sweep to keep Plex responsive", BACKLOG_LOAD_MAX); return
     targets = [a for a in INSTANCES if a.kind in ("sonarr", "radarr") and a.name in BACKLOG_INSTANCES]
@@ -2198,6 +2201,9 @@ def check_riven():
     # --- retries: throttled ---
     if not (RIVEN_STUCK_STATES or RIVEN_MISSING_STATES):
         return
+    _act = _scout_active()
+    if _act:
+        log.info("[riven] yielding to %d active Scout request(s) - skipping retries this sweep", _act); return
     nowsec = time.time()
     if RIVEN_INTERVAL and not DRY_RUN:
         last = float(state.get("_last_run", 0) or 0)
@@ -3054,7 +3060,8 @@ def _scout_get(body):
     kind = p.get("kind") or "movie"
     mode = _scout_mode()
     rid = "%s-%s-%d" % (kind, (p.get("tmdbId") or p.get("tvdbId") or p.get("imdbId") or "x"), int(time.time()))
-    req = {"id": rid, "kind": kind, "title": p.get("title") or "?", "year": p.get("year") or "",
+    uid = p.get("uid") or (kind + ":" + str(p.get("tmdbId") or p.get("tvdbId") or p.get("imdbId") or p.get("title") or ""))
+    req = {"id": rid, "uid": uid, "kind": kind, "title": p.get("title") or "?", "year": p.get("year") or "",
            "imdbId": p.get("imdbId") or "", "tmdbId": p.get("tmdbId"), "tvdbId": p.get("tvdbId"),
            "backend": mode, "created": time.time(), "stage": "queued", "play": "", "detail": ""}
     if DRY_RUN:
@@ -3180,6 +3187,72 @@ def _scout_play(req):
     if req.get("play"): return req["play"]
     return _plex_resolve(req.get("title"), req.get("year"), req.get("imdbId"), req.get("tmdbId"), req.get("tvdbId"), req.get("kind"))
 
+_SCOUT_LIVE_STAGES = ("queued", "searching", "grabbed", "downloading", "importing", "verifying")
+
+def _scout_active():
+    """How many Scout requests are still in flight. Used by the background drains (backlog / Riven)
+    to yield so an explicit user request is fetched first. Refreshes stages first so we do not yield
+    forever on a stale state when nobody has the dashboard open."""
+    if not EN_SCOUT: return 0
+    try:
+        with _scout_lock:
+            have = bool(_scout_load().get("reqs"))
+    except Exception:
+        return 0
+    if not have: return 0
+    try: _scout_status()                                          # refresh stages (probes the arrs; cheap)
+    except Exception: pass
+    now = time.time()
+    with _scout_lock:
+        reqs = list(_scout_load().get("reqs", {}).values())
+    return sum(1 for r in reqs
+               if r.get("stage") in _SCOUT_LIVE_STAGES and now - r.get("created", 0) < SCOUT_TTL_HOURS * 3600)
+
+def _scout_dlclient(arr, name):
+    for c in (arr.get_json("/downloadclient") or []):
+        if not name or c.get("name") == name:
+            return c
+    return None
+
+def _sab_force_top(fields, nzo):
+    apikey = fields.get("apiKey") or ""
+    if not apikey: return False, "no sab apikey"
+    host = fields.get("host") or "127.0.0.1"
+    port = fields.get("port") or 8080
+    scheme = "https" if fields.get("useSsl") in (True, "true", "True", 1) else "http"
+    base = (fields.get("urlBase") or "").strip("/")
+    root = "%s://%s:%s%s" % (scheme, host, port, ("/" + base) if base else "")
+    url = root + "/api?mode=queue&name=priority&value=%s&value2=2&output=json&apikey=%s" % (
+        urllib.parse.quote(str(nzo)), urllib.parse.quote(str(apikey)))
+    try:
+        urllib.request.urlopen(url, timeout=10).read(); return True, "forced"
+    except Exception as e:
+        return False, str(e)[:80]
+
+def _scout_prioritize(arr, rec, req):
+    """Best-effort: shove a Scout grab to the top of its download client so it finishes first.
+    Runs once per request. Only SABnzbd is force-able today; other clients are marked done so we
+    do not retry every poll."""
+    if req.get("prioritized"): return
+    dlid, cname = rec.get("downloadId"), rec.get("downloadClient")
+    if not dlid: return
+    c = _scout_dlclient(arr, cname) or {}
+    impl = (c.get("implementation") or "").lower()
+    fields = {f.get("name"): f.get("value") for f in (c.get("fields") or [])}
+    if "sab" in impl:
+        ok, detail = _sab_force_top(fields, dlid)
+        if ok:
+            req["prioritized"] = True
+            log.info("[scout] forced '%s' to top of %s queue", req.get("title"), cname)
+        elif "apikey" in detail:
+            req["prioritized"] = True                            # config gap, do not retry
+            log.debug("[scout] cannot force priority (%s): %s", cname, detail)
+        else:
+            log.debug("[scout] force priority failed (%s): %s", cname, detail)   # transient, retry next poll
+    else:
+        req["prioritized"] = True
+        log.debug("[scout] no priority lever for client '%s' (impl=%s)", cname, impl or "?")
+
 def _scout_probe(req):
     if req.get("stage") == "dry-run": return "dry-run", {}
     backend, kind = req.get("backend"), req.get("kind")
@@ -3192,6 +3265,9 @@ def _scout_probe(req):
             if m is None: return req.get("stage", "searching"), {}
             if m.get("hasFile"): return "available", {"play": _scout_play(req)}
             rec = _scout_queue_rec(arr, "movieId", tid)
+            if rec and not DRY_RUN:
+                try: _scout_prioritize(arr, rec, req)
+                except Exception as e: log.debug("[scout] prioritize err: %s", str(e)[:80])
             return _scout_stage_from_rec(rec) if rec else _scout_search_or_timeout(req)
         s = arr.get_json("/series/%d" % tid)
         if s is None: return req.get("stage", "searching"), {}
@@ -3199,6 +3275,9 @@ def _scout_probe(req):
         if stt.get("episodeFileCount", 0) > 0:
             return "available", {"play": _scout_play(req), "detail": "%d/%d episodes" % (stt.get("episodeFileCount", 0), stt.get("episodeCount", 0) or 0)}
         rec = _scout_queue_rec(arr, "seriesId", tid)
+        if rec and not DRY_RUN:
+            try: _scout_prioritize(arr, rec, req)
+            except Exception as e: log.debug("[scout] prioritize err: %s", str(e)[:80])
         return _scout_stage_from_rec(rec) if rec else _scout_search_or_timeout(req)
     if backend == "riven":
         rv = next((r for r in RIVENS if r.name == req.get("riven")), RIVENS[0] if RIVENS else None)
@@ -3219,8 +3298,10 @@ def _scout_status():
             with _scout_lock:
                 s = _scout_load(); s.get("reqs", {}).pop(req["id"], None); _scout_save(s)
             continue
+        pri0 = req.get("prioritized")
         try: stg, extra = _scout_probe(req)
         except Exception as e: stg, extra = "error", {"detail": str(e)[:80]}
+        if req.get("prioritized") != pri0: changed = True
         if stg != req.get("stage"):
             req["stage"] = stg; changed = True
             if stg in ("available", "no source", "error"): req["done_ts"] = now
@@ -3233,11 +3314,11 @@ def _scout_status():
             s = _scout_load()
             for req in items:
                 if req["id"] in s.get("reqs", {}):
-                    s["reqs"][req["id"]].update({k: req[k] for k in ("stage", "play", "done_ts") if k in req})
+                    s["reqs"][req["id"]].update({k: req[k] for k in ("stage", "play", "done_ts", "prioritized") if k in req})
             _scout_save(s)
     out.sort(key=lambda r: r.get("created", 0), reverse=True)
-    view = [{"id": r["id"], "title": r.get("title"), "year": r.get("year"), "kind": r.get("kind"),
-             "backend": r.get("backend"), "stage": r.get("stage"), "pct": r.get("_pct"),
+    view = [{"id": r["id"], "uid": r.get("uid", ""), "title": r.get("title"), "year": r.get("year"), "kind": r.get("kind"),
+             "backend": r.get("backend"), "stage": r.get("stage"), "pct": r.get("_pct"), "prioritized": bool(r.get("prioritized")),
              "detail": r.get("_detail"), "play": r.get("play", ""), "ago": int(now - r.get("created", now))} for r in out[:SCOUT_RETAIN]]
     return {"mode": mode, "backend": _scout_meta()["backend"], "requests": view}
 
@@ -3391,6 +3472,16 @@ details summary{color:var(--ac)!important}
 .sk-have{display:inline-block;align-self:flex-start;font-size:13px;color:#3f7a2e;margin-bottom:6px}
 .sk-get{align-self:flex-start;margin-top:auto;font-size:16px;padding:7px 16px}
 .sk-get:disabled{opacity:.5;cursor:default;background:#efe9da;box-shadow:none}
+.sk-act{margin-top:auto;padding-top:8px;align-self:stretch}
+.sk-status{border:2px solid #2c2a26;border-radius:120px 8px 120px 8px/8px 110px 8px 110px;padding:6px 10px;background:#fffdf7;box-shadow:2px 3px 0 rgba(44,42,38,.14)}
+.sk-statlab{font:16px 'Patrick Hand';text-transform:capitalize;display:flex;align-items:center;gap:6px}
+.sk-statlab .sk-spark{font-size:13px;color:#b06a00}
+.sk-bar{margin-top:6px;height:9px;border:2px solid #2c2a26;border-radius:6px;background:repeating-linear-gradient(45deg,#f0ead9,#f0ead9 4px,#e7dfca 4px,#e7dfca 8px);overflow:hidden}
+.sk-bar span{display:block;height:100%;background:#ffd34d;border-right:2px solid #2c2a26;transition:width .5s ease}
+.sk-status.sk-st-bad{border-color:#b3261e}
+.sk-status.sk-st-bad .sk-statlab{color:#b3261e}
+.sk-status.sk-st-go{background:#bfe3b0}
+.sk-prio{border-color:#b06a00;color:#b06a00}
 .sk-feed{margin-top:12px;display:flex;flex-direction:column;gap:12px}
 .sk-req{background:#fffdf7;border:2px solid #2c2a26;border-radius:12px;padding:12px 14px;box-shadow:3px 4px 0 rgba(44,42,38,.13)}
 .sk-reqhead{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}
@@ -3534,7 +3625,7 @@ function restart(){fetch(q('/api/config'),{method:'POST',body:JSON.stringify(gat
 function loadLogs(){fetch(q('/api/logs?n=400')).then(function(r){return r.text()}).then(function(t){
   var d=E('logs');if(!d.dataset.i){d.innerHTML='<pre id=lp></pre>';d.dataset.i=1}
   var lp=E('lp'),bot=lp.scrollTop+lp.clientHeight>=lp.scrollHeight-40;lp.textContent=t;if(bot)lp.scrollTop=lp.scrollHeight})}
-var skResults=[];var skKind='both';var skMeta={};
+var skResults=[];var skKind='both';var skMeta={};var skActiveByUid={};
 function loadScoutMeta(){fetch(q('/api/scout/meta')).then(function(r){return r.json()}).then(function(m){skMeta=m;
   var el=E('sk-backend');
   if(!m.enabled){el.textContent='Scout is turned off in config.';E('sk-go').disabled=true;return}
@@ -3549,19 +3640,43 @@ function scoutSearch(){var v=E('sk-q').value;if(!v.trim())return;
    skResults=d.results||[];renderResults()}).catch(function(){E('sk-results').innerHTML='<div class="sk-note sk-bad">search failed</div>'})}
 function renderResults(){var h='';
   if(!skResults.length){E('sk-results').innerHTML='<div class=sk-note>nothing found. try another title.</div>';return}
-  for(var i=0;i<skResults.length;i++){var r=skResults[i];
+  for(var i=0;i<skResults.length;i++){var r=skResults[i];r._i=i;
    var pos=r.poster?'<img class=sk-poster src="'+esc(r.poster)+'" alt="" onerror="this.style.display=\'none\'">':'<div class="sk-poster sk-noimg">no art</div>';
    var yr=r.year?(' ('+esc(r.year)+')'):'';
    var have=r.hasFile?'<span class=sk-have>in library</span>':'';
-   var btn=r.hasFile?'<button class="sk-btn sk-get" disabled>have it</button>':'<button class="sk-btn sk-get" onclick="scoutGet('+i+')">Get</button>';
    h+='<div class=sk-card>'+pos+'<div class=sk-kindtag>'+esc(r.kind)+'</div>'+
       '<div class=sk-cardtitle>'+esc(r.title)+yr+'</div>'+have+
-      '<div class=sk-ov>'+esc(r.overview||'')+'</div>'+btn+'</div>'}
+      '<div class=sk-ov>'+esc(r.overview||'')+'</div>'+
+      '<div class=sk-act id="skact_'+i+'">'+skAction(r)+'</div></div>'}
   E('sk-results').innerHTML=h}
+function skAction(r){var req=skActiveByUid[r.uid];
+  if(req)return skStatusPill(req);
+  if(r.hasFile)return '<button class="sk-btn sk-get" disabled>have it</button>';
+  return '<button class="sk-btn sk-get" onclick="scoutGet('+r._i+')">Get</button>'}
+function skStatusPill(req){var stage=req.stage;
+  if(stage==='available'){
+   if(req.play)return '<a class="sk-btn sk-play" href="'+esc(req.play)+'" target=_blank rel=noopener>Play in Plex</a>';
+   return '<div class="sk-status sk-st-go"><div class=sk-statlab>kaboom, linking Plex...</div></div>'}
+  if(stage==='no source')return '<div class="sk-status sk-st-bad"><div class=sk-statlab>no source yet, retrying</div></div>';
+  if(stage==='error')return '<div class="sk-status sk-st-bad"><div class=sk-statlab>error</div></div>';
+  if(stage==='dry-run')return '<div class=sk-status><div class=sk-statlab>dry-run, nothing sent</div></div>';
+  var idx=skStepIndex(stage);if(idx<0)idx=0;
+  var lab=SK_STEPS[idx]||stage;
+  if(stage==='downloading'&&req.pct!=null)lab='downloading '+req.pct+'%';
+  var pct=(stage==='downloading'&&req.pct!=null)?req.pct:Math.round(((idx+1)/SK_STEPS.length)*100);
+  var spark=req.prioritized?'<span class=sk-spark>&#9733; priority</span>':'';
+  return '<div class="sk-status sk-st-live"><div class=sk-statlab>'+esc(lab)+spark+'</div><div class=sk-bar><span style="width:'+pct+'%"></span></div></div>'}
 function scoutGet(i){var r=skResults[i];if(!r)return;
   fetch(q('/api/scout/get'),{method:'POST',body:JSON.stringify(r)}).then(function(x){return x.json()}).then(function(d){
-   if(d.ok){toast('on it: '+r.title);loadScoutStatus()}else{toast(d.error||'could not start')}})}
-function loadScoutStatus(){fetch(q('/api/scout/status')).then(function(r){return r.json()}).then(function(d){renderFeed(d)})}
+   if(d.ok){toast('on it: '+r.title);
+    skActiveByUid[r.uid]={uid:r.uid,title:r.title,year:r.year,kind:r.kind,stage:d.stage||'searching',pct:null,play:'',prioritized:false};
+    var el=E('skact_'+i);if(el)el.innerHTML=skAction(r);
+    loadScoutStatus()}else{toast(d.error||'could not start')}})}
+function refreshCards(){for(var i=0;i<skResults.length;i++){var el=E('skact_'+i);if(el)el.innerHTML=skAction(skResults[i])}}
+function loadScoutStatus(){fetch(q('/api/scout/status')).then(function(r){return r.json()}).then(function(d){
+   skActiveByUid={};var rs=d.requests||[];
+   for(var i=0;i<rs.length;i++){var rq=rs[i];if(rq.uid&&!skActiveByUid[rq.uid])skActiveByUid[rq.uid]=rq}
+   refreshCards();renderFeed(d)})}
 var SK_STEPS=['searching','grabbed','downloading','importing','verifying','available'];
 function skStepIndex(stage){if(stage==='queued'||stage==='searching')return 0;
   for(var i=0;i<SK_STEPS.length;i++)if(SK_STEPS[i]===stage)return i;return -1}
@@ -3569,7 +3684,8 @@ function renderFeed(d){var rs=d.requests||[];
   if(!rs.length){E('sk-feed').innerHTML='<div class=sk-note>nothing in flight. search above and hit Get.</div>';return}
   var h='';for(var i=0;i<rs.length;i++)h+=renderReq(rs[i]);E('sk-feed').innerHTML=h}
 function renderReq(r){var yr=r.year?(' ('+esc(r.year)+')'):'';
-  var head='<div class=sk-reqhead><div class=sk-reqtitle>'+esc(r.title)+yr+' <span class=sk-kindtag>'+esc(r.kind)+'</span></div>'+
+  var pri=r.prioritized?' <span class="sk-kindtag sk-prio">&#9733; priority</span>':'';
+  var head='<div class=sk-reqhead><div class=sk-reqtitle>'+esc(r.title)+yr+' <span class=sk-kindtag>'+esc(r.kind)+'</span>'+pri+'</div>'+
            '<button class=sk-x title=dismiss onclick="scoutClear(\''+esc(r.id)+'\')">x</button></div>';
   var term=(r.stage==='no source'||r.stage==='error'||r.stage==='dry-run');
   var body='';

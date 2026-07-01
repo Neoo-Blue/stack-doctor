@@ -630,9 +630,18 @@ It does not add a new backend: it drives whatever you already run.
 - With no acquisition backend, the tab shows a clear "nothing to drive" banner.
 
 The six stages are `searching -> grabbed -> downloading -> importing -> verifying -> available`.
-When the file lands, Scout resolves it in Plex (matching by IMDb/TMDB/TVDB guid, then year) and shows
-a **Play in Plex** button that opens `app.plex.tv` at that item. Set `PLEX_URL` + `PLEX_TOKEN` for the
+The **Get** button itself becomes the live status: after you click it, the button turns into a small
+progress pill on the card (current stage plus a fill bar and, while downloading, the percentage), and
+a persistent "Acquiring" list below tracks every request through the full stepper. When the file
+lands, Scout resolves it in Plex (matching by IMDb/TMDB/TVDB guid, then year) and the pill becomes a
+**Play in Plex** button that opens `app.plex.tv` at that item. Set `PLEX_URL` + `PLEX_TOKEN` for the
 play link; without them acquisition still works, just without the deep link.
+
+A Scout pick is treated as top priority. While any request is in flight the background drains
+([Backlog](#backlog-drain-monitored-but-missing-gently) and [Riven](#riven-health--retry-stuckmissing)
+retries) yield their sweeps so they do not compete for the download client, and the grab itself is
+pushed to the top of its download client queue (SABnzbd is forced; other clients are left as-is), so
+the thing you asked for is fetched first. Items that got the bump show a `priority` tag.
 
 Search and status are read-only, so the tab is safe to leave open. **Get** is the only action that
 writes, and it honours `DOCTOR_DRY_RUN`: in dry-run nothing is submitted and the request is marked
