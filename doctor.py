@@ -3921,6 +3921,7 @@ details summary{color:var(--ac)!important}
 .ob-warnbanner{background:#ffd7d0;border:2px solid #b3261e;border-radius:10px;padding:9px 13px;font-size:15px;color:#7a1c15;margin-top:10px}
 .ob-adv{display:none}
 #onboard.adv .ob-adv{display:block}
+#onboard.adv .ob-f.ob-adv{display:flex}
 #onboard.adv .ob-adv.ob-inline{display:inline-flex}
 @media(max-width:560px){.ob-grid{grid-template-columns:1fr}.ob-f.wide{grid-column:auto}.ob-test{width:100%;text-align:center}}
 </style></head><body>
@@ -3963,30 +3964,30 @@ details summary{color:var(--ac)!important}
    </div>
   </div>
 
-  <div class="ob-sec ob-adv">
-   <div class=ob-sectitle>Warmer <span style="font-size:15px;color:#6a6358">(precache for instant playback)</span></div>
-   <label class="ob-chk" id=ob-warmer-lab style="margin-bottom:6px"><input type=checkbox id=ob-warmer> Enable the warmer</label>
-   <div class=ob-lib id=ob-libs></div>
-   <div class=ob-note id=ob-warmer-note style="display:none"></div>
-   <div class="ob-f" style="max-width:420px;margin-top:8px"><label>WARMER_PATH_MAP (optional, plexPrefix:hostPrefix)</label><input id=ob-warmer-map class=ob-in placeholder="/data/media:/mnt/library"></div>
+  <div class="ob-sec">
+   <div class=ob-sectitle>What should run?</div>
+   <div class=ob-sectip id=ob-checktip>Easy mode picks sensible defaults from what you filled in. Toggle anything on to reveal its basic setup below.</div>
+   <div class=ob-checks id=ob-checks></div>
   </div>
 
-  <div class="ob-sec ob-adv">
+  <div class="ob-sec" id=ob-sec-decy style=display:none>
    <div class=ob-sectitle>Decypharr <span style="font-size:15px;color:#6a6358">(debrid/usenet mount)</span></div>
    <div class=ob-svc>
     <div class=ob-grid>
      <div class="ob-f wide"><label>Decypharr URL</label><input id=ob-decy-url class=ob-in placeholder="http://decypharr:8282"></div>
-     <div class=ob-f><label>Mount test dir (optional)</label><input id=ob-decy-mount class=ob-in placeholder="/mnt/decypharr/__all__"></div>
      <button class="sk-btn ob-test" onclick="obTestDecy()">Test</button>
     </div>
+    <div class="ob-f ob-adv" style="max-width:420px;margin-top:8px"><label>Mount test dir (optional)</label><input id=ob-decy-mount class=ob-in placeholder="/mnt/decypharr/__all__"></div>
     <div class="ob-res" id=ob-decy-res></div>
    </div>
   </div>
 
-  <div class="ob-sec">
-   <div class=ob-sectitle>What should run?</div>
-   <div class=ob-sectip id=ob-checktip>Easy mode picks sensible defaults. Switch to Advanced to fine-tune.</div>
-   <div class=ob-checks id=ob-checks></div>
+  <div class="ob-sec" id=ob-sec-warmer style=display:none>
+   <div class=ob-sectitle>Warmer <span style="font-size:15px;color:#6a6358">(precache for instant playback)</span></div>
+   <div class=ob-sectip>Reads media straight off disk, so it needs your library bind-mounted into this container.</div>
+   <div class=ob-lib id=ob-libs></div>
+   <div class=ob-note id=ob-warmer-note style="display:none"></div>
+   <div class="ob-f ob-adv" style="max-width:420px;margin-top:8px"><label>WARMER_PATH_MAP (optional, plexPrefix:hostPrefix)</label><input id=ob-warmer-map class=ob-in placeholder="/data/media:/mnt/library"></div>
   </div>
 
   <div class=ob-foot>
@@ -4208,24 +4209,30 @@ var OB_CHECKS=[['ENABLE_QUEUE','queue'],['ENABLE_SCOUT','scout'],['ENABLE_PLEX',
  ['ENABLE_SEERR','seerr'],['ENABLE_BAZARR','bazarr'],['ENABLE_SCRUBBER','scrubber'],['ENABLE_WARMER','warmer']];
 function obHas(t){for(var i=0;i<obServices.length;i++)if(obServices[i].type===t)return true;return false}
 function obHasUrl(u){for(var i=0;i<obServices.length;i++)if(obServices[i].url===u)return true;return false}
-function obDefaultChecks(){var c={ENABLE_QUEUE:true,ENABLE_SCOUT:true,ENABLE_RESOURCES:true};
- if(E('ob-plex-url').value.trim())c.ENABLE_PLEX=true;
- if(E('ob-decy-url').value.trim())c.ENABLE_DECYPHARR=true;
- if(obHas('riven'))c.ENABLE_RIVEN=true;
- if(obHas('seerr'))c.ENABLE_SEERR=true;
- if(obHas('bazarr'))c.ENABLE_BAZARR=true;
- if(obHas('mediastorm'))c.ENABLE_MEDIASTORM=true;
- if(E('ob-warmer').checked)c.ENABLE_WARMER=true;
+function obMergeDefaults(){var c=obChecks;function d(k){if(c[k]===undefined)c[k]=true}
+ d('ENABLE_QUEUE');d('ENABLE_SCOUT');d('ENABLE_RESOURCES');
+ if(E('ob-plex-url').value.trim())d('ENABLE_PLEX');
+ if(E('ob-decy-url').value.trim())d('ENABLE_DECYPHARR');
+ if(obHas('riven'))d('ENABLE_RIVEN');
+ if(obHas('seerr'))d('ENABLE_SEERR');
+ if(obHas('bazarr'))d('ENABLE_BAZARR');
+ if(obHas('mediastorm'))d('ENABLE_MEDIASTORM');
  return c}
+function obApplyVisibility(){var adv=obMode==='adv';
+ var decyOn=adv||!!obChecks.ENABLE_DECYPHARR,warmOn=adv||!!obChecks.ENABLE_WARMER;
+ E('ob-sec-decy').style.display=decyOn?'':'none';
+ E('ob-sec-warmer').style.display=warmOn?'':'none';
+ var note=E('ob-warmer-note'),libs=obState.library_mounts||[];
+ if(warmOn&&!libs.length){note.style.display='';note.textContent=obState.warmer_hint||''}else note.style.display='none'}
 function obSetMode(m){obMode=m;E('onboard').classList.toggle('adv',m==='adv');
  var seg=E('ob-mode').querySelectorAll('.sk-segb');for(var i=0;i<seg.length;i++)seg[i].classList.toggle('on',seg[i].dataset.m===m);
  E('ob-modehint').textContent=m==='easy'?'Easy: find services, drop in keys, go.':'Advanced: every service, the warmer mount, and per-check toggles.';
- E('ob-checktip').textContent=m==='easy'?'Easy mode picks sensible defaults from what you filled in.':'Tick exactly what you want stack-doctor to run.';
- if(m==='easy')obChecks=obDefaultChecks();obRenderChecks()}
+ E('ob-checktip').textContent=m==='easy'?'Easy mode picks sensible defaults from what you filled in. Toggle anything on to reveal its basic setup below.':'Tick exactly what you want stack-doctor to run.';
+ obMergeDefaults();obRenderChecks();obApplyVisibility()}
 function obRenderChecks(){var h='';for(var i=0;i<OB_CHECKS.length;i++){var k=OB_CHECKS[i][0],on=!!obChecks[k];
   h+='<label class="ob-chk'+(on?' on':'')+'"><input type=checkbox '+(on?'checked':'')+' onchange="obToggleCheck(\''+k+'\',this.checked)"> '+esc(OB_CHECKS[i][1])+'</label>'}
  E('ob-checks').innerHTML=h}
-function obToggleCheck(k,v){obChecks[k]=v;obRenderChecks()}
+function obToggleCheck(k,v){obChecks[k]=v;obRenderChecks();obApplyVisibility()}
 function obTypeOpts(sel){var h='';for(var i=0;i<OB_ADDABLE.length;i++){var t=OB_ADDABLE[i];h+='<option'+(t===sel?' selected':'')+'>'+esc(t)+'</option>'}return h}
 function obApiLabel(t){return t==='plex'?'token':'API key'}
 function obRenderServices(){var h='';
@@ -4250,10 +4257,10 @@ function obTestSvc(i){var s=obServices[i],res=E('obs_res_'+i);res.className='ob-
   res.className='ob-res '+(j.ok?'ok':'bad');res.textContent=(j.ok?'ok - ':'x - ')+(j.msg||'')})}
 function obTestPlex(){var res=E('ob-plex-res');res.className='ob-res';res.textContent='testing...';
  fetch(q('/api/onboard/test'),{method:'POST',body:JSON.stringify({type:'plex',url:E('ob-plex-url').value,apikey:E('ob-plex-token').value})}).then(function(r){return r.json()}).then(function(j){
-  res.className='ob-res '+(j.ok?'ok':'bad');res.textContent=(j.ok?'ok - ':'x - ')+(j.msg||'');if(obMode==='easy'){obChecks=obDefaultChecks();obRenderChecks()}})}
+  res.className='ob-res '+(j.ok?'ok':'bad');res.textContent=(j.ok?'ok - ':'x - ')+(j.msg||'');obMergeDefaults();obRenderChecks();obApplyVisibility()})}
 function obTestDecy(){var res=E('ob-decy-res');res.className='ob-res';res.textContent='testing...';
  fetch(q('/api/onboard/test'),{method:'POST',body:JSON.stringify({type:'decypharr',url:E('ob-decy-url').value})}).then(function(r){return r.json()}).then(function(j){
-  res.className='ob-res '+(j.ok?'ok':'bad');res.textContent=(j.ok?'ok - ':'x - ')+(j.msg||'')})}
+  res.className='ob-res '+(j.ok?'ok':'bad');res.textContent=(j.ok?'ok - ':'x - ')+(j.msg||'');obMergeDefaults();obRenderChecks();obApplyVisibility()})}
 function obDetect(){var btn=E('ob-detect');btn.textContent='scanning...';btn.disabled=true;
  fetch(q('/api/onboard/detect')).then(function(r){return r.json()}).then(function(d){
   btn.textContent='Auto-detect';btn.disabled=false;var f=d.found||[],added=0;
@@ -4262,17 +4269,13 @@ function obDetect(){var btn=E('ob-detect');btn.textContent='scanning...';btn.dis
    if(t==='decypharr'){if(!E('ob-decy-url').value)E('ob-decy-url').value=s.url;continue}
    var norm=(t==='overseerr'||t==='jellyseerr')?'seerr':t;
    if(!obHas(norm)&&!obHasUrl(s.url)){obServices.push({type:norm,url:s.url,apikey:'',note:s.note});added++}}
-  obRenderServices();if(obMode==='easy'){obChecks=obDefaultChecks();obRenderChecks()}
+  obRenderServices();obMergeDefaults();obRenderChecks();obApplyVisibility();
   toast(added?('found '+added+' service'+(added>1?'s':'')):'nothing new found');
   E('ob-svctip').textContent=added?'Detected below. Paste each API key and hit Test.':'Nothing auto-detected. Add services by hand in Advanced mode.'})}
 function obRenderLibs(){var libs=obState.library_mounts||[],h='';
  if(libs.length){var parts=[];for(var i=0;i<libs.length;i++)parts.push('<b>'+esc(libs[i].path)+'</b> ('+libs[i].entries+')');h='Library paths visible in this container: '+parts.join(', ')}
  else h='No media library mount detected inside this container yet.';
  E('ob-libs').innerHTML=h}
-function obWarmerToggle(){var on=E('ob-warmer').checked;E('ob-warmer-lab').classList.toggle('on',on);
- var note=E('ob-warmer-note');
- if(on&&(!obState.library_mounts||!obState.library_mounts.length)){note.style.display='';note.textContent=obState.warmer_hint||''}else note.style.display='none';
- if(obMode==='easy'){obChecks=obDefaultChecks();obRenderChecks()}}
 function obSave(){var insts=[],seerr=null,bazarr=null;
  for(var i=0;i<obServices.length;i++){var s=obServices[i];if(!s.url||!s.url.trim())continue;
   if(s.type==='seerr'){seerr={url:s.url,apikey:s.apikey};continue}
@@ -4280,8 +4283,8 @@ function obSave(){var insts=[],seerr=null,bazarr=null;
   if(OB_INSTANCE_TYPES[s.type])insts.push({type:s.type,name:s.type,url:s.url,apikey:s.apikey})}
  var body={instances:insts,plex:{url:E('ob-plex-url').value,token:E('ob-plex-token').value},
   decypharr:{url:E('ob-decy-url').value,mount:E('ob-decy-mount').value},
-  warmer:{enabled:E('ob-warmer').checked,path_map:E('ob-warmer-map').value},
-  checks:(obMode==='easy'?obDefaultChecks():obChecks)};
+  warmer:{enabled:!!obChecks.ENABLE_WARMER,path_map:E('ob-warmer-map').value},
+  checks:obChecks};
  if(seerr)body.seerr=seerr;if(bazarr)body.bazarr=bazarr;
  var btn=E('ob-save');btn.disabled=true;btn.textContent='saving...';
  fetch(q('/api/onboard/save'),{method:'POST',body:JSON.stringify(body)}).then(function(r){return r.json()}).then(function(j){
@@ -4296,12 +4299,11 @@ function obRestart(){fetch(q('/api/restart'),{method:'POST'}).then(function(){to
 function loadOnboard(){fetch(q('/api/onboard/state')).then(function(r){return r.json()}).then(function(s){obState=s;
   E('ob-warn').innerHTML=s.writable?'':'<div class=ob-warnbanner>Heads up: '+esc(s.config_file)+' is not writable by this process, so setup will not persist. Fix the volume/permissions or point DOCTOR_CONFIG_FILE at a writable path.</div>';
   E('ob-sub').textContent=s.configured?'already configured - re-run to add or change services':"let's get stack-doctor talking to your services";
-  obRenderLibs();obRenderServices();
-  if(obMode==='easy')obChecks=obDefaultChecks();obRenderChecks()})}
+  obRenderLibs();obRenderServices();obMergeDefaults();obRenderChecks();obApplyVisibility()})}
 (function(){var seg=E('ob-mode').querySelectorAll('.sk-segb');
  for(var i=0;i<seg.length;i++)seg[i].onclick=(function(b){return function(){obSetMode(b.dataset.m)}})(seg[i]);
  E('ob-detect').onclick=obDetect;E('ob-add').onclick=obAddSvc;
- E('ob-save').onclick=obSave;E('ob-warmer').onchange=obWarmerToggle})();
+ E('ob-save').onclick=obSave})();
 fetch(q('/api/onboard/state')).then(function(r){return r.json()}).then(function(s){obState=s;
   show(s.configured?'dash':'onboard')}).catch(function(){show('dash')});
 </script></body></html>"""
