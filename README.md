@@ -648,6 +648,16 @@ retries) yield their sweeps so they do not compete for the download client, and 
 pushed to the top of its download client queue (SABnzbd is forced; other clients are left as-is), so
 the thing you asked for is fetched first. Items that got the bump show a `priority` tag.
 
+**Built for speed.** On a debrid mount a grab resolves in seconds, but an arr only imports on its own
+completed-download-handling interval (up to a minute), so a request would otherwise sit "downloading"
+long after the file is really there. Scout closes that gap three ways: it forces the arr to import a
+finished grab immediately (`RefreshMonitoredDownloads`, every `SCOUT_IMPORT_NUDGE_SEC`), it pokes a
+targeted Plex scan of the new file's folder on import so the **Play in Plex** link lights up in
+seconds rather than at the next full sweep (`SCOUT_PLEX_SCAN`), and it drives the whole state machine
+server-side on a fast tick (`SCOUT_PUMP_SEC`) so completion does not depend on the dashboard's poll
+timer (a backgrounded browser tab throttles its own timers). End to end a cached title typically
+reaches **available** with a working play link well inside 30 seconds.
+
 Search and status are read-only, so the tab is safe to leave open. **Get** is the only action that
 writes, and it honours `DOCTOR_DRY_RUN`: in dry-run nothing is submitted and the request is marked
 `dry-run`. Requests live in `SCOUT_STATE_FILE` and a finished one drops off the feed after
@@ -664,6 +674,9 @@ writes, and it honours `DOCTOR_DRY_RUN`: in dry-run nothing is submitted and the
 | `SCOUT_RETAIN` | `40` | how many recent requests the activity feed keeps |
 | `SCOUT_TTL_HOURS` | `48` | drop a finished request from the feed after this long |
 | `SCOUT_STATE_FILE` | `/data/scout.json` | where in-flight requests are persisted |
+| `SCOUT_IMPORT_NUDGE_SEC` | `5` | how often to force the arr to import a finished grab (`0` = off, wait for the arr's own interval) |
+| `SCOUT_PLEX_SCAN` | `true` | on import, poke a targeted Plex scan of the new file's folder so the Play link resolves fast |
+| `SCOUT_PUMP_SEC` | `3` | server-side tick that drives a live request to completion regardless of the dashboard poll timer (`0` = off) |
 
 ## Extending
 

@@ -353,6 +353,9 @@ SCOUT_MAX_RESULTS    = _i("SCOUT_MAX_RESULTS", 20)                   # cap on se
 SCOUT_RETAIN         = _i("SCOUT_RETAIN", 40)                       # how many recent requests the activity feed keeps
 SCOUT_TTL_HOURS      = _i("SCOUT_TTL_HOURS", 48)                    # drop a finished (available) request from the feed after this long
 SCOUT_STATE          = os.environ.get("SCOUT_STATE_FILE", "/data/scout.json")
+SCOUT_IMPORT_NUDGE_SEC = _i("SCOUT_IMPORT_NUDGE_SEC", 5)            # how often to force the arr to import a finished grab (0 = off). Debrid resolves in seconds; without this the arr sits idle up to its ~60s completed-download interval
+SCOUT_PLEX_SCAN      = _b("SCOUT_PLEX_SCAN", True)                  # on import, poke a targeted Plex scan of the new file's folder so the Play link lights up in seconds, not at the next full library sweep
+SCOUT_PUMP_SEC       = _i("SCOUT_PUMP_SEC", 3)                      # server-side tick that drives a live request to completion regardless of the dashboard's poll timer (a backgrounded browser tab throttles its own timers). 0 = off
 
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
@@ -3217,6 +3220,31 @@ def _scout_plex_annotate(out, qstr):
 
 _SCOUT_LIVE_STAGES = ("queued", "searching", "grabbed", "downloading", "importing", "verifying")
 
+def _scout_has_live():
+    """Cheap check (no arr calls): is any request still in flight? Lets the pump idle without probing."""
+    try:
+        with _scout_lock:
+            reqs = _scout_load().get("reqs", {})
+    except Exception:
+        return False
+    now = time.time()
+    return any(r.get("stage") in _SCOUT_LIVE_STAGES and now - r.get("created", 0) < SCOUT_TTL_HOURS * 3600
+               for r in reqs.values())
+
+def scout_pump(stop):
+    """Drive live Scout requests to completion server-side, on a fast tick, so a request finishes in
+    seconds even when the dashboard tab is backgrounded (browsers throttle its poll timer to ~1/min).
+    Only probes the arrs while something is actually in flight; idles cheaply otherwise."""
+    while not stop.is_set():
+        live = False
+        try:
+            if _scout_has_live():
+                _scout_status()                                  # advances stages + fires import/priority nudges
+                live = True
+        except Exception as e:
+            log.debug("[scout] pump err: %s", str(e)[:80])
+        stop.wait(SCOUT_PUMP_SEC if live else 20)
+
 def _scout_active():
     """How many Scout requests are still in flight. Used by the background drains (backlog / Riven)
     to yield so an explicit user request is fetched first. Refreshes stages first so we do not yield
@@ -3281,6 +3309,44 @@ def _scout_prioritize(arr, rec, req):
         req["prioritized"] = True
         log.debug("[scout] no priority lever for client '%s' (impl=%s)", cname, impl or "?")
 
+_scout_nudge_last = {}    # req id -> last RefreshMonitoredDownloads ts (throttle)
+_scout_scanned    = set() # req ids we already poked a targeted Plex scan for
+
+def _scout_nudge_import(arr, req):
+    """Force the arr to poll its download client and import anything already finished, instead of
+    waiting out its ~60s completed-download-handling interval. decypharr resolves a cached grab in
+    seconds, so this is what turns a minute-long idle into a few seconds. Throttled per request."""
+    if SCOUT_IMPORT_NUDGE_SEC <= 0 or DRY_RUN: return
+    now, rid = time.time(), req.get("id")
+    if now - _scout_nudge_last.get(rid, 0) < SCOUT_IMPORT_NUDGE_SEC: return
+    _scout_nudge_last[rid] = now
+    try: arr.command({"name": "RefreshMonitoredDownloads"}, t=30)
+    except Exception as e: log.debug("[scout] import nudge err: %s", str(e)[:70])
+
+def _plex_scan_path(folder):
+    """Ask Plex to scan just the folder a new file landed in, so the Play link resolves in seconds
+    instead of at the next full-library sweep. Best-effort: no-op without PLEX_URL/TOKEN or a match."""
+    if not (SCOUT_PLEX_SCAN and PLEX_URL and PLEX_TOKEN and folder): return
+    secs = _plex_json("/library/sections")
+    for sec in ((secs or {}).get("MediaContainer", {}).get("Directory") or []):
+        for loc in (sec.get("Location") or []):
+            root = (loc.get("path") or "").rstrip("/")
+            if root and (folder == root or folder.startswith(root + "/")):
+                try:
+                    urllib.request.urlopen(PLEX_URL.rstrip("/") + "/library/sections/%s/refresh?path=%s&X-Plex-Token=%s" % (
+                        sec.get("key"), urllib.parse.quote(folder), PLEX_TOKEN), timeout=8).read()
+                    log.info("[scout] poked Plex scan of %s (section %s)", folder, sec.get("title"))
+                except Exception as e: log.debug("[scout] plex scan err: %s", str(e)[:70])
+                return
+
+def _scout_ready(req, folder):
+    """First time a request's file lands, poke a targeted Plex scan so its Play link resolves fast."""
+    rid = req.get("id")
+    if rid in _scout_scanned or req.get("play"): return
+    _scout_scanned.add(rid)
+    try: _plex_scan_path(folder)
+    except Exception as e: log.debug("[scout] ready-scan err: %s", str(e)[:70])
+
 def _scout_probe(req):
     if req.get("stage") == "dry-run": return "dry-run", {}
     backend, kind = req.get("backend"), req.get("kind")
@@ -3291,21 +3357,29 @@ def _scout_probe(req):
         if kind == "movie":
             m = arr.get_json("/movie/%d" % tid)
             if m is None: return req.get("stage", "searching"), {}
-            if m.get("hasFile"): return "available", {"play": _scout_play(req)}
+            if m.get("hasFile"):
+                mf = (m.get("movieFile") or {}).get("path") or ""
+                _scout_ready(req, os.path.dirname(mf) if mf else (m.get("folderPath") or ""))
+                return "available", {"play": _scout_play(req)}
             rec = _scout_queue_rec(arr, "movieId", tid)
             if rec and not DRY_RUN:
                 try: _scout_prioritize(arr, rec, req)
                 except Exception as e: log.debug("[scout] prioritize err: %s", str(e)[:80])
+                try: _scout_nudge_import(arr, req)
+                except Exception as e: log.debug("[scout] nudge err: %s", str(e)[:80])
             return _scout_stage_from_rec(rec) if rec else _scout_search_or_timeout(req)
         s = arr.get_json("/series/%d" % tid)
         if s is None: return req.get("stage", "searching"), {}
         stt = s.get("statistics") or {}
         if stt.get("episodeFileCount", 0) > 0:
+            _scout_ready(req, s.get("path") or "")
             return "available", {"play": _scout_play(req), "detail": "%d/%d episodes" % (stt.get("episodeFileCount", 0), stt.get("episodeCount", 0) or 0)}
         rec = _scout_queue_rec(arr, "seriesId", tid)
         if rec and not DRY_RUN:
             try: _scout_prioritize(arr, rec, req)
             except Exception as e: log.debug("[scout] prioritize err: %s", str(e)[:80])
+            try: _scout_nudge_import(arr, req)
+            except Exception as e: log.debug("[scout] nudge err: %s", str(e)[:80])
         return _scout_stage_from_rec(rec) if rec else _scout_search_or_timeout(req)
     if backend == "riven":
         rv = next((r for r in RIVENS if r.name == req.get("riven")), RIVENS[0] if RIVENS else None)
@@ -3856,6 +3930,9 @@ def main():
 
     if EN_WESTREPAIR:
         threading.Thread(target=westrepair_loop, args=(stop,), daemon=True).start()
+
+    if EN_SCOUT and EN_UI and SCOUT_PUMP_SEC > 0:
+        threading.Thread(target=scout_pump, args=(stop,), daemon=True).start()
 
     # http server(s): arr webhooks (event mode) and/or the web dashboard (ENABLE_UI)
     servers, wanted = [], {}
