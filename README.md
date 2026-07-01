@@ -648,15 +648,23 @@ retries) yield their sweeps so they do not compete for the download client, and 
 pushed to the top of its download client queue (SABnzbd is forced; other clients are left as-is), so
 the thing you asked for is fetched first. Items that got the bump show a `priority` tag.
 
-**Built for speed.** On a debrid mount a grab resolves in seconds, but an arr only imports on its own
-completed-download-handling interval (up to a minute), so a request would otherwise sit "downloading"
-long after the file is really there. Scout closes that gap three ways: it forces the arr to import a
-finished grab immediately (`RefreshMonitoredDownloads`, every `SCOUT_IMPORT_NUDGE_SEC`), it pokes a
-targeted Plex scan of the new file's folder on import so the **Play in Plex** link lights up in
-seconds rather than at the next full sweep (`SCOUT_PLEX_SCAN`), and it drives the whole state machine
-server-side on a fast tick (`SCOUT_PUMP_SEC`) so completion does not depend on the dashboard's poll
-timer (a backgrounded browser tab throttles its own timers). End to end a cached title typically
-reaches **available** with a working play link well inside 30 seconds.
+**Built for speed.** A Scout pick typically reaches **available** with a working play link in well
+under 30 seconds. Four things get it there:
+
+- **It grabs a release the backend can actually fetch.** Left to auto-search, an arr grabs the
+  highest-scored release first, which on a debrid mount is usually a 40-90GB full-disc or remux image
+  the backend cannot resolve. It spends ~20s failing, blocklists it, tries the next, and so on, so
+  the biggest cost is failed grabs, not the download. Instead Scout runs its own interactive search
+  and grabs the best release under `SCOUT_MAX_GRAB_GB` (the filter is size, not the arr's parsed
+  quality, since a fetchable encode is sometimes mis-tagged as a disc). If a pick does fail it walks
+  to the next candidate (`SCOUT_GRAB_TRIES`); if nothing fetchable turns up it falls back to the
+  arr's own search. This is Scout-only and does not change your automated grabs.
+- **It imports the instant the grab finishes** by forcing `RefreshMonitoredDownloads` every
+  `SCOUT_IMPORT_NUDGE_SEC`, rather than waiting out the arr's ~60s completed-download-handling interval.
+- **It pokes a targeted Plex scan** of the new file's folder on import (`SCOUT_PLEX_SCAN`), so the
+  **Play in Plex** link resolves in seconds instead of at the next full library sweep.
+- **It drives the state machine server-side** on a fast tick (`SCOUT_PUMP_SEC`), so completion does
+  not depend on the dashboard's poll timer, which a backgrounded browser tab throttles.
 
 Search and status are read-only, so the tab is safe to leave open. **Get** is the only action that
 writes, and it honours `DOCTOR_DRY_RUN`: in dry-run nothing is submitted and the request is marked
@@ -677,6 +685,10 @@ writes, and it honours `DOCTOR_DRY_RUN`: in dry-run nothing is submitted and the
 | `SCOUT_IMPORT_NUDGE_SEC` | `5` | how often to force the arr to import a finished grab (`0` = off, wait for the arr's own interval) |
 | `SCOUT_PLEX_SCAN` | `true` | on import, poke a targeted Plex scan of the new file's folder so the Play link resolves fast |
 | `SCOUT_PUMP_SEC` | `3` | server-side tick that drives a live request to completion regardless of the dashboard poll timer (`0` = off) |
+| `SCOUT_MAX_GRAB_GB` | `30` | Scout grabs the best release under this size; skips the big full-disc/remux images that fail to resolve on a debrid mount (`0` = defer to the arr's auto-pick) |
+| `SCOUT_GRAB_TRIES` | `4` | how many fetchable releases to try (best first) before falling back to the arr's own search |
+| `SCOUT_GRAB_WAIT` | `18` | seconds to watch a grabbed release for import/failure before moving to the next candidate |
+| `SCOUT_SEARCH_TIMEOUT` | `90` | timeout for Scout's interactive release search against the indexers |
 
 ## Extending
 

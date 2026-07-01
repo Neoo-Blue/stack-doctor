@@ -356,6 +356,10 @@ SCOUT_STATE          = os.environ.get("SCOUT_STATE_FILE", "/data/scout.json")
 SCOUT_IMPORT_NUDGE_SEC = _i("SCOUT_IMPORT_NUDGE_SEC", 5)            # how often to force the arr to import a finished grab (0 = off). Debrid resolves in seconds; without this the arr sits idle up to its ~60s completed-download interval
 SCOUT_PLEX_SCAN      = _b("SCOUT_PLEX_SCAN", True)                  # on import, poke a targeted Plex scan of the new file's folder so the Play link lights up in seconds, not at the next full library sweep
 SCOUT_PUMP_SEC       = _i("SCOUT_PUMP_SEC", 3)                      # server-side tick that drives a live request to completion regardless of the dashboard's poll timer (a backgrounded browser tab throttles its own timers). 0 = off
+SCOUT_MAX_GRAB_GB    = _i("SCOUT_MAX_GRAB_GB", 30)                  # Scout picks its own release to grab: skip anything larger than this. On a debrid mount the 30GB+ full-disc / remux images almost never resolve, so auto-grabbing one just burns ~20s failing before the arr tries the next. 0 = no ceiling (defer to the arr's auto-pick)
+SCOUT_GRAB_TRIES     = _i("SCOUT_GRAB_TRIES", 4)                    # how many fetchable releases to try (best first) before falling back to the arr's own auto search
+SCOUT_GRAB_WAIT      = _i("SCOUT_GRAB_WAIT", 18)                    # seconds to watch a grabbed release for import/failure before moving to the next candidate
+SCOUT_SEARCH_TIMEOUT = _i("SCOUT_SEARCH_TIMEOUT", 90)              # timeout for Scout's interactive release search against the indexers
 
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
@@ -3025,7 +3029,7 @@ def _scout_add_movie(arr, req):
     if prof is None or not root: return None, "no quality profile / root folder on %s" % arr.name
     payload = {"title": req["title"], "tmdbId": req.get("tmdbId"), "year": req.get("year") or 0,
                "qualityProfileId": prof, "rootFolderPath": root, "monitored": True,
-               "minimumAvailability": "released", "addOptions": {"searchForMovie": True}}
+               "minimumAvailability": "released", "addOptions": {"searchForMovie": False}}  # Scout grabs its own fetchable release below
     try:
         return json.load(arr._req("POST", "/movie", data=json.dumps(payload).encode(), t=40)).get("id"), None
     except urllib.error.HTTPError as e:
@@ -3058,6 +3062,61 @@ def _scout_store(req):
                 reqs.pop(k, None)
         _scout_save(s)
 
+def _scout_grabbable(rels):
+    """From an interactive release search, the releases Scout is willing to grab, best first. Skips
+    anything the arr already rejected (respects the profile) and anything over the size ceiling, since
+    on this backend the big full-disc / remux images just fail to resolve. Size, not the arr's parsed
+    quality name, is the filter: a fetchable 2160p encode is sometimes mis-tagged BR-DISK."""
+    ceil = SCOUT_MAX_GRAB_GB * (1 << 30)
+    out = [r for r in rels
+           if not r.get("rejected") and r.get("guid") and r.get("indexerId") is not None
+           and not (ceil and (r.get("size") or 0) > ceil)]
+    out.sort(key=lambda r: (r.get("qualityWeight") or 0, r.get("size") or 0), reverse=True)
+    return out
+
+def _scout_grab(arr, r):
+    try:
+        arr._req("POST", "/release", data=json.dumps({"guid": r.get("guid"), "indexerId": r.get("indexerId")}).encode(), t=60)
+        return True
+    except Exception as e:
+        log.debug("[scout] grab err: %s", str(e)[:80]); return False
+
+def _scout_failed_since(arr, movie_id, title, after_iso):
+    for e in (arr.get_json("/history/movie?movieId=%d" % movie_id) or []):
+        if e.get("eventType") == "downloadFailed" and (e.get("sourceTitle") or "") == title and (e.get("date") or "") >= after_iso:
+            return True
+    return False
+
+def _scout_interactive_grab(arr, movie_id, title):
+    """Pick a release Scout can actually fetch and grab it, instead of letting the arr auto-grab the
+    biggest disc/remux image (which fails on this backend, ~20s per failed try). Walks the best
+    fetchable candidates, moving on only when one explicitly fails; hands a live download off to the
+    normal tracker. Falls back to the arr's own search if nothing fetchable turns up."""
+    time.sleep(2)                                                # let a fresh add settle before searching
+    try: rels = arr.get_json("/release?movieId=%d" % movie_id, t=SCOUT_SEARCH_TIMEOUT) or []
+    except Exception as e: rels = []; log.debug("[scout] release search err: %s", str(e)[:80])
+    cands = _scout_grabbable(rels)
+    if not cands:
+        log.info("[scout] no fetchable release for '%s'; using the arr's auto search", title)
+        arr.command({"name": "MoviesSearch", "movieIds": [movie_id]}); return
+    for r in cands[:SCOUT_GRAB_TRIES]:
+        rtitle = r.get("title") or ""
+        after = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5))
+        if not _scout_grab(arr, r): continue
+        log.info("[scout] grabbed '%s' (%.1fGB) for '%s'", rtitle[:60], (r.get("size") or 0) / 1e9, title)
+        deadline, failed = time.time() + SCOUT_GRAB_WAIT, False
+        while time.time() < deadline:
+            time.sleep(3)
+            if (arr.get_json("/movie/%d" % movie_id) or {}).get("hasFile"): return   # imported
+            if _scout_failed_since(arr, movie_id, rtitle, after): failed = True; break
+        if not failed: return                                    # still downloading -> let the tracker finish it, do not double-grab
+        log.info("[scout] '%s' failed to fetch, trying next release", rtitle[:50])
+    log.info("[scout] exhausted fetchable releases for '%s'", title)
+
+def _scout_launch_grab(arr, movie_id, title):
+    if DRY_RUN or not movie_id: return
+    threading.Thread(target=_scout_interactive_grab, args=(arr, movie_id, title), daemon=True).start()
+
 def _scout_get(body):
     try: p = json.loads(body or b"{}")
     except Exception: return False, {"error": "bad request"}
@@ -3081,12 +3140,13 @@ def _scout_get(body):
         if arr_id > 0:
             req["target_id"] = arr_id
             if not p.get("hasFile"):
-                arr.command({"name": "MoviesSearch", "movieIds": [arr_id]} if kind == "movie"
-                            else {"name": "SeriesSearch", "seriesId": arr_id})
+                if kind == "movie": _scout_launch_grab(arr, arr_id, req["title"])
+                else: arr.command({"name": "SeriesSearch", "seriesId": arr_id})
         else:
             nid, err = (_scout_add_movie(arr, req) if kind == "movie" else _scout_add_show(arr, req))
             if err: log.warning("[scout] add failed: %s", err); return False, {"error": err}
             req["target_id"] = nid
+            if kind == "movie": _scout_launch_grab(arr, nid, req["title"])
         req["stage"] = "searching"; _scout_store(req)
         log.info("[scout] acquiring %s (%s) via %s id=%s", req["title"], kind, arr.name, req.get("target_id"))
         return True, {"id": rid, "stage": "searching"}
