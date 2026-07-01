@@ -629,6 +629,11 @@ It does not add a new backend: it drives whatever you already run.
   item's Riven state.
 - With no acquisition backend, the tab shows a clear "nothing to drive" banner.
 
+Search hits that are already playable in Plex skip the queue entirely: instead of a **Get** button they
+show a **Play in Plex** button straight away. Presence is resolved against Plex at search time (matching
+by IMDb/TMDB/TVDB guid, then title and year), not against the arr's `hasFile`, because on a debrid/Riven
+mount a title plays fine long before any arr reports a local file. So Scout doubles as a quick find-and-play.
+
 The six stages are `searching -> grabbed -> downloading -> importing -> verifying -> available`.
 The **Get** button itself becomes the live status: after you click it, the button turns into a small
 progress pill on the card (current stage plus a fill bar and, while downloading, the percentage), and

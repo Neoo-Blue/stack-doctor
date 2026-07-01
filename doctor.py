@@ -3013,7 +3013,9 @@ def _scout_search(qstr, kind):
     for r in res:
         if r["uid"] in seen: continue
         seen.add(r["uid"]); out.append(r)
-    return {"mode": mode, "results": out[:SCOUT_MAX_RESULTS]}
+    out = out[:SCOUT_MAX_RESULTS]
+    _scout_plex_annotate(out, qstr)                              # flag anything already playable in Plex + attach its deep link
+    return {"mode": mode, "results": out}
 
 def _scout_add_movie(arr, req):
     prof, root = _scout_profile(arr), _scout_root(arr)
@@ -3166,10 +3168,10 @@ def _guid_match(it, imdb, tmdb, tvdb):
         if gid: ids.add(gid)
     return bool((imdb and "imdb://%s" % imdb in ids) or (tmdb and "tmdb://%s" % tmdb in ids) or (tvdb and "tvdb://%s" % tvdb in ids))
 
-def _plex_resolve(title, year, imdb, tmdb, tvdb, kind):
+def _plex_resolve(title, year, imdb, tmdb, tvdb, kind, t=8):
     mid = _plex_machine_id()
     if not mid: return ""
-    items = _plex_collect(_plex_json("/search?query=" + urllib.parse.quote(title or "") + "&limit=30"))
+    items = _plex_collect(_plex_json("/search?query=" + urllib.parse.quote(title or "") + "&limit=30", t=t))
     want = "movie" if kind == "movie" else "show"
     cand = [it for it in items if it.get("type") == want]
     best = None
@@ -3186,6 +3188,32 @@ def _plex_resolve(title, year, imdb, tmdb, tvdb, kind):
 def _scout_play(req):
     if req.get("play"): return req["play"]
     return _plex_resolve(req.get("title"), req.get("year"), req.get("imdbId"), req.get("tmdbId"), req.get("tvdbId"), req.get("kind"))
+
+def _scout_plex_annotate(out, qstr):
+    """Flag any search result that is already playable in Plex and attach its deep link.
+    In this homelab Plex is fed by debrid/Riven mounts, so arr hasFile is false even for
+    titles that play fine, hence we ask Plex directly (one search per query)."""
+    if not (PLEX_URL and out): return
+    mid = _plex_machine_id()
+    if not mid: return
+    items = _plex_collect(_plex_json("/search?query=" + urllib.parse.quote(qstr or "") + "&limit=50"))
+    if not items: return
+    for r in out:
+        want = "movie" if r.get("kind") == "movie" else "show"
+        imdb, tmdb, tvdb = r.get("imdbId") or "", str(r.get("tmdbId") or ""), str(r.get("tvdbId") or "")
+        yr, title = str(r.get("year") or ""), (r.get("title") or "").strip().lower()
+        best = None
+        for it in items:
+            if it.get("type") == want and _guid_match(it, imdb, tmdb, tvdb): best = it; break
+        if not best:
+            for it in items:
+                if it.get("type") != want: continue
+                if title and (it.get("title") or "").strip().lower() == title and (not yr or str(it.get("year")) == yr):
+                    best = it; break
+        rk = (best or {}).get("ratingKey")
+        if not rk: continue
+        r["inPlex"] = True
+        r["play"] = "https://app.plex.tv/desktop/#!/server/%s/details?key=%s" % (mid, urllib.parse.quote("/library/metadata/" + str(rk), safe=""))
 
 _SCOUT_LIVE_STAGES = ("queued", "searching", "grabbed", "downloading", "importing", "verifying")
 
@@ -3651,7 +3679,8 @@ function renderResults(){var h='';
   E('sk-results').innerHTML=h}
 function skAction(r){var req=skActiveByUid[r.uid];
   if(req)return skStatusPill(req);
-  if(r.hasFile)return '<button class="sk-btn sk-get" disabled>have it</button>';
+  if(r.play)return '<a class="sk-btn sk-play" href="'+esc(r.play)+'" target=_blank rel=noopener>Play in Plex</a>';
+  if(r.inPlex)return '<button class="sk-btn sk-get" disabled>in Plex</button>';
   return '<button class="sk-btn sk-get" onclick="scoutGet('+r._i+')">Get</button>'}
 function skStatusPill(req){var stage=req.stage;
   if(stage==='available'){
