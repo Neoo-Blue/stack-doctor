@@ -972,7 +972,7 @@ def _scrub_load_state():
     try:
         return json.load(open(SCRUB_STATE))
     except Exception:
-        return {"files": {}, "manifest_dir": None}
+        return {"files": {}}
 
 def _scrub_save_state(s):
     try:
@@ -1128,14 +1128,13 @@ def _scrub_t3_full(path):
         return False, "ffmpeg full rc=0 %s" % (err or "").strip()[:300]
     return True, ""
 
-def _scrub_act_on_bad(real_path, lib_symlink, reason, state, manifest):
-    """Quarantine the library symlink + delete the owning arr's file with blocklist=true.
-    Mirrors the janitor's quarantine shape so 'undo' is the same drill."""
+def _scrub_act_on_bad(real_path, lib_symlink, reason, qroot, manifest):
+    """Quarantine the library symlink + delete the owning arr's file so it re-searches.
+    qroot is this sweep's own quarantine dir, so the moved symlink + manifest.json under it
+    are a self-contained, per-sweep undo record (mv the symlink back to restore)."""
     if DRY_RUN:
         log.warning("[scrubber] WOULD quarantine + re-grab %s (%s)", lib_symlink, reason)
         return False
-    qroot = state.get("manifest_dir") or os.path.join(SCRUB_QUAR, time.strftime("scrubber-%Y%m%d-%H%M%S"))
-    state["manifest_dir"] = qroot
     try:
         os.makedirs(qroot, exist_ok=True)
     except Exception as e:
@@ -1143,17 +1142,17 @@ def _scrub_act_on_bad(real_path, lib_symlink, reason, state, manifest):
     # 1) move the library symlink (preserve its target so an undo is just `mv` back)
     moved = False
     try:
+        dst = os.path.join(qroot, os.path.relpath(lib_symlink, "/"))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.lexists(dst):   # same library path quarantined before in this dir; keep both
+            dst = "%s.%d" % (dst, int(time.time()))
         if os.path.islink(lib_symlink):
             tgt = os.readlink(lib_symlink)
-            dst = os.path.join(qroot, os.path.relpath(lib_symlink, "/"))
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(tgt, dst)
             os.unlink(lib_symlink)
             moved = True
         elif os.path.exists(lib_symlink):
             # not a symlink (a flat file under the library) - move the file itself
-            dst = os.path.join(qroot, os.path.relpath(lib_symlink, "/"))
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.rename(lib_symlink, dst)
             moved = True
     except Exception as e:
@@ -1223,6 +1222,7 @@ def check_scrubber():
         log.debug("[scrubber] nothing due (all cached-OK or below min-age)"); return
     log.info("[scrubber] scanning %d file(s), tier=%d", len(candidates), SCRUB_TIER)
     manifest = []
+    sweep_qroot = os.path.join(SCRUB_QUAR, time.strftime("scrubber-%Y%m%d-%H%M%S"))
     bad = 0; suspect = 0; ok_n = 0
     for real_path, lib_symlink, st in candidates:
         # re-check load mid-sweep; bail early if we've started crowding decypharr
@@ -1265,16 +1265,11 @@ def check_scrubber():
             else:
                 bad += 1
                 log.error("[scrubber] BAD t%d %s :: %s", cur_tier, real_path, why[:200])
-                _scrub_act_on_bad(real_path, lib_symlink, why, state, manifest)
-    # persist manifest snapshot for reversibility
-    if manifest and state.get("manifest_dir"):
+                _scrub_act_on_bad(real_path, lib_symlink, why, sweep_qroot, manifest)
+    # persist this sweep's manifest (fresh dir per sweep => a clean, isolated undo record)
+    if manifest:
         try:
-            mf = os.path.join(state["manifest_dir"], "manifest.json")
-            existing = []
-            if os.path.exists(mf):
-                try: existing = json.load(open(mf))
-                except Exception: pass
-            json.dump(existing + manifest, open(mf, "w"), indent=1)
+            json.dump(manifest, open(os.path.join(sweep_qroot, "manifest.json"), "w"), indent=1)
         except Exception:
             pass
     _scrub_save_state(state)
