@@ -1057,15 +1057,34 @@ def _scrub_run(cmd, timeout):
     except FileNotFoundError as e:
         return 127, "binary not found: %s" % e
 
+# ffprobe/ffmpeg stderr lines that are non-fatal on a decypharr FUSE mount and must
+# NOT cost a re-grab. "File ended prematurely" fires at EOF when a container declares a
+# hair more data than the file actually holds (common in remuxes) or when the mount
+# stops serving at the tail; the tool still exits rc=0 and the file plays in Plex.
+_SCRUB_BENIGN_STDERR = ("File ended prematurely",)
+
+def _scrub_benign_only(err):
+    """True when every non-empty stderr line is one of the known-benign warnings above."""
+    lines = [ln for ln in (err or "").splitlines() if ln.strip()]
+    if not lines:
+        return True
+    return all(any(m in ln for m in _SCRUB_BENIGN_STDERR) for ln in lines)
+
 def _scrub_t1_header(path):
-    """Tier 1: ffprobe parses the container header. Returns (ok, detail)."""
+    """Tier 1: ffprobe parses the container header. Returns (ok, detail).
+    A torn/unparseable container makes ffprobe exit non-zero, so rc is the reliable
+    signal. rc=0 means the header parsed; a lone benign EOF-tail warning is ignored
+    (see _SCRUB_BENIGN_STDERR) so cold-cache reads and remux tails don't false-positive
+    into a delete + re-grab."""
     cmd = [SCRUB_FFPROBE, "-v", "error", "-hide_banner",
            "-show_entries", "format=duration,bit_rate",
            "-of", "default=nw=1", path]
     rc, err = _scrub_run(cmd, SCRUB_HEADER_TO)
-    if rc == 0 and not err.strip():
-        return True, ""
-    return False, ("ffprobe rc=%d %s" % (rc, err.strip()[:200])) or "header_fail"
+    if rc != 0:
+        return False, ("ffprobe rc=%d %s" % (rc, err.strip()[:200])) or "header_fail"
+    if err.strip() and not _scrub_benign_only(err):
+        return False, "ffprobe rc=0 %s" % err.strip()[:200]
+    return True, ""
 
 def _scrub_t2_skim(path):
     """Tier 2: decode SCRUB_SKIM_SECS at SCRUB_SKIM_POINTS seek points with ffmpeg's null muxer.
@@ -1103,8 +1122,10 @@ def _scrub_t3_full(path):
     before action when SCRUBBER_FULL_DECODE_ON_BAD is set."""
     cmd = [SCRUB_FFMPEG, "-v", "error", "-hide_banner", "-i", path, "-f", "null", "-"]
     rc, err = _scrub_run(cmd, SCRUB_FULL_TO)
-    if rc != 0 or err.strip():
+    if rc != 0:
         return False, "ffmpeg full rc=%d %s" % (rc, (err or "").strip()[:300])
+    if err.strip() and not _scrub_benign_only(err):
+        return False, "ffmpeg full rc=0 %s" % (err or "").strip()[:300]
     return True, ""
 
 def _scrub_act_on_bad(real_path, lib_symlink, reason, state, manifest):
