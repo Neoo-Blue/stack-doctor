@@ -105,6 +105,7 @@ DRY_RUN     = _b("DOCTOR_DRY_RUN", False)
 EN_QUEUE      = _b("ENABLE_QUEUE", True)
 EN_DECYPHARR  = _b("ENABLE_DECYPHARR", False)
 EN_PLEX       = _b("ENABLE_PLEX", False)
+EN_SILO       = _b("ENABLE_SILO", False)       # Silo self-hosted media server health
 EN_RESOURCES  = _b("ENABLE_RESOURCES", False)
 EN_JANITOR    = _b("ENABLE_JANITOR", False)
 EN_PROVIDERS  = _b("ENABLE_PROVIDERS", False)   # auto-test failed indexers/download clients (sonarr/radarr/prowlarr)
@@ -118,6 +119,7 @@ EN_BACKLOG    = _b("ENABLE_BACKLOG", False)     # trickle-search monitored-but-m
 EN_RIVEN      = _b("ENABLE_RIVEN", False)       # Riven (rivenmedia/riven): health + services watch, retry stuck/missing items
 EN_MEDIASTORM = _b("ENABLE_MEDIASTORM", False)  # mediastorm (godver3/mediastorm): up/health watch (no import queue to manage)
 EN_SCOUT      = _b("ENABLE_SCOUT", True)        # dashboard Scout tab: search a title -> Get -> watch it acquire -> play in Plex (uses whatever backend is enabled)
+EN_REPAIR     = _b("ENABLE_REPAIR", False)      # proactive self-heal: re-grab a file the instant it goes missing/bad (don't wait for the throttled backlog)
 
 # westrepair config
 WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
@@ -136,6 +138,19 @@ SEERR_URL       = os.environ.get("SEERR_URL", "")
 SEERR_APIKEY    = os.environ.get("SEERR_APIKEY", "")
 SEERR_MAX       = _i("SEERR_RETRY_MAX", 10)      # max requests retried per sweep (rate-limit the re-adds)
 SEERR_MAX_TRIES = _i("SEERR_MAX_ATTEMPTS", 5)    # give up on a request after this many auto-retries (0 = never give up)
+
+# repair check: proactive self-heal. When an item's file is deleted (the scrubber quarantines a dead/
+# corrupt file, an upgrade replaced it, a manual/disk delete) the arr does NOT auto-search - it goes
+# missing and waits for the slow backlog. This watches each arr's history for file-deletion events and
+# re-grabs the affected item IMMEDIATELY, so a broken Plex item self-heals with no manual search. Bounded
+# + load-gated + per-item cooldown (a permanently-unavailable title can't loop) + baselined on first run.
+REPAIR_PER_SWEEP  = _i("REPAIR_MAX_PER_SWEEP", 10)                 # cap immediate re-grabs/sweep (drains a mass-break over sweeps)
+REPAIR_COOLDOWN   = _dur(os.environ.get("REPAIR_COOLDOWN", "6h")) # don't re-grab the SAME item within this window
+REPAIR_LOAD_MAX   = _i("REPAIR_LOAD_MAX", 12)                     # skip when host is busy (keeps Plex responsive)
+REPAIR_LOOKBACK   = _i("REPAIR_HISTORY_LOOKBACK", 200)            # history records scanned per arr per sweep
+REPAIR_STATE      = os.environ.get("REPAIR_STATE_FILE", "/data/repair.json")
+REPAIR_EVENTS     = set(e.strip() for e in os.environ.get(
+    "REPAIR_EVENTS", "movieFileDeleted,episodeFileDeleted").split(",") if e.strip())
 
 # queue check
 MIN_STRIKES   = _i("DOCTOR_MIN_STRIKES", 2)
@@ -181,6 +196,19 @@ for _kv in os.environ.get("DOCTOR_CONDITION_ACTIONS", "").split(","):
         if _c.strip() and _a.strip().lower() in _VALID_ACTIONS:
             CONDITION_ACTIONS[_c.strip()] = _a.strip().lower()
 IMPORT_MODE = os.environ.get("DOCTOR_IMPORT_MODE", "auto").strip().lower()   # auto|move|copy
+# force_import override: rejections we are willing to import anyway. Debrid/usenet FUSE mounts
+# often can't read a file's runtime, so the arr raises a false "sample" rejection on good files.
+FORCE_IMPORT_OVERRIDE = [s.strip().lower() for s in
+    os.environ.get("DOCTOR_FORCE_IMPORT_OVERRIDE", "sample").split(",") if s.strip()]
+# after this many failed force_import strikes (0 = never), stop leaving a stuck item forever and
+# escalate it to a removal action so the queue can't clog. Genuinely un-importable releases
+# (episode-not-in-release, not-an-upgrade dupes) get cleared this way.
+FORCE_IMPORT_ESCALATE = int(os.environ.get("DOCTOR_FORCE_IMPORT_ESCALATE", "3") or 3)
+# escalation action: "clear" = remove + blocklist the bad release + skipRedownload (no immediate
+# re-search, so no event-mode webhook storm); item stays monitored and the backlog module finds a
+# replacement release at its own throttled pace. "research"/"remove" keep the old re-search behavior.
+_fie = os.environ.get("DOCTOR_FORCE_IMPORT_ESCALATE_ACTION", "clear").strip().lower()
+FORCE_IMPORT_ESCALATE_ACTION = _fie if _fie in ("research", "remove", "clear") else "clear"
 
 # resource thresholds (host load uses /proc/loadavg if mounted)
 LOAD_MAX        = _f("DOCTOR_LOAD_MAX", 0)         # queue check pauses above this (0=off)
@@ -198,6 +226,13 @@ DECY_RESTART_CMD  = os.environ.get("DECYPHARR_RESTART_CMD", "")     # shell cmd 
 # plex
 PLEX_URL   = os.environ.get("PLEX_URL", "")
 PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
+SILO_URL     = os.environ.get("SILO_URL", "")
+SILO_APIKEY  = os.environ.get("SILO_APIKEY", "")
+SILO_PROFILE = os.environ.get("SILO_PROFILE", "")   # optional Silo profile id; empty = all profiles
+SILO_REMATCH          = _b("SILO_REMATCH", bool(SILO_URL))     # auto re-match unmatched Silo items (posters/metadata)
+SILO_REMATCH_MAX      = _i("SILO_REMATCH_MAX", 25)            # items to attempt per pass (gentle on TMDB/Silo)
+SILO_REMATCH_TRIES    = _i("SILO_REMATCH_TRIES", 3)           # give up on an item after this many failed passes
+SILO_REMATCH_INTERVAL = _i("SILO_REMATCH_INTERVAL", 600)      # seconds between re-match passes
 PLEX_SCAN  = _b("PLEX_SCAN_ON_CHECK", False)
 
 # warmer (Plex-driven precache of the heads of likely-next media -> instant playback start)
@@ -464,7 +499,11 @@ def _force_import(arr, rec):
         return 0
     files = []
     for it in cands:
-        if it.get("rejections"):                 # arr found a blocking reason (sample, unknown, etc.)
+        # override only rejections we opted into (e.g. false "sample"); skip anything else
+        # (episode-not-in-release, unknown series/movie, not-an-upgrade) so we never force junk.
+        _rsn = [((x.get("reason") if isinstance(x, dict) else str(x)) or "").lower()
+                for x in (it.get("rejections") or [])]
+        if any(not any(ok in r for ok in FORCE_IMPORT_OVERRIDE) for r in _rsn):
             continue
         f = {"path": it.get("path"), "folderName": it.get("folderName", ""),
              "quality": it.get("quality"), "languages": it.get("languages"),
@@ -513,9 +552,10 @@ class Arr:
         except Exception:
             return []
 
-    def remove(self, item_id, blocklist=None):
+    def remove(self, item_id, blocklist=None, skip_redownload=False):
         bl = BLOCKLIST if blocklist is None else blocklist
-        q = "removeFromClient=%s&blocklist=%s" % (str(REMOVE_CLIENT).lower(), str(bl).lower())
+        q = "removeFromClient=%s&blocklist=%s&skipRedownload=%s" % (
+            str(REMOVE_CLIENT).lower(), str(bl).lower(), str(skip_redownload).lower())
         self._req("DELETE", "/queue/%d?%s" % (item_id, q))
 
     def post(self, path, t=150):
@@ -758,19 +798,36 @@ def check_queue(only=None):
                 if n:
                     actions += 1; new.pop(iid, None)
                     log.info("[queue:%s] force-imported %d file(s) (%s): %s", arr.name, n, reason, title)
-                else:
+                    continue
+                if not (FORCE_IMPORT_ESCALATE and cnt >= FORCE_IMPORT_ESCALATE):
                     log.info("[queue:%s] %s: nothing importable yet, leaving (strike %d): %s",
                              arr.name, reason, cnt, title)
-            else:   # research (remove + blocklist) | remove (remove, never blocklist)
-                bl = BLOCKLIST if action == "research" else False
-                parked = _churn_record(state, arr, r, title)   # un-monitor first so the remove can't re-search
-                try:
-                    arr.remove(r["id"], blocklist=bl); actions += 1; new.pop(iid, None)
-                    log.info("[queue:%s] removed (%s, action=%s, blocklist=%s)%s: %s",
-                             arr.name, reason, action, str(bl).lower(),
-                             " [parked, no re-search]" if parked else " -> re-search", title)
-                except Exception as e:
-                    log.warning("[queue:%s] remove failed: %s", arr.name, e)
+                    continue
+                action = FORCE_IMPORT_ESCALATE_ACTION   # stuck too long -> stop leaving it, clear it
+                log.info("[queue:%s] %s: not importable after %d strikes -> escalating to %s: %s",
+                         arr.name, reason, cnt, action, title)
+                if action == "clear":
+                    # safe unclog: remove + blocklist the bad release + skipRedownload so there is NO
+                    # immediate re-search (that was the event-mode webhook storm). Item stays monitored;
+                    # the throttled backlog module finds a replacement release later.
+                    try:
+                        arr.remove(r["id"], blocklist=BLOCKLIST, skip_redownload=True)
+                        actions += 1; new.pop(iid, None)
+                        log.info("[queue:%s] cleared stuck item (blocklist=%s, no re-search): %s",
+                                 arr.name, str(BLOCKLIST).lower(), title)
+                    except Exception as e:
+                        log.warning("[queue:%s] clear failed: %s", arr.name, e)
+                    continue
+            # research (remove + blocklist) | remove (never blocklist); also reached via escalation
+            bl = BLOCKLIST if action == "research" else False
+            parked = _churn_record(state, arr, r, title)   # un-monitor first so the remove can't re-search
+            try:
+                arr.remove(r["id"], blocklist=bl); actions += 1; new.pop(iid, None)
+                log.info("[queue:%s] removed (%s, action=%s, blocklist=%s)%s: %s",
+                         arr.name, reason, action, str(bl).lower(),
+                         " [parked, no re-search]" if parked else " -> re-search", title)
+            except Exception as e:
+                log.warning("[queue:%s] remove failed: %s", arr.name, e)
         state[arr.name] = new
         if stuck:
             log.info("[queue:%s] %d stuck tracked, %d acted", arr.name, stuck, actions)
@@ -852,6 +909,93 @@ def check_plex():
             log.info("[plex] triggered library refresh")
         except Exception as e:
             log.debug("[plex] refresh failed: %s", e)
+
+def check_silo():
+    if not SILO_URL:
+        return
+    base = SILO_URL.rstrip("/")
+    c = http_code(base + "/health", t=10)
+    if c != 200:
+        log.error("[silo] %s -> %s (unresponsive)", SILO_URL, c if c else "DOWN")
+        return
+    info = ""
+    if SILO_APIKEY:
+        try:
+            req = urllib.request.Request(base + "/api/v1/admin/stats",
+                                         headers={"Authorization": "Bearer " + SILO_APIKEY})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                d = json.loads(r.read().decode())
+            info = " items=%s movies=%s users=%s" % (
+                d.get("total_items"), d.get("total_movies"), d.get("total_users"))
+        except Exception:
+            pass
+    log.info("[silo] %s -> 200 OK%s", SILO_URL, info)
+
+
+_silo_rematch_last = [0.0]
+
+def _silo_pick(cands, item):
+    if not cands:
+        return None
+    yr = item.get("year"); ct = item.get("content_type")
+    def typeok(c):
+        cc = c.get("content_type")
+        if not ct:
+            return True
+        if ct == cc:
+            return True
+        return ct in ("show", "series") and cc in ("series", "tv", "show")
+    pool = [c for c in cands if typeok(c)] or cands
+    if isinstance(yr, int):
+        ym = [c for c in pool if c.get("year") == yr]
+        if ym:
+            return ym[0]
+        yn = [c for c in pool if isinstance(c.get("year"), int) and abs(c.get("year") - yr) <= 1]
+        if yn:
+            return yn[0]
+    return pool[0]
+
+def check_silo_rematch():
+    """Auto re-match Silo items the initial scan left unmatched (posters/metadata)."""
+    if not (SILO_URL and SILO_REMATCH):
+        return
+    if time.time() - _silo_rematch_last[0] < SILO_REMATCH_INTERVAL:
+        return
+    _silo_rematch_last[0] = time.time()
+    s = Silo(SILO_URL, SILO_APIKEY, SILO_PROFILE)
+    items = s.unmatched(limit=200)
+    if not items:
+        return
+    state = _load_state()
+    tries = state.setdefault("__silo_rematch__", {})
+    matched = attempted = 0
+    for it in items:
+        if attempted >= SILO_REMATCH_MAX:
+            break
+        if it.get("content_type") not in ("movie", "series", "show", "tv"):
+            continue
+        cid = it.get("content_id"); title = it.get("title"); lib = it.get("library_id")
+        if not (cid and title):
+            continue
+        if int(tries.get(cid, 0)) >= SILO_REMATCH_TRIES:      # persistently unmatchable -> stop retrying
+            continue
+        attempted += 1
+        if DRY_RUN:
+            log.info("[silo-rematch] DRY-RUN would try %s (%s)", title, it.get("year")); continue
+        best = _silo_pick(s.match_search(cid, title, it.get("year")), it)
+        if best and best.get("provider_ids") and s.match_apply(cid, best["provider_ids"], lib):
+            matched += 1
+            tries.pop(cid, None)
+            log.info("[silo-rematch] matched %s (%s)", title, it.get("year"))
+        else:
+            tries[cid] = int(tries.get(cid, 0)) + 1
+        time.sleep(0.3)
+    live = set(it.get("content_id") for it in items)
+    for k in [k for k in tries if k not in live]:
+        tries.pop(k, None)
+    _save_state(state)
+    if matched or attempted:
+        log.info("[silo-rematch] matched %d of %d attempted (%d unmatched remain)", matched, attempted, len(items))
 
 # =========================================================================== #
 # CHECK: resources
@@ -2195,6 +2339,93 @@ def check_backlog():
         log.debug("[backlog] nothing eligible this sweep")
 
 
+# =========================================================================== #
+# CHECK: repair (proactive self-heal - re-grab a file the instant it goes missing)
+# =========================================================================== #
+
+def _repair_load_state():
+    try: return json.load(open(REPAIR_STATE))
+    except Exception: return {}
+
+def _repair_save_state(s):
+    try:
+        os.makedirs(os.path.dirname(REPAIR_STATE) or ".", exist_ok=True)
+        json.dump(s, open(REPAIR_STATE, "w"))
+    except Exception as e:
+        log.debug("[repair] state save failed: %s", e)
+
+def _repair_needs_grab(arr, tid):
+    """True if the item is still monitored, has no file, and (movies) is available to grab -- i.e. the
+    deletion really left a hole (skip upgrades that already have a new file, and un-monitored items)."""
+    try:
+        if arr.kind == "sonarr":
+            e = arr.get_json("/episode/%d" % tid)
+            return bool(e and e.get("monitored") and not e.get("hasFile"))
+        m = arr.get_json("/movie/%d" % tid)
+        return bool(m and m.get("monitored") and not m.get("hasFile") and m.get("isAvailable", True))
+    except Exception:
+        return False
+
+def check_repair():
+    """Re-grab an item the moment its file goes missing (scrubber quarantined a dead/corrupt file, an
+    upgrade removed the old one, a manual/disk delete), instead of waiting for the throttled backlog.
+    Reads each arr's history for file-deletion events since a stored high-water mark. Baselined on first
+    run (no retroactive mass grab), bounded per sweep, load-gated, and per-item cooldown'd so a
+    permanently-unavailable title cannot loop."""
+    arrs = [a for a in INSTANCES if a.kind in ("sonarr", "radarr")]
+    if not arrs:
+        return
+    if REPAIR_LOAD_MAX > 0 and host_load() > REPAIR_LOAD_MAX:
+        log.info("[repair] host load > %d -> skipping", REPAIR_LOAD_MAX); return
+    state = _repair_load_state()
+    hw = state.setdefault("hw", {})            # arr.name -> last history id processed
+    cool = state.setdefault("cooldown", {})    # arr.name -> {itemId: ts}
+    now = time.time(); searched = 0
+    for arr in arrs:
+        data = arr.get_json("/history?page=1&pageSize=%d&sortKey=date&sortDirection=descending" % REPAIR_LOOKBACK)
+        recs = (data or {}).get("records") if isinstance(data, dict) else None
+        if not recs:
+            continue
+        last = hw.get(arr.name)
+        max_id = last or 0
+        broke = []                              # (itemId, title), newest-first, above the high-water mark
+        for h in recs:
+            hid = h.get("id", 0)
+            if last is not None and hid <= last:
+                break                           # reached already-processed history
+            if hid > max_id: max_id = hid
+            if h.get("eventType") in REPAIR_EVENTS:
+                tid = h.get("episodeId") if arr.kind == "sonarr" else h.get("movieId")
+                if tid:
+                    broke.append((tid, (h.get("sourceTitle") or "")[:70]))
+        hw[arr.name] = max_id
+        if last is None:
+            log.info("[repair:%s] baseline (history hw=%d, no retroactive grab)", arr.name, max_id)
+            continue
+        cd = cool.setdefault(arr.name, {})
+        done = set()
+        for tid, title in broke:
+            if searched >= REPAIR_PER_SWEEP: break
+            if tid in done: continue
+            done.add(tid)
+            if now - cd.get(str(tid), 0) < REPAIR_COOLDOWN: continue
+            if not _repair_needs_grab(arr, tid): continue     # already refilled, or un-monitored
+            body = ({"name": "EpisodeSearch", "episodeIds": [tid]} if arr.kind == "sonarr"
+                    else {"name": "MoviesSearch", "movieIds": [tid]})
+            if DRY_RUN:
+                log.info("[repair:%s] WOULD re-grab NOW: %s", arr.name, title); searched += 1; continue
+            if arr.command(body) is not None:
+                cd[str(tid)] = now; searched += 1
+                log.warning("[repair:%s] file went missing -> re-grabbing NOW: %s", arr.name, title)
+    for d in cool.values():                     # prune stale cooldown entries
+        for k, ts in list(d.items()):
+            if now - ts > max(REPAIR_COOLDOWN * 4, 86400):
+                d.pop(k, None)
+    _repair_save_state(state)
+    if searched:
+        log.info("[repair] triggered %d immediate re-grab(s)", searched)
+
+
 def _riven_load_state():
     try: return json.load(open(RIVEN_STATE))
     except Exception: return {}
@@ -2574,10 +2805,191 @@ def _warm_targets(plex):
                     add("recent", f)
     return targets
 
+# =========================================================================== #
+# WARMER: Silo source (self-hosted media server on the same debrid library).
+# Silo reports file paths under the same /mnt/library mount, so warming reads
+# them straight through decypharr just like the Plex path. We warm the next
+# episode(s) of anything actively playing, plus each profile's Continue Watching.
+# =========================================================================== #
+
+class Silo:
+    def __init__(self, url, apikey, profile=""):
+        self.base = url.rstrip("/") + "/api/v1"
+        self.apikey = apikey
+        self.profile = profile
+        self._cw_section = None
+
+    def _get(self, path, profile=None):
+        req = urllib.request.Request(self.base + path)
+        if self.apikey:
+            req.add_header("Authorization", "Bearer " + self.apikey)
+        pid = profile if profile is not None else self.profile
+        if pid:
+            req.add_header("X-Profile-Id", pid)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode() or "null")
+
+    def _post(self, path, body, profile=None):
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(self.base + path, data=data, method="POST")
+        if self.apikey:
+            req.add_header("Authorization", "Bearer " + self.apikey)
+        req.add_header("Content-Type", "application/json")
+        pid = profile if profile is not None else self.profile
+        if pid:
+            req.add_header("X-Profile-Id", pid)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode() or "null")
+
+    def unmatched(self, limit=100, offset=0):
+        try:
+            d = self._get("/libraries/unmatched-items?limit=%d&offset=%d" % (limit, offset))
+            return d.get("items") or []
+        except Exception:
+            return []
+
+    def match_search(self, cid, query, year=None):
+        body = {"query": query}
+        if year:
+            body["year"] = year
+        try:
+            return self._post("/admin/items/%s/match/search" % urllib.parse.quote(cid, safe=""), body).get("candidates") or []
+        except Exception:
+            return []
+
+    def match_apply(self, cid, provider_ids, library_id):
+        try:
+            self._post("/admin/items/%s/match/apply" % urllib.parse.quote(cid, safe=""),
+                       {"provider_ids": provider_ids, "library_id": library_id})
+            return True
+        except Exception:
+            return False
+
+    def sessions(self):
+        try:
+            d = self._get("/admin/sessions")
+            return d if isinstance(d, list) else (d.get("sessions") or [])
+        except Exception:
+            return []
+
+    def profiles(self):
+        try:
+            d = self._get("/profiles")
+            return (d.get("profiles") if isinstance(d, dict) else d) or []
+        except Exception:
+            return []
+
+    def item_files(self, content_id):
+        """Host file path(s) for a content_id (movie or episode), highest-res first."""
+        try:
+            d = self._get("/catalog/items/" + urllib.parse.quote(content_id, safe=""))
+        except Exception:
+            return []
+        vers = list(d.get("versions") or [])
+        def rank(v):
+            r = "".join(ch for ch in str(v.get("resolution") or "") if ch.isdigit())
+            return int(r) if r else 0
+        vers.sort(key=rank, reverse=True)
+        return [v["file_path"] for v in vers if v.get("file_path")]
+
+    def continue_watching(self, profile=None):
+        try:
+            if not self._cw_section:
+                lay = self._get("/home/layout", profile=profile)
+                for sec in (lay.get("sections") or []):
+                    if sec.get("section_type") == "continue_watching":
+                        self._cw_section = sec.get("id"); break
+            if not self._cw_section:
+                return []
+            d = self._get("/home/sections/%s/items" % self._cw_section, profile=profile)
+            sec = d.get("section") or d
+            return [it.get("content_id") for it in (sec.get("items") or []) if it.get("content_id")]
+        except Exception:
+            return []
+
+    def _episodes(self, series_id, season):
+        try:
+            d = self._get("/catalog/series/%s/seasons/%d/episodes" % (series_id, season))
+            return sorted(d.get("episodes") or [], key=lambda e: e.get("episode_number") or 0)
+        except Exception:
+            return []
+
+    def next_episode_files(self, ep_content_id, count):
+        m = re.match(r"episode-(.+)-(\d+)-(\d+)$", ep_content_id or "")
+        if not m:
+            return []
+        series_id = "series-" + m.group(1)
+        season = int(m.group(2)); ep = int(m.group(3))
+        wanted, out, guard = [], [], 0
+        eps = self._episodes(series_id, season)
+        idx = next((i for i, e in enumerate(eps) if (e.get("episode_number") or 0) == ep), -1)
+        nxt = eps[idx + 1:] if idx >= 0 else []
+        while len(wanted) < count and guard < 30:
+            guard += 1
+            if nxt:
+                cid = nxt.pop(0).get("content_id")
+                if cid:
+                    wanted.append(cid)
+            else:
+                season += 1
+                eps = self._episodes(series_id, season)
+                if not eps:
+                    break
+                nxt = eps[:]
+        for cid in wanted:
+            out += self.item_files(cid)
+        return out
+
+
+_warm_last_cw = [0.0]
+
+def _silo_targets(silo):
+    """Ordered, de-duped (reason, host_path) to warm from Silo this cycle."""
+    targets, seen = [], set()
+    def add(reason, path):
+        if path and path not in seen:
+            seen.add(path); targets.append((reason, path))
+    sessions = silo.sessions()
+    if "next" in WARM_SOURCES:                                  # next episode(s) of anything playing
+        for ss in sessions:
+            cid = ss.get("content_id") or ""
+            if not cid.startswith("episode-"):   # episode sessions report media_type "series"; the content_id is the tell
+                continue
+            if WARM_NEXT_NEAR_END > 0:                           # only once the current ep nears its end
+                try:
+                    remain_min = (float(ss.get("file_duration") or 0) - float(ss.get("position_seconds") or 0)) / 60.0
+                except Exception:
+                    remain_min = 0
+                if remain_min > WARM_NEXT_NEAR_END:
+                    continue
+            for f in _limit_parts(silo.next_episode_files(cid, WARM_NEXT_EPS)):
+                add("silo-next-ep", f)
+    # speculative Continue Watching warming pauses while anyone is streaming on Silo
+    if not WARM_LOW_CACHE and not sessions and time.time() - _warm_last_cw[0] >= WARM_ONDECK_EVERY:
+        _warm_last_cw[0] = time.time()
+        if WARM_ONDECK and "ondeck" in WARM_SOURCES:
+            profs = [SILO_PROFILE] if SILO_PROFILE else ([p.get("id") for p in silo.profiles()] or [None])
+            for pid in profs:
+                for cid in silo.continue_watching(pid):
+                    for f in _limit_parts(silo.item_files(cid)):
+                        add("silo-ondeck", f)
+    return targets
+
+
 def warm_cycle():
     if WARM_LOAD_MAX > 0 and host_load() > WARM_LOAD_MAX:
         log.info("[warmer] host load > %.0f -> skip cycle", WARM_LOAD_MAX); return
-    targets = _warm_targets(Plex(PLEX_URL, PLEX_TOKEN))
+    targets = _warm_targets(Plex(PLEX_URL, PLEX_TOKEN)) if PLEX_URL else []
+    if SILO_URL:
+        try:
+            targets = targets + _silo_targets(Silo(SILO_URL, SILO_APIKEY, SILO_PROFILE))
+        except Exception as e:
+            log.warning("[warmer] silo targets error: %s", str(e)[:80])
+    _seen = set(); _uniq = []
+    for _r, _p in targets:
+        if _p not in _seen:
+            _seen.add(_p); _uniq.append((_r, _p))
+    targets = _uniq
     done = 0
     for reason, path in targets:
         if done >= WARM_MAX_CYCLE:
@@ -2785,12 +3197,13 @@ def _wr_plex_rescan():
 
 
 CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_providers),
-          ("decypharr", EN_DECYPHARR, check_decypharr), ("plex", EN_PLEX, check_plex),
+          ("decypharr", EN_DECYPHARR, check_decypharr), ("plex", EN_PLEX, check_plex), ("silo", EN_SILO, check_silo), ("silo-rematch", SILO_REMATCH, check_silo_rematch),
           ("resources", EN_RESOURCES, check_resources), ("janitor", EN_JANITOR, check_janitor),
           ("scrubber", EN_SCRUBBER, check_scrubber),
           ("watchlists", EN_WATCHLISTS, check_watchlists),
           ("holidays", EN_HOLIDAYS, check_holidays),
           ("backlog", EN_BACKLOG, check_backlog),
+          ("repair", EN_REPAIR, check_repair),
           ("riven", EN_RIVEN, check_riven),
           ("mediastorm", EN_MEDIASTORM, check_mediastorm),
           ("bazarr", EN_BAZARR, check_bazarr), ("seerr", EN_SEERR, check_seerr),
@@ -2895,6 +3308,8 @@ def _ui_health():
     if PLEX_URL:
         jobs.append(("plex", "plex", lambda: (
             http_code(PLEX_URL.rstrip("/") + "/identity" + ("?X-Plex-Token=" + PLEX_TOKEN if PLEX_TOKEN else ""), t=5) == 200, "")))
+    if SILO_URL:
+        jobs.append(("silo", "silo", lambda: (http_code(SILO_URL.rstrip("/") + "/health", t=5) == 200, "")))
     if BAZARR_URL:
         jobs.append(("bazarr", "bazarr", lambda: (http_code(BAZARR_URL.rstrip("/") + "/api/system/status",
             headers={"X-API-KEY": BAZARR_APIKEY} if BAZARR_APIKEY else None, t=5) == 200, "")))
@@ -4470,7 +4885,7 @@ function scoutClear(id){fetch(q('/api/scout/clear'),{method:'POST',body:JSON.str
 var obMode='easy',obServices=[],obChecks={},obState={};
 var OB_INSTANCE_TYPES={radarr:1,radarr4k:1,sonarr:1,sonarr4k:1,prowlarr:1,riven:1,mediastorm:1};
 var OB_ADDABLE=['radarr','radarr4k','sonarr','sonarr4k','prowlarr','riven','mediastorm','seerr','bazarr'];
-var OB_CHECKS=[['ENABLE_QUEUE','queue'],['ENABLE_SCOUT','scout'],['ENABLE_PLEX','plex'],['ENABLE_DECYPHARR','decypharr'],
+var OB_CHECKS=[['ENABLE_QUEUE','queue'],['ENABLE_SCOUT','scout'],['ENABLE_PLEX','plex'],['ENABLE_SILO','silo'],['ENABLE_DECYPHARR','decypharr'],
  ['ENABLE_PROVIDERS','providers'],['ENABLE_RESOURCES','resources'],['ENABLE_JANITOR','janitor'],['ENABLE_WATCHLISTS','watchlists'],
  ['ENABLE_HOLIDAYS','holidays'],['ENABLE_BACKLOG','backlog'],['ENABLE_RIVEN','riven'],['ENABLE_MEDIASTORM','mediastorm'],
  ['ENABLE_SEERR','seerr'],['ENABLE_BAZARR','bazarr'],['ENABLE_SCRUBBER','scrubber'],['ENABLE_WARMER','warmer']];
