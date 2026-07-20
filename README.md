@@ -25,6 +25,7 @@ container, everything configured by env vars.
 | **queue** | stuck/dead/blocked *arr download-queue items | per-condition fix action: `report`, `research` (remove + blocklist -> re-search), `remove` (no blocklist), or `force_import` (ManualImport files already on disk) |
 | **providers** | failed indexers / download clients (sonarr/radarr/**prowlarr**) | runs the **Test** on them to re-validate + clear the failure |
 | **decypharr** | hung FUSE mount (read-test) + API down | runs your restart hook (`DECYPHARR_RESTART_CMD`) |
+| **altmount** | [AltMount](https://github.com/javi11/altmount) usenet WebDAV+FUSE mount feeding the *arrs: SAB API down, hung mount (read-test), root-owned NZB staging dirs (a footgun that silently fails every import), and consumers whose bind mount can't see the FUSE submount (so new content never scans in) | restarts via `ALTMOUNT_RESTART_CMD`, auto-heals wrongly-owned staging dirs, and flags/repairs stale consumer mounts (`ALTMOUNT_PROP_CHECKS`) |
 | **plex** | Plex unresponsive | alerts (optional library refresh) |
 | **resources** | host load / low memory / swap pressure | reports; optional `drop_caches` relief |
 | **janitor** | permanently-dead usenet releases (from decypharr's log) | quarantines those library symlinks (reversible) |

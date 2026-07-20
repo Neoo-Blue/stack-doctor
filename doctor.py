@@ -106,6 +106,7 @@ EN_QUEUE      = _b("ENABLE_QUEUE", True)
 EN_DECYPHARR  = _b("ENABLE_DECYPHARR", False)
 EN_PLEX       = _b("ENABLE_PLEX", False)
 EN_SILO       = _b("ENABLE_SILO", False)       # Silo self-hosted media server health
+EN_ALTMOUNT   = _b("ENABLE_ALTMOUNT", False)   # AltMount usenet WebDAV+FUSE mount (SAB API, mount stall, media-owned staging dirs, consumer propagation)
 EN_RESOURCES  = _b("ENABLE_RESOURCES", False)
 EN_JANITOR    = _b("ENABLE_JANITOR", False)
 EN_PROVIDERS  = _b("ENABLE_PROVIDERS", False)   # auto-test failed indexers/download clients (sonarr/radarr/prowlarr)
@@ -222,6 +223,24 @@ DECY_URL          = os.environ.get("DECYPHARR_URL", "")             # e.g. http:
 DECY_MOUNT_TEST   = os.environ.get("DECYPHARR_MOUNT_TEST", "")      # a dir on the FUSE mount to read-test
 DECY_READ_TIMEOUT = _i("DECYPHARR_READ_TIMEOUT", 25)
 DECY_RESTART_CMD  = os.environ.get("DECYPHARR_RESTART_CMD", "")     # shell cmd to recover a hung mount
+
+# altmount (usenet WebDAV + rclone FUSE mount; a SABnzbd-compatible download client for the *arrs)
+ALT_URL           = os.environ.get("ALTMOUNT_URL", "")             # e.g. http://192.168.50.202:8080
+ALT_APIKEY        = os.environ.get("ALTMOUNT_APIKEY", "")          # SAB api key (masked in the dashboard)
+ALT_MOUNT_TEST    = os.environ.get("ALTMOUNT_MOUNT_TEST", "")      # a dir on the FUSE mount to read-test, e.g. /mnt/library/altmount
+ALT_READ_TIMEOUT  = _i("ALTMOUNT_READ_TIMEOUT", 25)
+ALT_RESTART_CMD   = os.environ.get("ALTMOUNT_RESTART_CMD", "")     # shell cmd to recover a hung mount/dead service, e.g. "systemctl restart altmount"
+# AltMount stages incoming NZBs under these temp dirs. If it is ever started as root they get created
+# root-owned, and every later import silently fails ("Failed to save file" / "move to persistent
+# storage: permission denied") once it is back on the media uid. Guard + auto-heal that footgun.
+ALT_TMP_DIRS      = [p.strip() for p in os.environ.get("ALTMOUNT_TMP_DIRS", "/tmp/altmount-uploads,/tmp/.altmount-queue").split(",") if p.strip()]
+ALT_TMP_UID       = _i("ALTMOUNT_TMP_UID", 1000)                   # uid AltMount runs as (media); staging dirs must be owned by it
+ALT_FIX_TMP       = _b("ALTMOUNT_FIX_TMP", True)                   # remove wrongly-owned staging dirs so AltMount recreates them
+# propagation guard: a consumer (autopulse/plex/silo) whose /mnt/library bind is rprivate never sees
+# the altmount submount, so new imports never scan into that app. Each entry is "label=command" and
+# must exit 0 when healthy, e.g. "autopulse=pct exec 106 -- docker exec autopulse mountpoint -q /mnt/library/altmount".
+ALT_PROP_CHECKS   = [p.strip() for p in os.environ.get("ALTMOUNT_PROP_CHECKS", "").split(";") if p.strip()]
+ALT_PROP_FIX_CMD  = os.environ.get("ALTMOUNT_PROP_FIX_CMD", "")    # optional shell cmd to repair a stale consumer mount
 
 # plex
 PLEX_URL   = os.environ.get("PLEX_URL", "")
@@ -888,6 +907,70 @@ def check_decypharr():
     log.error("[decypharr] running restart hook: %s", DECY_RESTART_CMD)
     rc = run_cmd(DECY_RESTART_CMD); _decy_last_restart[0] = time.time()
     log.error("[decypharr] restart hook rc=%s %s", rc[0] if rc else "?", rc[1] if rc else "")
+
+# =========================================================================== #
+# CHECK: altmount  (usenet WebDAV + rclone FUSE mount feeding the *arrs)
+# =========================================================================== #
+
+_alt_last_restart = [0.0]
+
+def check_altmount():
+    # 1. SABnzbd-compatible API reachability - this is what the *arrs actually talk to
+    if ALT_URL:
+        base = ALT_URL.rstrip("/")
+        url = base + "/sabnzbd/api?mode=version" + ("&apikey=" + ALT_APIKEY if ALT_APIKEY else "")
+        c = http_code(url, t=10)
+        if c == 200:
+            log.info("[altmount] api %s -> 200 OK", ALT_URL)
+        else:
+            log.error("[altmount] api %s -> %s (unresponsive)", ALT_URL, c if c else "DOWN")
+
+    # 2. staging-dir ownership guard: root-owned dirs make every import fail silently
+    if ALT_FIX_TMP:
+        for d in ALT_TMP_DIRS:
+            try:
+                uid = os.stat(d).st_uid
+            except FileNotFoundError:
+                continue  # not created yet -> AltMount will make it correctly on first addfile
+            except Exception as e:
+                log.debug("[altmount] stat %s: %s", d, e); continue
+            if uid == ALT_TMP_UID:
+                continue
+            log.error("[altmount] staging dir %s owned by uid %s (need %s) -> imports will fail", d, uid, ALT_TMP_UID)
+            if DRY_RUN:
+                log.error("[altmount] dry-run: would remove %s so AltMount recreates it media-owned", d); continue
+            rc = run_cmd("rm -rf -- '%s'" % d.replace("'", "'\\''"))
+            log.error("[altmount] removed stale-owned staging dir %s rc=%s", d, rc[0] if rc else "?")
+
+    # 3. propagation guard: a consumer with an rprivate bind never sees the mount, so imports never scan in
+    for entry in ALT_PROP_CHECKS:
+        label, _, cmd = entry.partition("=")
+        if not cmd:
+            continue
+        rc = run_cmd(cmd)
+        if rc and rc[0] == 0:
+            log.info("[altmount] propagation %s OK", label.strip()); continue
+        log.error("[altmount] propagation %s STALE (consumer can't see the mount -> new content won't scan in)", label.strip())
+        if ALT_PROP_FIX_CMD and not DRY_RUN:
+            fx = run_cmd(ALT_PROP_FIX_CMD)
+            log.error("[altmount] propagation fix rc=%s %s", fx[0] if fx else "?", fx[1] if fx else "")
+
+    # 4. mount read test (FUSE stall guard) + restart remediation
+    if not ALT_MOUNT_TEST:
+        return
+    ok = _read_test(ALT_MOUNT_TEST, ALT_READ_TIMEOUT)
+    if ok is None:
+        log.warning("[altmount] mount %s: no test file found / unlistable", ALT_MOUNT_TEST); return
+    if ok:
+        log.info("[altmount] mount %s read OK", ALT_MOUNT_TEST); return
+    log.error("[altmount] mount %s READ HUNG (FUSE stall)", ALT_MOUNT_TEST)
+    if DRY_RUN or not ALT_RESTART_CMD:
+        log.error("[altmount] no restart cmd set (or dry-run) -> alert only"); return
+    if time.time() - _alt_last_restart[0] < 300:
+        log.warning("[altmount] restarted <5m ago, holding off"); return
+    log.error("[altmount] running restart hook: %s", ALT_RESTART_CMD)
+    rc = run_cmd(ALT_RESTART_CMD); _alt_last_restart[0] = time.time()
+    log.error("[altmount] restart hook rc=%s %s", rc[0] if rc else "?", rc[1] if rc else "")
 
 # =========================================================================== #
 # CHECK: plex
@@ -3197,7 +3280,7 @@ def _wr_plex_rescan():
 
 
 CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_providers),
-          ("decypharr", EN_DECYPHARR, check_decypharr), ("plex", EN_PLEX, check_plex), ("silo", EN_SILO, check_silo), ("silo-rematch", SILO_REMATCH, check_silo_rematch),
+          ("decypharr", EN_DECYPHARR, check_decypharr), ("altmount", EN_ALTMOUNT, check_altmount), ("plex", EN_PLEX, check_plex), ("silo", EN_SILO, check_silo), ("silo-rematch", SILO_REMATCH, check_silo_rematch),
           ("resources", EN_RESOURCES, check_resources), ("janitor", EN_JANITOR, check_janitor),
           ("scrubber", EN_SCRUBBER, check_scrubber),
           ("watchlists", EN_WATCHLISTS, check_watchlists),
@@ -3235,11 +3318,17 @@ _SECRET_HINT = ("APIKEY", "API_KEY", "TOKEN", "PASSWORD", "PASS", "SECRET")
 UI_SCHEMA = [
     ("Mode", [("DOCTOR_MODE", "cron|event"), ("DOCTOR_INTERVAL", "900"),
               ("DOCTOR_DRY_RUN", "false"), ("DOCTOR_LOG_LEVEL", "INFO")]),
-    ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
+    ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""), ("ENABLE_ALTMOUNT", ""),
               ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""), ("ENABLE_SCRUBBER", ""),
               ("ENABLE_WATCHLISTS", ""), ("ENABLE_HOLIDAYS", ""), ("ENABLE_BACKLOG", ""),
               ("ENABLE_RIVEN", ""), ("ENABLE_MEDIASTORM", ""),
               ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", "")]),
+    ("AltMount (usenet WebDAV + mount)", [("ALTMOUNT_URL", "http://192.168.50.202:8080"),
+              ("ALTMOUNT_APIKEY", "sab api key"), ("ALTMOUNT_MOUNT_TEST", "/mnt/library/altmount"),
+              ("ALTMOUNT_RESTART_CMD", "systemctl restart altmount"), ("ALTMOUNT_TMP_UID", "1000"),
+              ("ALTMOUNT_FIX_TMP", "true|false"), ("ALTMOUNT_TMP_DIRS", "/tmp/altmount-uploads,/tmp/.altmount-queue"),
+              ("ALTMOUNT_PROP_CHECKS", "autopulse=pct exec 106 -- docker exec autopulse mountpoint -q /mnt/library/altmount"),
+              ("ALTMOUNT_PROP_FIX_CMD", "")]),
     ("Watchlists (Plex Home + friends -> arrs)", [
               ("WATCHLISTS_FRIENDS", "alice:xxxx,bob:yyyy"),
               ("WATCHLISTS_INCLUDE_HOME", "true|false"),
@@ -3310,6 +3399,9 @@ def _ui_health():
             http_code(PLEX_URL.rstrip("/") + "/identity" + ("?X-Plex-Token=" + PLEX_TOKEN if PLEX_TOKEN else ""), t=5) == 200, "")))
     if SILO_URL:
         jobs.append(("silo", "silo", lambda: (http_code(SILO_URL.rstrip("/") + "/health", t=5) == 200, "")))
+    if ALT_URL:
+        jobs.append(("altmount", "mount", lambda: (
+            http_code(ALT_URL.rstrip("/") + "/sabnzbd/api?mode=version" + ("&apikey=" + ALT_APIKEY if ALT_APIKEY else ""), t=5) == 200, ALT_URL)))
     if BAZARR_URL:
         jobs.append(("bazarr", "bazarr", lambda: (http_code(BAZARR_URL.rstrip("/") + "/api/system/status",
             headers={"X-API-KEY": BAZARR_APIKEY} if BAZARR_APIKEY else None, t=5) == 200, "")))
