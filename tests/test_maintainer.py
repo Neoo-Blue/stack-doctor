@@ -28,18 +28,21 @@ class PulsarrTagsTest(unittest.TestCase):
 
 
 class TagUsersTest(unittest.TestCase):
-    def test_extracts_username_from_tag(self):
-        self.assertEqual(_tag_users({"pulsarr-alice"}, "pulsarr-"), {"alice"})
+    def test_extracts_username_from_user_tag(self):
+        self.assertEqual(_tag_users({"pulsarr-user-alice"}, "pulsarr"), {"alice"})
 
     def test_multiple_users(self):
-        self.assertEqual(_tag_users({"pulsarr-alice", "pulsarr-bob"}, "pulsarr-"),
+        self.assertEqual(_tag_users({"pulsarr-user-alice", "pulsarr-user-bob"}, "pulsarr"),
                          {"alice", "bob"})
 
+    def test_base_pulsarr_tag_ignored(self):
+        self.assertEqual(_tag_users({"pulsarr"}, "pulsarr"), set())
+
     def test_empty_suffix_handled(self):
-        self.assertEqual(_tag_users({"pulsarr-"}, "pulsarr-"), set())
+        self.assertEqual(_tag_users({"pulsarr-user-"}, "pulsarr"), set())
 
     def test_empty_labels(self):
-        self.assertEqual(_tag_users(set(), "pulsarr-"), set())
+        self.assertEqual(_tag_users(set(), "pulsarr"), set())
 
 
 class SeriesEligibilityTest(unittest.TestCase):
@@ -57,7 +60,7 @@ class SeriesEligibilityTest(unittest.TestCase):
 
     def test_eligible_ended_old_unwatched_pulsarr_tagged(self):
         series = self._make_series()
-        tag_map = {1: "pulsarr-test"}
+        tag_map = {1: "pulsarr-user-test"}
         with patch("doctor.checks.maintainer.MAINTAINER_MIN_YEAR", 2024), \
              patch("doctor.checks.maintainer.MAINTAINER_MIN_AGE_DAYS", 0):
             self.assertTrue(_series_is_eligible(series, set(), tag_map, "pulsarr-", self._now(), "tagged"))
@@ -142,7 +145,7 @@ class CheckMaintainerIntegrationTest(unittest.TestCase):
         arr = MagicMock()
         arr.name = name
         arr.kind = "sonarr"
-        arr.tag_map.return_value = {1: "pulsarr-plexuser"}
+        arr.tag_map.return_value = {1: "pulsarr-user-plexuser"}
         arr.series.return_value = series_list or []
         return arr
 
@@ -170,11 +173,12 @@ class CheckMaintainerIntegrationTest(unittest.TestCase):
              patch("doctor.checks.maintainer.MAINTAINER_LIBRARY_TITLE", "shows"), \
              patch("doctor.checks.maintainer.MAINTAINER_UNWATCHED_DAYS", 30), \
              patch("doctor.checks.maintainer.MAINTAINER_MIN_AGE_DAYS", 0), \
-             patch("doctor.checks.maintainer.MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr-"), \
+             patch("doctor.checks.maintainer.MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr"), \
              patch("doctor.checks.maintainer.MAINTAINER_RECHECK", 86400), \
              patch("doctor.checks.maintainer.MAINTAINER_MODE", "tagged"), \
              patch("doctor.checks.maintainer.MAINTAINER_PLEX_SECTION_KEY", 0), \
-             patch("doctor.checks.maintainer.PULSARR_DB_PATH", ""), \
+             patch("doctor.checks.maintainer.PULSARR_URL", ""), \
+             patch("doctor.checks.maintainer.PULSARR_APIKEY", ""), \
              patch("doctor.checks.maintainer.INSTANCES", [arr]), \
              patch("doctor.clients.tautulli.Tautulli.recently_watched_shows",
                    return_value=set()) as _mock_taut, \
@@ -203,11 +207,12 @@ class CheckMaintainerIntegrationTest(unittest.TestCase):
              patch("doctor.checks.maintainer.MAINTAINER_LIBRARY_TITLE", "shows"), \
              patch("doctor.checks.maintainer.MAINTAINER_UNWATCHED_DAYS", 30), \
              patch("doctor.checks.maintainer.MAINTAINER_MIN_AGE_DAYS", 0), \
-             patch("doctor.checks.maintainer.MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr-"), \
+             patch("doctor.checks.maintainer.MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr"), \
              patch("doctor.checks.maintainer.MAINTAINER_RECHECK", 86400), \
              patch("doctor.checks.maintainer.MAINTAINER_MODE", "tagged"), \
              patch("doctor.checks.maintainer.MAINTAINER_PLEX_SECTION_KEY", 0), \
-             patch("doctor.checks.maintainer.PULSARR_DB_PATH", ""), \
+             patch("doctor.checks.maintainer.PULSARR_URL", ""), \
+             patch("doctor.checks.maintainer.PULSARR_APIKEY", ""), \
              patch("doctor.checks.maintainer.INSTANCES", [arr]), \
              patch("doctor.clients.tautulli.Tautulli.recently_watched_shows",
                    return_value=set()), \
@@ -234,11 +239,12 @@ class CheckMaintainerIntegrationTest(unittest.TestCase):
              patch("doctor.checks.maintainer.MAINTAINER_LIBRARY_TITLE", "shows"), \
              patch("doctor.checks.maintainer.MAINTAINER_UNWATCHED_DAYS", 30), \
              patch("doctor.checks.maintainer.MAINTAINER_MIN_AGE_DAYS", 0), \
-             patch("doctor.checks.maintainer.MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr-"), \
+             patch("doctor.checks.maintainer.MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr"), \
              patch("doctor.checks.maintainer.MAINTAINER_RECHECK", 86400), \
              patch("doctor.checks.maintainer.MAINTAINER_MODE", "tagged"), \
              patch("doctor.checks.maintainer.MAINTAINER_PLEX_SECTION_KEY", 0), \
-             patch("doctor.checks.maintainer.PULSARR_DB_PATH", ""), \
+             patch("doctor.checks.maintainer.PULSARR_URL", ""), \
+             patch("doctor.checks.maintainer.PULSARR_APIKEY", ""), \
              patch("doctor.checks.maintainer.INSTANCES", [arr]), \
              patch("doctor.clients.tautulli.Tautulli.recently_watched_shows",
                    return_value={"Watched Show"}) as _mock_taut, \
@@ -265,7 +271,7 @@ class CheckMaintainerIntegrationTest(unittest.TestCase):
             sid=42, title="Arrow", status="ended", year=2012, tags=[1, 2],
         )]
         arr = self._make_sonarr_instance(name="sonarr-shows", series_list=series)
-        arr.tag_map.return_value = {1: "pulsarr-alice", 2: "pulsarr-bob"}
+        arr.tag_map.return_value = {1: "pulsarr-user-alice", 2: "pulsarr-user-bob"}
 
         with patch("doctor.checks.maintainer.EN_MAINTAINER", True), \
              patch("doctor.checks.maintainer.TAUTULLI_URL", "http://taut:8181"), \
@@ -276,11 +282,12 @@ class CheckMaintainerIntegrationTest(unittest.TestCase):
              patch("doctor.checks.maintainer.MAINTAINER_LIBRARY_TITLE", "shows"), \
              patch("doctor.checks.maintainer.MAINTAINER_UNWATCHED_DAYS", 30), \
              patch("doctor.checks.maintainer.MAINTAINER_MIN_AGE_DAYS", 0), \
-             patch("doctor.checks.maintainer.MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr-"), \
+             patch("doctor.checks.maintainer.MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr"), \
              patch("doctor.checks.maintainer.MAINTAINER_RECHECK", 86400), \
              patch("doctor.checks.maintainer.MAINTAINER_MODE", "tagged"), \
              patch("doctor.checks.maintainer.MAINTAINER_PLEX_SECTION_KEY", 0), \
-             patch("doctor.checks.maintainer.PULSARR_DB_PATH", ""), \
+             patch("doctor.checks.maintainer.PULSARR_URL", ""), \
+             patch("doctor.checks.maintainer.PULSARR_APIKEY", ""), \
              patch("doctor.checks.maintainer.INSTANCES", [arr]), \
              patch("doctor.clients.tautulli.Tautulli.recently_watched_shows",
                    return_value=set()) as _mock_taut, \
@@ -320,11 +327,12 @@ class CheckMaintainerIntegrationTest(unittest.TestCase):
              patch("doctor.checks.maintainer.MAINTAINER_LIBRARY_TITLE", "shows"), \
              patch("doctor.checks.maintainer.MAINTAINER_UNWATCHED_DAYS", 30), \
              patch("doctor.checks.maintainer.MAINTAINER_MIN_AGE_DAYS", 0), \
-             patch("doctor.checks.maintainer.MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr-"), \
+             patch("doctor.checks.maintainer.MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr"), \
              patch("doctor.checks.maintainer.MAINTAINER_RECHECK", 86400), \
              patch("doctor.checks.maintainer.MAINTAINER_MODE", "tagged"), \
              patch("doctor.checks.maintainer.MAINTAINER_PLEX_SECTION_KEY", 0), \
-             patch("doctor.checks.maintainer.PULSARR_DB_PATH", ""), \
+             patch("doctor.checks.maintainer.PULSARR_URL", ""), \
+             patch("doctor.checks.maintainer.PULSARR_APIKEY", ""), \
              patch("doctor.checks.maintainer.INSTANCES", [arr]), \
              patch("doctor.clients.tautulli.Tautulli.recently_watched_shows",
                    return_value={"Arrow"}) as _mock_taut, \

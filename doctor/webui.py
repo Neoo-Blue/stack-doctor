@@ -51,21 +51,11 @@ UI_SCHEMA = [
               ("MISSING_SEASONS_RECHECK", "24h")]),
     ("No-Upgrade Profile", [("NO_UPGRADE_PROFILE_NAME", "WEB-1080p (No Upgrade)"),
               ("NO_UPGRADE_PROFILE_ID", "0")]),
-    ("("Library Maintainer", [("TAUTULLI_URL", "http://tautulli:8181"), ("TAUTULLI_APIKEY", ""),
-              ("PULSARR_URL", "http://pulsarr:3003"), ("PULSARR_APIKEY", ""),
-              ("PULSARR_DB_PATH", "/var/lib/docker/volumes/pulsarr-config/_data/db/pulsarr.db"),
-              ("MAINTAINER_MAX_ACTIONS", "5"), ("MAINTAINER_UNWATCHED_DAYS", "30"),
-              ("MAINTAINER_MIN_YEAR", "2024"), ("MAINTAINER_MIN_AGE_DAYS", "30"),
-              ("MAINTAINER_MODE", "tagged|all"), ("MAINTAINER_PLEX_SECTION_KEY", "0"),
-              ("MAINTAINER_LIBRARY_TITLE", "shows"),
-              ("MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr-"),
-              ("MAINTAINER_RECHECK", "24h")]),
-
     ("Seerr (failed-request retry)", [("SEERR_URL", "http://overseerr:5055"), ("SEERR_APIKEY", ""),
               ("SEERR_RETRY_MAX", "10"), ("SEERR_MAX_ATTEMPTS", "5")]),
     ("Library Maintainer", [("TAUTULLI_URL", "http://tautulli:8181"), ("TAUTULLI_APIKEY", ""),
               ("PULSARR_URL", "http://pulsarr:3003"), ("PULSARR_APIKEY", ""),
-              ("PULSARR_DB_PATH", "/var/lib/docker/volumes/pulsarr-config/_data/db/pulsarr.db"),
+              ("PULSARR_DB_PATH", "/pulsarr-data/db/pulsarr.db"),
               ("MAINTAINER_MAX_ACTIONS", "5"), ("MAINTAINER_UNWATCHED_DAYS", "30"),
               ("MAINTAINER_MIN_YEAR", "2024"), ("MAINTAINER_MIN_AGE_DAYS", "30"),
               ("MAINTAINER_MODE", "tagged|all"), ("MAINTAINER_PLEX_SECTION_KEY", "0"),
@@ -113,7 +103,7 @@ def _ui_health():
             t=5) == 200, "")))
     if PULSARR_URL:
         jobs.append(("pulsarr", "pulsarr", lambda: (http_code(
-            PULSARR_URL.rstrip("/") + "/v1/system/health",
+            PULSARR_URL.rstrip("/") + "/health",
             headers={"x-api-key": PULSARR_APIKEY}, t=5) == 200, "")))
     out = [None] * len(jobs)
     def run(i, name, kind, fn):
