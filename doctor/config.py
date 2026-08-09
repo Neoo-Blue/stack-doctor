@@ -1,9 +1,6 @@
-"""Configuration, logging, and small generic helpers (env-driven)."""
+"""Configuration and small generic helpers (env-driven)."""
 import os
-import sys
 import json
-import logging
-import logging.handlers
 
 VERSION = "0.3"
 def _b(name: str, default: bool = False) -> bool:
@@ -77,8 +74,9 @@ def _check_interval(cid, speed, default_iv=None):
     if default_iv is not None:
         return int(default_iv)
     return FAST_INTERVAL if speed == "fast" else SLOW_INTERVAL
-EN_QUEUE      = _b("ENABLE_QUEUE", True)
-EN_DECYPHARR  = _b("ENABLE_DECYPHARR", False)
+EN_QUEUE              = _b("ENABLE_QUEUE", True)
+EN_DECYPHARR          = _b("ENABLE_DECYPHARR", False)
+EN_DECYPHARR_PROVIDERS = _b("ENABLE_DECYPHARR_PROVIDERS", False)
 EN_PLEX       = _b("ENABLE_PLEX", False)
 EN_RESOURCES  = _b("ENABLE_RESOURCES", False)
 EN_JANITOR    = _b("ENABLE_JANITOR", False)
@@ -141,6 +139,9 @@ DECY_MOUNT_TEST   = os.environ.get("DECYPHARR_MOUNT_TEST", "")      # a dir on t
 DECY_READ_TIMEOUT = _i("DECYPHARR_READ_TIMEOUT", 25)
 DECY_RESTART_CMD  = os.environ.get("DECYPHARR_RESTART_CMD", "")     # shell cmd to recover a hung mount
 DECY_FUSE_STRIKES = _i("DECYPHARR_FUSE_STRIKES", 2)                 # consecutive failures before restart hook fires
+# ---- decypharr repair trigger (ask decypharr to run its own repair sweep) ----
+DECY_REPAIR_TRIGGER   = _b("DECYPHARR_REPAIR_TRIGGER", True)       # ask decypharr to repair on stack-doctor sweep
+DECY_REPAIR_INTERVAL  = _dur(os.environ.get("DECYPHARR_REPAIR_INTERVAL", "2h"), 7200)  # min seconds between triggers
 # ---- decypharr link-error cache poisoning detector ----
 # decypharr caches ALL provider errors (including transient RD CDN errors like
 # read_pxy_timeout) as permanent in-memory validation failures.  Once poisoned
@@ -150,6 +151,19 @@ DECY_LINK_ERR_LOG_CMD   = os.environ.get("DECYPHARR_LINK_ERR_LOG_CMD", "")  # cm
 DECY_LINK_ERR_THRESHOLD = _i("DECYPHARR_LINK_ERR_THRESHOLD", 20)    # errors in window before acting (default 20)
 DECY_LINK_ERR_WINDOW    = _dur(os.environ.get("DECYPHARR_LINK_ERR_WINDOW", "10m"), 600)  # rolling window in seconds (default 10m)
 DECY_LINK_ERR_RESTART   = _b("DECYPHARR_LINK_ERR_RESTART", True)    # restart decypharr when threshold hit (uses DECY_RESTART_CMD)
+# ---- decypharr provider health / auto-disable ----
+# Watches decypharr's log for per-provider seedbox/add failures and, when a provider
+# is consistently failing, removes it from decypharr/config.json and restarts decypharr.
+# The original provider block is saved in stack-doctor state for later re-enable.
+DCP_LOG_CMD             = os.environ.get("DECYPHARR_PROVIDERS_LOG_CMD", "")  # log source; falls back to janitor log cmd
+DCP_LOG                 = os.environ.get("DECYPHARR_PROVIDERS_LOG", "")      # or a plain log file path
+DCP_CONFIG_PATH         = os.environ.get("DECYPHARR_CONFIG_PATH", "/data/decypharr/config.json")
+DCP_THRESHOLD           = _i("DECYPHARR_PROVIDERS_THRESHOLD", 5)    # failed submissions in window before provider is considered broken
+DCP_WINDOW              = _dur(os.environ.get("DECYPHARR_PROVIDERS_WINDOW", "10m"), 600)
+DCP_AUTO_DISABLE        = _b("DECYPHARR_PROVIDERS_AUTO_DISABLE", True)
+DCP_COOLDOWN            = _dur(os.environ.get("DECYPHARR_PROVIDERS_COOLDOWN", "1h"), 3600)  # before attempting re-enable
+DCP_REENABLE            = _b("DECYPHARR_PROVIDERS_REENABLE", True)  # test provider API and re-add after cooldown
+DCP_PROVIDERS_RESTART_CMD = os.environ.get("DECYPHARR_PROVIDERS_RESTART_CMD", DECY_RESTART_CMD or "docker restart decypharr")
 PLEX_URL   = os.environ.get("PLEX_URL", "")
 PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
 PLEX_SCAN  = _b("PLEX_SCAN_ON_CHECK", False)
@@ -205,59 +219,96 @@ REPAIR_ORPHAN_SCAN      = _b("REPAIR_ORPHAN_SCAN", True)             # report de
 REPAIR_HIERARCHICAL_SEARCH = _b("REPAIR_HIERARCHICAL_SEARCH", False)  # prefer series/season/episode searches based on airing status
 REPAIR_HIERARCHICAL_FALLBACK = _b("REPAIR_HIERARCHICAL_FALLBACK", True)  # fall back to narrower search if wider search finds nothing
 REPAIR_SEASON_ENDED_THRESHOLD = _dur(os.environ.get("REPAIR_SEASON_ENDED_THRESHOLD", "7d"), 604800)  # how long after last aired date to treat a season as ended
+EN_RESCAN               = _b("ENABLE_RESCAN", False)
+RESCAN_LIBRARY_PATHS    = [p.strip() for p in os.environ.get("RESCAN_LIBRARY_PATHS",
+                           os.environ.get("REPAIR_LIBRARY_PATHS", "")).split(",") if p.strip()]
+RESCAN_MAX_ACTIONS      = _i("RESCAN_MAX_ACTIONS", 5)        # partial Plex scans per sweep (keep low to avoid DB hammering)
+RESCAN_SCAN_DELAY       = _i("RESCAN_SCAN_DELAY", 60)        # seconds between partial scans
+RESCAN_MAX_WAIT         = _dur(os.environ.get("RESCAN_MAX_WAIT", "10m"), 600)  # max time to wait for Plex to finish a scan before giving up
+RESCAN_COOLDOWN         = _dur(os.environ.get("RESCAN_COOLDOWN", "1h"), 3600)  # don't rescan same missing folder within this window
+RESCAN_INTERVAL         = _dur(os.environ.get("RESCAN_INTERVAL", "15m"), 900)  # seconds between rescan sweeps
+RESCAN_LOAD_MAX         = _f("RESCAN_LOAD_MAX", 0)           # skip sweep if 1-min load above this (0=off)
+RESCAN_PLEX_RESPONSIVE_TIMEOUT = _f("RESCAN_PLEX_RESPONSIVE_TIMEOUT", 3.0)  # abort if Plex root ping takes longer than this
+RESCAN_DECYPHARR_REPAIR_BACKOFF = _b("RESCAN_DECYPHARR_REPAIR_BACKOFF", True)  # skip sweep while decypharr repair is active
+RESCAN_INCREMENTAL      = _b("RESCAN_INCREMENTAL", True)      # only scan files/parents changed since last sweep
+RESCAN_FULL_INTERVAL    = _dur(os.environ.get("RESCAN_FULL_INTERVAL", "24h"), 86400)  # do a full walk this often
+RESCAN_SECTIONS_CACHE_TTL = _dur(os.environ.get("RESCAN_SECTIONS_CACHE_TTL", "5m"), 300)  # cache Plex sections/locations
+RESCAN_JANITOR_CANDIDATES = _b("RESCAN_JANITOR_CANDIDATES", True)  # use janitor dead-files as candidate parents
+RESCAN_ARR_QUEUE_BACKOFF = _b("RESCAN_ARR_QUEUE_BACKOFF", True)  # skip sweep while *arr has active queue items
+RESCAN_ARR_QUEUE_MAX = _i("RESCAN_ARR_QUEUE_MAX", 0)            # skip if any *arr queue exceeds this (0=any)
+RESCAN_FULL_REFRESH_THRESHOLD = _i("RESCAN_FULL_REFRESH_THRESHOLD", 0)  # full-section refresh if >N parents missing (0=off)
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
-handlers = [logging.StreamHandler(sys.stdout)]
-if LOG_FILE:
-    try:
-        os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
-        handlers.append(logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3))
-    except Exception:
-        pass
-class _ColorFormatter(logging.Formatter):
-    _GREY    = "\033[90m"
-    _GREEN   = "\033[32m"
-    _YELLOW  = "\033[33m"
-    _RED     = "\033[31m"
-    _BRED    = "\033[1;31m"
-    _CYAN    = "\033[36m"
-    _RESET   = "\033[0m"
-    _LEVEL   = {
-        "DEBUG":    "\033[36m",
-        "INFO":     "\033[32m",
-        "WARNING":  "\033[33m",
-        "ERROR":    "\033[31m",
-        "CRITICAL": "\033[1;31m",
-    }
-    def format(self, record):
-        # Let the base class assemble the full message, including exc_info/exc_text/stack_info
-        full  = super().format(record)
-        ts    = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
-        lvl   = record.levelname
-        lc    = self._LEVEL.get(lvl, "")
-        # The base formatter produces "ts | LEVEL | name | msg[\ntraceback]"
-        # We replace only the first line's header; any trailing traceback lines are kept as-is
-        first_line, *rest = full.splitlines()
-        header = (f"{self._GREY}{ts}{self._RESET} "
-                  f"{lc}| {lvl:<7} |{self._RESET} "
-                  f"{self._CYAN}{record.name}{self._RESET} | "
-                  f"{record.getMessage()}")
-        lines = [header] + rest
-        return "\n".join(lines)
-_console = logging.StreamHandler(sys.stdout)
-if LOG_COLORS:
-    _console.setFormatter(_ColorFormatter())
-else:
-    _console.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"))
-handlers_colored = [_console]
-if len(handlers) > 1:                         # file handler was added
-    handlers_colored.append(handlers[-1])     # keep rotating file handler (no colour)
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
-                    handlers=handlers_colored)
-log = logging.getLogger("doctor")
+# Logging is configured in a separate module so config.py stays focused on env constants.
+from .logging_config import log
 
 # Re-export utils helpers for backward compatibility with any code that imports them
 # from doctor.config. The canonical home is doctor.utils.
 from doctor.utils import http_code, run_cmd, run_output, host_load  # noqa: F401
 
-__all__ = [n for n in dir() if not n.startswith("__") and not isinstance(globals()[n], type(os))]
+# Public surface for ``from doctor.config import *``: uppercase constants, the logger,
+# and the backward-compatible utils re-exports.
+__all__ = [n for n in dir() if n.isupper()]
+__all__ += ["log", "http_code", "run_cmd", "run_output", "host_load"]
+
+# ---- debridlink migration ----
+EN_DEBRIDLINK_MIGRATION = _b("ENABLE_DEBRIDLINK_MIGRATION", False)
+DBR_PROWLARR_URL = os.environ.get("DBR_PROWLARR_URL", "")
+DBR_PROWLARR_APIKEY = os.environ.get("DBR_PROWLARR_APIKEY", "")
+DBR_QBT_URL = os.environ.get("DBR_QBT_URL", "")
+DBR_QBT_CATEGORY = os.environ.get("DBR_QBT_CATEGORY", "sonarr")
+DBR_MAX_ACTIONS = _i("DBR_MAX_ACTIONS", 10)
+DBR_RECHECK = _dur(os.environ.get("DBR_RECHECK", "12h"), 43200)
+DBR_MIN_SEEDS = _i("DBR_MIN_SEEDS", 1)
+DBR_SCAN_DELAY = _f("DBR_SCAN_DELAY", 10)
+# ---- library maintainer ----
+EN_MAINTAINER         = _b("ENABLE_MAINTAINER", False)
+MAINTAINER_MAX_ACTIONS   = _i("MAINTAINER_MAX_ACTIONS", 5)
+MAINTAINER_UNWATCHED_DAYS = _i("MAINTAINER_UNWATCHED_DAYS", 30)
+MAINTAINER_MIN_YEAR       = _i("MAINTAINER_MIN_YEAR", 2024)
+MAINTAINER_MIN_AGE_DAYS   = _i("MAINTAINER_MIN_AGE_DAYS", 30)
+MAINTAINER_LIBRARY_TITLE  = os.environ.get("MAINTAINER_LIBRARY_TITLE", "shows")
+MAINTAINER_PULSARR_TAG_PREFIX = os.environ.get("MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr-")
+MAINTAINER_MODE             = os.environ.get("MAINTAINER_MODE", "tagged").strip().lower()
+MAINTAINER_PLEX_SECTION_KEY = _i("MAINTAINER_PLEX_SECTION_KEY", 0)
+MAINTAINER_RECHECK         = _dur(os.environ.get("MAINTAINER_RECHECK", "24h"), 86400)
+TAUTULLI_URL    = os.environ.get("TAUTULLI_URL", "")
+TAUTULLI_APIKEY = os.environ.get("TAUTULLI_APIKEY", "")
+PULSARR_URL     = os.environ.get("PULSARR_URL", "")
+PULSARR_APIKEY  = os.environ.get("PULSARR_APIKEY", "")
+PULSARR_DB_PATH = os.environ.get("PULSARR_DB_PATH", "")
+
+DBR_MIGRATE_MODE = os.environ.get("# ---- library maintainer ----
+EN_MAINTAINER         = _b("ENABLE_MAINTAINER", False)
+MAINTAINER_MAX_ACTIONS   = _i("MAINTAINER_MAX_ACTIONS", 5)
+MAINTAINER_UNWATCHED_DAYS = _i("MAINTAINER_UNWATCHED_DAYS", 30)
+MAINTAINER_MIN_YEAR       = _i("MAINTAINER_MIN_YEAR", 2024)
+MAINTAINER_MIN_AGE_DAYS   = _i("MAINTAINER_MIN_AGE_DAYS", 30)
+MAINTAINER_LIBRARY_TITLE  = os.environ.get("MAINTAINER_LIBRARY_TITLE", "shows")
+MAINTAINER_PULSARR_TAG_PREFIX = os.environ.get("MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr-")
+MAINTAINER_MODE             = os.environ.get("MAINTAINER_MODE", "tagged").strip().lower()
+MAINTAINER_PLEX_SECTION_KEY = _i("MAINTAINER_PLEX_SECTION_KEY", 0)
+MAINTAINER_RECHECK         = _dur(os.environ.get("MAINTAINER_RECHECK", "24h"), 86400)
+TAUTULLI_URL    = os.environ.get("TAUTULLI_URL", "")
+TAUTULLI_APIKEY = os.environ.get("TAUTULLI_APIKEY", "")
+PULSARR_URL     = os.environ.get("PULSARR_URL", "")
+PULSARR_APIKEY  = os.environ.get("PULSARR_APIKEY", "")
+PULSARR_DB_PATH = os.environ.get("PULSARR_DB_PATH", "")
+
+DBR_MIGRATE_MODE", "continuous").strip().lower()
+# ---- library maintainer ----
+EN_MAINTAINER         = _b("ENABLE_MAINTAINER", False)
+MAINTAINER_MAX_ACTIONS   = _i("MAINTAINER_MAX_ACTIONS", 5)       # max shows deleted per sweep
+MAINTAINER_UNWATCHED_DAYS = _i("MAINTAINER_UNWATCHED_DAYS", 30)   # must be unwatched for at least this many days
+MAINTAINER_MIN_YEAR       = _i("MAINTAINER_MIN_YEAR", 2024)       # shows released before this year are eligible
+MAINTAINER_MIN_AGE_DAYS   = _i("MAINTAINER_MIN_AGE_DAYS", 30)     # series must have been added to Sonarr at least this long ago
+MAINTAINER_LIBRARY_TITLE  = os.environ.get("MAINTAINER_LIBRARY_TITLE", "shows")  # only delete from this Sonarr instance whose name contains this
+MAINTAINER_PULSARR_TAG_PREFIX = os.environ.get("MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr-")
+MAINTAINER_MODE             = os.environ.get("MAINTAINER_MODE", "tagged").strip().lower()  # tagged | all
+MAINTAINER_PLEX_SECTION_KEY = _i("MAINTAINER_PLEX_SECTION_KEY", 0)   # Plex section to empty trash on (all mode)
+MAINTAINER_RECHECK         = _dur(os.environ.get("MAINTAINER_RECHECK", "24h"), 86400)  # cooldown before a previously-flagged series is reconsidered
+TAUTULLI_URL    = os.environ.get("TAUTULLI_URL", "")
+TAUTULLI_APIKEY = os.environ.get("TAUTULLI_APIKEY", "")
+PULSARR_URL     = os.environ.get("PULSARR_URL", "")
+PULSARR_APIKEY  = os.environ.get("PULSARR_APIKEY", "")
+PULSARR_DB_PATH = os.environ.get("PULSARR_DB_PATH", "")  # direct sqlite3 access to pulsarr.db for watchlist record deletion

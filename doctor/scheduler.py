@@ -4,18 +4,22 @@ import threading
 from collections import namedtuple
 from typing import Optional, Callable, Any
 from .config import (
-    EN_BAZARR, EN_DECYPHARR, EN_FORCE_IMPORT, EN_JANITOR, EN_MISSING_SEASONS,
-    EN_NO_UPGRADE_PROFILE, EN_PLEX, EN_PLEX_SCAN, EN_PROVIDERS,
+    EN_BAZARR, EN_DECYPHARR, EN_DECYPHARR_PROVIDERS, EN_DEBRIDLINK_MIGRATION, EN_FORCE_IMPORT, EN_JANITOR,
+    EN_MAINTAINER, EN_MISSING_SEASONS,
+    EN_NO_UPGRADE_PROFILE, EN_PLEX, EN_PLEX_SCAN, EN_PROVIDERS, EN_RESCAN,
     EN_QUEUE, EN_REPAIR, EN_RESOURCES, EN_SEERR,
     FAST_INTERVAL, MULTIPACK_ENABLED, SCHEDULER_CONCURRENCY,
     SCHEDULER_TICK, SLOW_INTERVAL,
     _check_interval, _human, log,
 )
 from .checks import (  # check_* functions referenced by CHECKS
+    check_debridlink_migration,
     check_bazarr,
     check_decypharr,
+    check_decypharr_providers,
     check_force_import,
     check_janitor,
+    check_maintainer,
     check_missing_seasons,
     check_multipack,
     check_no_upgrade_profile,
@@ -24,6 +28,7 @@ from .checks import (  # check_* functions referenced by CHECKS
     check_providers,
     check_queue,
     check_repair,
+    check_rescan,
     check_resources,
     check_seerr,
 )
@@ -44,17 +49,21 @@ CheckEntry = namedtuple("CheckEntry", ["cid", "enabled", "fn", "speed", "default
 CHECKS = [CheckEntry("queue",              EN_QUEUE,              check_queue,              "fast", None, True),
           CheckEntry("providers",          EN_PROVIDERS,          check_providers,          "fast", None, True),
           CheckEntry("decypharr",          EN_DECYPHARR,          check_decypharr,          "fast", None, False),
+          CheckEntry("decypharr_providers", EN_DECYPHARR_PROVIDERS, check_decypharr_providers, "fast", 300, False),
+          CheckEntry("debridlink_migration", EN_DEBRIDLINK_MIGRATION, check_debridlink_migration, "slow", 3600, False),
           CheckEntry("plex",               EN_PLEX,               check_plex,               "fast", None, False),
           CheckEntry("plexscan",           EN_PLEX_SCAN,          check_plex_scan,          "fast", None, False),
           CheckEntry("resources",          EN_RESOURCES,          check_resources,          "fast", None, False),
           CheckEntry("janitor",            EN_JANITOR,            check_janitor,            "slow", None, False),
           CheckEntry("repair",             EN_REPAIR,             check_repair,             "slow", None, True),
+          CheckEntry("rescan",             EN_RESCAN,             check_rescan,             "slow", 3600,  False),   # 1h default, no instances needed
           CheckEntry("force_import",       EN_FORCE_IMPORT,       check_force_import,       "slow", None, True),   # importarr-style manual import
           CheckEntry("bazarr",             EN_BAZARR,             check_bazarr,             "fast", None, False),
           CheckEntry("seerr",              EN_SEERR,              check_seerr,              "fast", None, False),
           CheckEntry("missing_seasons",    EN_MISSING_SEASONS,    check_missing_seasons,    "slow", 900,   True),   # 15 min default
           CheckEntry("no_upgrade_profile", EN_NO_UPGRADE_PROFILE, check_no_upgrade_profile, "slow", None, True),
-          CheckEntry("multipack",          MULTIPACK_ENABLED,     check_multipack,          "slow", None, True)]
+          CheckEntry("multipack",          MULTIPACK_ENABLED,     check_multipack,          "slow", None, True),
+          CheckEntry("maintainer",        EN_MAINTAINER,         check_maintainer,         "slow", None, True)]
 _check_locks = {cid: threading.Lock() for cid, _, _, _, _, _ in CHECKS}
 _scheduler_sem = threading.Semaphore(max(1, SCHEDULER_CONCURRENCY))
 _lock = threading.Lock()

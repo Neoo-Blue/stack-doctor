@@ -5,13 +5,16 @@ import time
 import threading
 from .config import (
     BAZARR_APIKEY, BAZARR_URL, CONFIG_FILE, DECY_URL, DRY_RUN, EN_UI,
-    LOG_FILE, MODE, PLEX_TOKEN, PLEX_URL, SEERR_APIKEY, SEERR_URL,
+    LOG_FILE, MODE, PLEX_TOKEN, PLEX_URL, PULSARR_APIKEY, PULSARR_URL,
+    RESCAN_LIBRARY_PATHS, SEERR_APIKEY, SEERR_URL, TAUTULLI_APIKEY, TAUTULLI_URL,
     TRIGGER_EVENTS, UI_TOKEN, VERSION, WARM_PLEXLOG_CMD, WARM_PLEXLOG_FILE,
     _b, host_load, http_code, log,
 )
 from .clients import INSTANCES
-from .checks.plex import _plex_rescan, _plex_empty_trash
+from .actions.plex import plex_rescan, plex_empty_trash
+from .checks.rescan import rescan_backlog
 from .checks import warmer as _warmer
+
 from .scheduler import CHECKS, _check_runs, sweep, _run_scheduled_check
 from .state import _load_state
 
@@ -25,11 +28,18 @@ UI_SCHEMA = [
               ("DOCTOR_SCHEDULER_TICK", "30s"), ("DOCTOR_SCHEDULER_CONCURRENCY", "3"),
               ("DOCTOR_DRY_RUN", "false"), ("DOCTOR_LOG_LEVEL", "INFO")]),
     ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
+              ("ENABLE_DECYPHARR_PROVIDERS", ""),
               ("ENABLE_PLEX", ""), ("ENABLE_PLEX_SCAN", ""), ("ENABLE_RESOURCES", ""),
               ("ENABLE_JANITOR", ""), ("ENABLE_REPAIR", ""), ("ENABLE_BAZARR", ""),
               ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""),
-              ("ENABLE_MISSING_SEASONS", ""), ("ENABLE_NO_UPGRADE_PROFILE", "")]),
+              ("ENABLE_MISSING_SEASONS", ""), ("ENABLE_NO_UPGRADE_PROFILE", ""),
+              ("ENABLE_MAINTAINER", ""), ("ENABLE_FORCE_IMPORT", "")]),
+    ("Decypharr provider health", [("DECYPHARR_PROVIDERS_THRESHOLD", "5"), ("DECYPHARR_PROVIDERS_WINDOW", "10m"),
+              ("DECYPHARR_PROVIDERS_COOLDOWN", "1h"), ("DECYPHARR_PROVIDERS_AUTO_DISABLE", "true|false"),
+              ("DECYPHARR_PROVIDERS_REENABLE", "true|false"), ("DECYPHARR_PROVIDERS_RESTART_CMD", "docker restart decypharr")]),
     ("Plex scan recovery", [("PLEX_SCAN_STUCK_AFTER", "30m"), ("PLEX_SCAN_CANCEL", "true|false")]),
+    ("Plex rescan (missing files)", [("ENABLE_RESCAN", ""), ("RESCAN_LIBRARY_PATHS", "/mnt/library/movies,/mnt/library/tv"),
+              ("RESCAN_MAX_ACTIONS", "20"), ("RESCAN_SCAN_DELAY", "5")]),
     ("Repair (dead-file re-grab)", [("REPAIR_LIBRARY_PATHS", "/mnt/library/movies,/mnt/library/tv"),
               ("REPAIR_MAX_ACTIONS", "20"), ("REPAIR_MAX_SYMLINKS", "100"), ("REPAIR_LOAD_MAX", "0"),
               ("REPAIR_DEBRID_MOUNT", ""),
@@ -41,8 +51,27 @@ UI_SCHEMA = [
               ("MISSING_SEASONS_RECHECK", "24h")]),
     ("No-Upgrade Profile", [("NO_UPGRADE_PROFILE_NAME", "WEB-1080p (No Upgrade)"),
               ("NO_UPGRADE_PROFILE_ID", "0")]),
+    ("("Library Maintainer", [("TAUTULLI_URL", "http://tautulli:8181"), ("TAUTULLI_APIKEY", ""),
+              ("PULSARR_URL", "http://pulsarr:3003"), ("PULSARR_APIKEY", ""),
+              ("PULSARR_DB_PATH", "/var/lib/docker/volumes/pulsarr-config/_data/db/pulsarr.db"),
+              ("MAINTAINER_MAX_ACTIONS", "5"), ("MAINTAINER_UNWATCHED_DAYS", "30"),
+              ("MAINTAINER_MIN_YEAR", "2024"), ("MAINTAINER_MIN_AGE_DAYS", "30"),
+              ("MAINTAINER_MODE", "tagged|all"), ("MAINTAINER_PLEX_SECTION_KEY", "0"),
+              ("MAINTAINER_LIBRARY_TITLE", "shows"),
+              ("MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr-"),
+              ("MAINTAINER_RECHECK", "24h")]),
+
     ("Seerr (failed-request retry)", [("SEERR_URL", "http://overseerr:5055"), ("SEERR_APIKEY", ""),
               ("SEERR_RETRY_MAX", "10"), ("SEERR_MAX_ATTEMPTS", "5")]),
+    ("Library Maintainer", [("TAUTULLI_URL", "http://tautulli:8181"), ("TAUTULLI_APIKEY", ""),
+              ("PULSARR_URL", "http://pulsarr:3003"), ("PULSARR_APIKEY", ""),
+              ("PULSARR_DB_PATH", "/var/lib/docker/volumes/pulsarr-config/_data/db/pulsarr.db"),
+              ("MAINTAINER_MAX_ACTIONS", "5"), ("MAINTAINER_UNWATCHED_DAYS", "30"),
+              ("MAINTAINER_MIN_YEAR", "2024"), ("MAINTAINER_MIN_AGE_DAYS", "30"),
+              ("MAINTAINER_MODE", "tagged|all"), ("MAINTAINER_PLEX_SECTION_KEY", "0"),
+              ("MAINTAINER_LIBRARY_TITLE", "shows"),
+              ("MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr-"),
+              ("MAINTAINER_RECHECK", "24h")]),
 
     ("Queue / churn brake", [("DOCTOR_MIN_STRIKES", "2"), ("DOCTOR_MAX_ACTIONS", "20"), ("DOCTOR_BLOCKLIST", "true"),
               ("DOCTOR_CHURN_LIMIT", "0"), ("DOCTOR_CHURN_ACTION", "report|park|backoff"), ("DOCTOR_CHURN_BACKOFF", "10m,1h,24h")]),
@@ -78,6 +107,14 @@ def _ui_health():
     if SEERR_URL:
         jobs.append(("seerr", "seerr", lambda: (http_code(SEERR_URL.rstrip("/") + "/api/v1/status",
             headers={"X-Api-Key": SEERR_APIKEY} if SEERR_APIKEY else None, t=5) == 200, "")))
+    if TAUTULLI_URL:
+        jobs.append(("tautulli", "tautulli", lambda: (http_code(
+            TAUTULLI_URL.rstrip("/") + "/api/v2?apikey=" + TAUTULLI_APIKEY + "&cmd=get_activity",
+            t=5) == 200, "")))
+    if PULSARR_URL:
+        jobs.append(("pulsarr", "pulsarr", lambda: (http_code(
+            PULSARR_URL.rstrip("/") + "/v1/system/health",
+            headers={"x-api-key": PULSARR_APIKEY}, t=5) == 200, "")))
     out = [None] * len(jobs)
     def run(i, name, kind, fn):
         try:
@@ -110,22 +147,13 @@ def _ui_status():
     # They have no run metadata in _check_runs so we always emit nulled defaults.
     checks.append({"name": "warmer", "on": _b("ENABLE_WARMER", False) and bool(PLEX_URL), **_RUN_NULL})
     checks.append({"name": "detail-page warm", "on": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE), **_RUN_NULL})
-    return {"version": VERSION, "mode": MODE, "dry_run": DRY_RUN, "load": round(host_load(), 2), "checks": checks}
+    return {"version": VERSION, "mode": MODE, "dry_run": DRY_RUN, "load": round(host_load(), 2), "checks": checks, "rescan_backlog": rescan_backlog()}
 def _ui_warmer():
-    rec = [{"title": r["title"], "why": r["why"], "ago": int(time.time() - r["ts"])} for r in reversed(_warmer._warm_recent)]
-    last_ts = _warmer._last_cycle_ts[0]
-    return {
-        "enabled":      _b("ENABLE_WARMER", False) and bool(PLEX_URL),
-        "detail_page":  bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE),
-        "total":        _warmer._warm_count[0],
-        "recent":       rec[:40],
-        "last_cycle_ts":           last_ts if last_ts else None,
-        "last_cycle_ago":          round(time.time() - last_ts) if last_ts else None,
-        "last_cycle_duration_s":   _warmer._last_cycle_duration[0],
-        "last_cycle_warmed":       _warmer._last_cycle_warmed[0],
-        "last_cycle_candidates":   _warmer._last_cycle_candidates[0],
-        "last_cycle_skipped_load": _warmer._last_cycle_skipped_load[0],
-    }
+    stats = _warmer.get_stats()
+    stats["enabled"] = _b("ENABLE_WARMER", False) and bool(PLEX_URL)
+    stats["detail_page"] = bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE)
+    stats["recent"] = stats["recent"][:40]
+    return stats
 def _ui_config():
     groups = []
     for g, items in UI_SCHEMA:
@@ -162,6 +190,74 @@ def _ui_logs(n):
 def _ui_state():
     """Return the full state.json as a dict for operator inspection."""
     return _load_state()
+
+
+def _is_under_roots(target, roots):
+    target = os.path.realpath(target)
+    for r in roots:
+        if target == os.path.realpath(r) or target.startswith(os.path.realpath(r) + os.sep):
+            return True
+    return False
+
+
+def _rescan_folders(parent=None):
+    roots = [r for r in (RESCAN_LIBRARY_PATHS or []) if os.path.isdir(r)]
+    if not roots:
+        return []
+    if parent:
+        parent = os.path.realpath(parent)
+        if not _is_under_roots(parent, roots):
+            return []
+        base = parent
+    else:
+        base = None
+    if base is None:
+        out = []
+        for r in roots:
+            out.append({"name": os.path.basename(r) or r, "path": r, "is_root": True})
+        return sorted(out, key=lambda x: x["name"].lower())
+    try:
+        entries = []
+        for name in os.listdir(base):
+            p = os.path.join(base, name)
+            if os.path.isdir(p):
+                entries.append({"name": name, "path": p, "is_root": False})
+        return sorted(entries, key=lambda x: x["name"].lower())
+    except OSError:
+        return []
+
+
+def _trigger_rescan_path(folder_path):
+    from .clients import Plex
+    if not (PLEX_URL and PLEX_TOKEN):
+        return False, "PLEX_URL/PLEX_TOKEN not set"
+    roots = [r for r in (RESCAN_LIBRARY_PATHS or []) if os.path.isdir(r)]
+    folder_path = os.path.realpath(folder_path)
+    if not _is_under_roots(folder_path, roots):
+        return False, "path not in RESCAN_LIBRARY_PATHS"
+    plex = Plex(PLEX_URL, PLEX_TOKEN)
+    sections = []
+    raw = plex.sections()
+    for sec in raw or []:
+        sec["locations"] = plex.section_locations(sec["key"]) or []
+        sections.append(sec)
+    best = None
+    best_len = 0
+    for sec in sections:
+        for loc in sec.get("locations", []):
+            loc = os.path.realpath(loc)
+            if folder_path == loc or folder_path.startswith(loc + os.sep):
+                if len(loc) > best_len:
+                    best = sec
+                    best_len = len(loc)
+    if not best:
+        return False, "no Plex section for path"
+    log.info("[ui] manual partial scan for %s in section %s", folder_path, best["title"])
+    if plex.scan_path(best["key"], folder_path):
+        return True, "scan triggered"
+    return False, "Plex scan_path failed"
+
+
 def _build_server(port):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import urlparse, parse_qs
@@ -194,6 +290,9 @@ def _build_server(port):
 
             if path == "/api/config":           return self._send(200, "application/json", json.dumps(_ui_config()))
             if path == "/api/state":             return self._send(200, "application/json", json.dumps(_ui_state()))
+            if path == "/api/rescan/folders":
+                parent = parse_qs(urlparse(self.path).query).get("parent", [""])[0] or None
+                return self._send(200, "application/json", json.dumps({"roots": [r for r in (RESCAN_LIBRARY_PATHS or []) if os.path.isdir(r)], "folders": _rescan_folders(parent)}))
             if path == "/api/logs":
                 try: n = min(int(parse_qs(urlparse(self.path).query).get("n", ["300"])[0]), 3000)
                 except Exception: n = 300
@@ -203,7 +302,7 @@ def _build_server(port):
             path = urlparse(self.path).path
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else b""
-            if path in ("/api/config", "/api/restart",
+            if path in ("/api/config", "/api/restart", "/api/rescan/scan",
                         "/api/plex/rescan", "/api/plex/emptytrash", "/api/sweep") or path.startswith("/api/check/"):
                 if not EN_UI or not self._authed():
                     return self._send(401, "text/plain", "unauthorized")
@@ -211,14 +310,21 @@ def _build_server(port):
                     ok, msg = _ui_save(body)
                     return self._send(200 if ok else 400, "application/json", json.dumps({"ok": ok, "msg": msg}))
                 if path == "/api/plex/rescan":
-                    threading.Thread(target=_plex_rescan, daemon=True).start()
+                    threading.Thread(target=plex_rescan, daemon=True).start()
                     return self._send(202, "application/json", json.dumps({"ok": True, "msg": "Plex rescan started"}))
                 if path == "/api/plex/emptytrash":
-                    threading.Thread(target=_plex_empty_trash, daemon=True).start()
+                    threading.Thread(target=plex_empty_trash, daemon=True).start()
                     return self._send(202, "application/json", json.dumps({"ok": True, "msg": "Plex empty trash started"}))
                 if path == "/api/sweep":
                     threading.Thread(target=sweep, daemon=True).start()
                     return self._send(202, "application/json", json.dumps({"ok": True, "msg": "sweep started"}))
+                if path == "/api/rescan/scan":
+                    try: p = json.loads(body or b"{"); folder = p.get("path", "")
+                    except Exception: folder = ""
+                    if not folder:
+                        return self._send(400, "application/json", json.dumps({"ok": False, "msg": "missing path"}))
+                    ok, msg = _trigger_rescan_path(folder)
+                    return self._send(202 if ok else 500, "application/json", json.dumps({"ok": ok, "msg": msg}))
                 if path.startswith("/api/check/"):
                     cid = path.split("/api/check/", 1)[1]
                     for name, en, fn, _, _, _ in CHECKS:
