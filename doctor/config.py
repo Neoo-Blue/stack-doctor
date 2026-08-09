@@ -278,24 +278,7 @@ PULSARR_URL     = os.environ.get("PULSARR_URL", "")
 PULSARR_APIKEY  = os.environ.get("PULSARR_APIKEY", "")
 PULSARR_DB_PATH = os.environ.get("PULSARR_DB_PATH", "")
 
-DBR_MIGRATE_MODE = os.environ.get("# ---- library maintainer ----
-EN_MAINTAINER         = _b("ENABLE_MAINTAINER", False)
-MAINTAINER_MAX_ACTIONS   = _i("MAINTAINER_MAX_ACTIONS", 5)
-MAINTAINER_UNWATCHED_DAYS = _i("MAINTAINER_UNWATCHED_DAYS", 30)
-MAINTAINER_MIN_YEAR       = _i("MAINTAINER_MIN_YEAR", 2024)
-MAINTAINER_MIN_AGE_DAYS   = _i("MAINTAINER_MIN_AGE_DAYS", 30)
-MAINTAINER_LIBRARY_TITLE  = os.environ.get("MAINTAINER_LIBRARY_TITLE", "shows")
-MAINTAINER_PULSARR_TAG_PREFIX = os.environ.get("MAINTAINER_PULSARR_TAG_PREFIX", "pulsarr-")
-MAINTAINER_MODE             = os.environ.get("MAINTAINER_MODE", "tagged").strip().lower()
-MAINTAINER_PLEX_SECTION_KEY = _i("MAINTAINER_PLEX_SECTION_KEY", 0)
-MAINTAINER_RECHECK         = _dur(os.environ.get("MAINTAINER_RECHECK", "24h"), 86400)
-TAUTULLI_URL    = os.environ.get("TAUTULLI_URL", "")
-TAUTULLI_APIKEY = os.environ.get("TAUTULLI_APIKEY", "")
-PULSARR_URL     = os.environ.get("PULSARR_URL", "")
-PULSARR_APIKEY  = os.environ.get("PULSARR_APIKEY", "")
-PULSARR_DB_PATH = os.environ.get("PULSARR_DB_PATH", "")
-
-DBR_MIGRATE_MODE", "continuous").strip().lower()
+DBR_MIGRATE_MODE = os.environ.get("DBR_MIGRATE_MODE", "continuous").strip().lower()
 # ---- library maintainer ----
 EN_MAINTAINER         = _b("ENABLE_MAINTAINER", False)
 MAINTAINER_MAX_ACTIONS   = _i("MAINTAINER_MAX_ACTIONS", 5)       # max shows deleted per sweep
