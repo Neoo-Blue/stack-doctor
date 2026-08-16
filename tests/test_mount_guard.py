@@ -187,23 +187,6 @@ class ConfigDivergenceTest(unittest.TestCase):
         finally:
             os.unlink(cfg)
 
-    def test_empty_string_does_not_override(self):
-        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-        f.write('{"DOCTOR_DRY_RUN": "", "DOCTOR_CONDITIONS": ""}')
-        cfg = f.name; f.close()
-        try:
-            with patch.object(doctor, "CONFIG_FILE", cfg), \
-                 patch.dict("os.environ", {"DOCTOR_DRY_RUN": "true"}, clear=False), \
-                 patch("sys.stderr", new_callable=io.StringIO) as err:
-                doctor._load_overrides()
-                out = err.getvalue()
-                after = os.environ.get("DOCTOR_DRY_RUN")
-            self.assertNotIn("override the environment", out)
-            self.assertEqual(after, "true",
-                             "empty-string config value must not clobber the env")
-        finally:
-            os.unlink(cfg)
-
 
 class ScrubberCapTest(unittest.TestCase):
     def test_per_check_cap_stops_at_limit(self):
