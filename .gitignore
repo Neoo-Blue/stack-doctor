@@ -4,3 +4,6 @@ data/
 __pycache__/
 state.json
 .DS_Store
+config.json
+*.log
+.opencode/

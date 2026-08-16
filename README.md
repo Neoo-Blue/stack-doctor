@@ -29,12 +29,14 @@ container, everything configured by env vars.
 | **plex** | Plex unresponsive | alerts (optional library refresh) |
 | **resources** | host load / low memory / swap pressure | reports; optional `drop_caches` relief |
 | **janitor** | permanently-dead usenet releases (from decypharr's log) | quarantines those library symlinks (reversible) |
+| **metaclean** | orphaned altmount metadata causing yEnc `CRC mismatch` retry storms | removes the orphaned metadata dir (failed release + unreferenced + old) so altmount stops re-reading a dead file |
 | **scrubber** | **proactively** scans library files for bad parts that make Plex skip mid-play (dead NZB articles, torn containers, packet corruption) | quarantines the symlink (reversible) + deletes the *arr's `moviefile`/`episodefile` with `blocklist=true` so a clean release is re-searched |
 | **watchlists** | new titles on Plex Home users' + non-Home friends' watchlists that aren't in your library | adds them directly to Sonarr/Radarr (4K instance first, 1080p fallback), bypassing Overseerr entirely; per-sweep rate-cap so a dumped 300-item watchlist doesn't flood |
 | **holidays** | the calendar nearing a holiday (curated per-holiday definitions, e.g. Independence Day, Halloween, Christmas) | builds a themed movie collection a few days before and pins it to Plex Home (the recommended row), then takes it down a few days after |
 | **backlog** | monitored episodes/movies that are still **missing** and old enough that RSS will never reach back for them (e.g. content added after a source migration) | gently trickles interactive searches for them: a small per-sweep cap, a minimum age gate, a per-item cooldown, a load gate, and a minimum interval between sweeps so it never floods the download path |
 | **riven** | a [Riven](https://github.com/rivenmedia/riven) backend that is unhealthy / has a down service, plus items wedged in a working state (Scraped/Downloaded) or never resolved (Requested/Indexed/Failed) | reports health + down services every sweep; gently retries stuck/missing items through Riven's own state machine, throttled exactly like backlog (per-sweep cap, per-item cooldown, load gate, minimum interval) |
 | **mediastorm** | a [mediastorm](https://github.com/godver3/mediastorm) server that is down / not answering `/health` | alerts (health-only: mediastorm has no import queue or monitored-missing list to drain) |
+| **missing-disk** | an item the *arr thinks is present but whose file/symlink is gone on disk (expired debrid link, manual rm) — the blind spot `repair` can't see because no deletion *event* fired | deletes the *arr's stale file record + re-searches. **Off by default** and mount-gated: never acts while the backing mount is down/empty |
 | **bazarr** | Bazarr unreachable | alerts |
 | **seerr** | Overseerr/Jellyseerr/Seerr requests stuck **FAILED** (the arr add timed out under load) | re-drives them so a transient blip self-heals (attempt-capped) |
 | **warmer** | what a viewer is about to watch (Plex On Deck + next episode) | precaches the file head so playback starts instantly |
@@ -93,6 +95,14 @@ Why `downloadClientUnavailable` defaults to `report`: when the client is briefly
 in-flight grab reports that status. Removing + blocklisting them would ban perfectly good
 releases for a problem that wasn't theirs. The `providers` and `decypharr` checks handle an
 actually-down client; the queue check just waits.
+
+**Dead-end rejections — prefer `research`, not `force_import`.** Some rejections are a *dead end*
+for a ManualImport (e.g. `Destination already exists`, `unable to parse …`): the file can't be
+imported by force, so a `force_import` action wedges the item and re-fires every sweep. Map those
+to `research` instead, e.g. `DOCTOR_CONDITION_ACTIONS="importBlocked=research,stalled=research,downloadClientUnavailable=report"`.
+`DOCTOR_FORCE_IMPORT_ESCALATE` (default `3`) is the safety net: after that many failed
+force-import strikes on the same item it auto-escalates to `DOCTOR_FORCE_IMPORT_ESCALATE_ACTION`
+(default `clear`) so nothing is stuck forever.
 
 ---
 
@@ -260,7 +270,7 @@ is on a writable volume (the wizard warns you up front if it is not).
 | `DOCTOR_CHURN_ACTION` | `report` | what the brake does: `report` (log only), `park` (un-monitor), or `backoff` (un-monitor, then auto re-monitor on the schedule below for a fresh try) |
 | `DOCTOR_CHURN_BACKOFF` | `10m,1h,24h` | `backoff`: escalating retry schedule (`s`/`m`/`h`/`d` units). Each park steps to the next delay; the last entry repeats. Default = retry 10m after the 1st park, 1h after the 2nd, every 24h after. (Legacy `DOCTOR_CHURN_COOLDOWN` still honored as a single fixed delay.) |
 | `DOCTOR_REMOVE_FROM_CLIENT` | `true` | also remove from the download client |
-| `DOCTOR_DRY_RUN` | `false` | `true` = log only, change nothing |
+| `DOCTOR_DRY_RUN` | `true` | `true` = log only, change nothing (safe-by-default; set `false` to act) |
 | `DOCTOR_CONDITIONS` | *all* | comma list of conditions to act on (see table above) |
 | `DOCTOR_LOAD_MAX` | `0` | if > 0, skip a sweep when host 1-min load exceeds it (mount `/proc/loadavg:ro`) |
 | `DOCTOR_HEALTH_REPORT` | `true` | log *arr `/health` warnings at debug level |
@@ -466,19 +476,81 @@ State (`SCRUBBER_STATE_FILE`) caches `(path, size, mtime) -> result`, so the sca
 | `SCRUBBER_STRIKES` | `2` | consecutive bad reads before action (transient mount blips do not cost re-grabs) |
 | `SCRUBBER_STATE_FILE` | `/data/scrubber.json` | per-file result cache |
 | `SCRUBBER_QUARANTINE_DIR` | `JANITOR_QUARANTINE_DIR` or `/data/quarantine` | where quarantined symlinks land (with `manifest.json` for undo) |
-| `SCRUBBER_DELETE_ARR_FILE` | `true` | delete the arr's `moviefile`/`episodefile` (with `blocklist=true`) so it re-searches; `false` = quarantine only |
+| `SCRUBBER_DELETE_ARR_FILE` | `false` | delete the arr's `moviefile`/`episodefile` (with `blocklist=true`) so it re-searches; `false` = quarantine only (safe default) |
+| `SCRUBBER_MAX_DELETES` | `20` | cap arr-file deletes/quarantines per sweep (bound the blast radius) |
 | `SCRUBBER_EXTENSIONS` | `.mkv,.mp4,.avi,.m4v,.ts` | which file extensions to scan |
-| `SCRUBBER_MIN_AGE_HOURS` | `1` | skip files newer than this (don't fight the warmer / fresh imports) |
+| `SCRUBBER_MIN_AGE_HOURS` | `6` | skip files newer than this (don't fight the warmer / fresh imports) |
 | `SCRUBBER_REVERIFY_DAYS` | `30` | re-check previously-OK files after N days; usenet retention rots (`0` = never re-check) |
 | `SCRUBBER_HEADER_TIMEOUT` | `30` | per-file ffprobe timeout (tier 1) |
 | `SCRUBBER_SKIM_TIMEOUT` | `180` | per-skim-point ffmpeg timeout (tier 2) |
 | `SCRUBBER_FULL_TIMEOUT` | `1800` | full-decode timeout (tier 3) |
 | `SCRUBBER_FFPROBE` / `SCRUBBER_FFMPEG` | `ffprobe` / `ffmpeg` | binaries (override to use a sandboxed build) |
+| `MOUNT_HEALTH_GUARDS` | *(none = gate off)* | comma list of `mount=probe` pairs, e.g. `/mnt/zurg=/mnt/zurg/__all__,/mnt/altmount=/mnt/altmount`. Before the scrubber deletes anything, the backing mount must be a **mountpoint** AND list a non-empty `probe` dir. A down/empty mount => **all deletions under it are skipped** (prevents the transient-mount mass-delete). |
+| `MOUNT_HEALTH_TIMEOUT` | `8` | seconds to wait for a mount probe before declaring it down |
+
+> **Mount-health gate (P0 safety):** if a mount is *transiently* down, every file on it looks
+> broken and the scrubber would otherwise quarantine + re-grab your whole library. With
+> `MOUNT_HEALTH_GUARDS` set, a file is only actioned when its mount is a mountpoint and
+> responsive. Set this for every FUSE mount your library symlinks point at.
 
 The scrubber needs **direct read access** to the library, so it is best run as a **host
 service on the same host as decypharr** (where `/mnt/library` is real). It honors
 `DOCTOR_DRY_RUN=true` (logs what it would quarantine + which arr file it would delete,
 changes nothing).
+
+## Metaclean (orphaned altmount metadata -> yEnc CRC-retry storms)
+
+altmount (usenet WebDAV + rclone FUSE) keeps per-release metadata under a metadata root. When a
+download fails it leaves that metadata behind, and altmount keeps re-reading the corrupt file
+forever — wedging ffprobe in D-state and driving a yEnc `CRC mismatch` retry storm (the
+Iceman-DUSKLiGHT class).
+
+An orphaned metadata dir is removed only when **all** hold:
+
+1. its release is in altmount's `failed/` dir (or currently CRC-storming), **and**
+2. no live library symlink target references it (so it is serving nothing), **and**
+3. it is older than `METACLEAN_MIN_AGE_HOURS` (a currently-storming release bypasses the age gate).
+
+Live/served content is never touched.
+
+### Configuration
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_METACLEAN` | `false` | turn the check on |
+| `METACLEAN_ROOT` | *(none)* | altmount metadata root, e.g. `/data/altmount/config/metadata` |
+| `METACLEAN_CATEGORIES` | `radarr,sonarr,movies,tv` | subdirs of the root to sweep |
+| `METACLEAN_LINK_DIRS` | *(none)* | library roots to index live symlink targets from, e.g. `/mnt/iceberg,/mnt/altmount-links` |
+| `METACLEAN_MIN_AGE_HOURS` | `6` | quiet orphaned metadata must be this old before removal |
+| `METACLEAN_FAILED_CMD` | *(none)* | shell command listing altmount's failed release dirs, e.g. `docker exec altmount sh -c 'ls /config/.nzbs/failed/*/'` |
+| `METACLEAN_STORM_CMD` | *(none)* | shell command printing recent `yEnc CRC mismatch` log lines, e.g. `docker logs --since 15m altmount 2>&1 \| grep 'yEnc CRC mismatch'` |
+
+Honors `DOCTOR_DRY_RUN=true` (logs each WOULD-remove, changes nothing). This is the same job
+as altmount-maintenance.sh sweep 1 — run one or the other, not both.
+
+## Missing-from-disk (arr-orphaned dead files)
+
+`repair` only reacts to file-deletion **events** in the arr's history, so a file that vanished
+outside an arr event — an expired debrid link, a manual `rm`, a symlink the arr lost track of —
+never triggers a re-grab and the item sits "present but broken" forever (the Vox Machina class).
+
+This check finds items the arr **thinks are present** but whose file/symlink is gone on disk, then
+deletes the arr's stale `movieFile`/`episodeFile` record and re-searches.
+
+**Off by default and mount-gated** — it only acts when the backing mount is confirmed up
+(`_mount_ok_for(path) is not False`). A missing file on a *down* mount is a transient blip, not a
+real deletion, so it is never actioned.
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_MISSING_FROM_DISK` | `false` | turn the check on |
+| `MISSING_FROM_DISK_MAX_PER_SWEEP` | `10` | cap re-grabs per sweep (rate limit) |
+| `MISSING_FROM_DISK_LOAD_MAX` | `12` | skip while host 1-min load is above this (`0` = off) |
+| `MISSING_FROM_DISK_COOLDOWN` | `6h` | don't re-grab the same item within this window |
+| `MISSING_FROM_DISK_STATE_FILE` | `/data/missing_disk.json` | per-item cooldown cache |
+
+Honors `DOCTOR_DRY_RUN` (logs each WOULD re-grab, changes nothing) and respects
+`MOUNT_HEALTH_GUARDS` (see the Scrubber section).
 
 ## Watchlists (Plex Home + friends -> arrs, no Overseerr)
 
@@ -756,6 +828,41 @@ writes, and it honours `DOCTOR_DRY_RUN`: in dry-run nothing is submitted and the
 | `SCOUT_GRAB_TRIES` | `4` | how many fetchable releases to try (best first) before falling back to the arr's own search |
 | `SCOUT_GRAB_WAIT` | `18` | seconds to watch a grabbed release for import/failure before moving to the next candidate |
 | `SCOUT_SEARCH_TIMEOUT` | `90` | timeout for Scout's interactive release search against the indexers |
+
+## Ownership & de-confliction
+
+stack-doctor is one of several cleanup tools that can overlap. Pick **one owner per action** and
+disable the duplicate elsewhere — two tools "fixing" the same broken symlink at the same time is how
+double-deletes happen.
+
+| Action | Owner | Disable elsewhere |
+|---|---|---|
+| Stuck arr queue items | stack-doctor `queue` | decypharr + altmount `queue_cleanup`; warrden |
+| Broken library symlinks | stack-doctor `janitor`/`repair` (mount-gated) **OR** altmount-maintenance sweep-2 — pick ONE | the other |
+| Orphaned metadata (CRC storms) | `metaclean` **OR** altmount-maintenance sweep-1 — pick ONE | the other |
+| Missing-from-disk | stack-doctor `missing-disk` (mount-gated, off by default) | n/a |
+| Hung mounts | `decypharr` / `altmount` read-test | n/a |
+| Indexer health | `providers` | n/a |
+
+### Safety defaults & caveats
+
+- **Safe-by-default deletion (this fork).** `DOCTOR_DRY_RUN` defaults to `true`,
+  `SCRUBBER_DELETE_ARR_FILE` to `false`, and `SCRUBBER_MIN_AGE_HOURS` to `6`, so a fresh or
+  misconfigured deployment deletes nothing until you explicitly opt in. A deployment that was
+  already setting these in compose keeps its current behaviour — only unset/new deployments become safe.
+- **Per-check caps.** `SCRUBBER_MAX_DELETES`, `JANITOR_MAX_MOVES`, and `METACLEAN_MAX_REMOVES`
+  bound each check's blast radius per sweep, independent of the global `DOCTOR_MAX_ACTIONS` queue cap.
+- **Mount-health gate (P0).** The `janitor`, `scrubber`, and `missing-disk` checks all refuse to act
+  while a guarded mount is down/empty. Set `MOUNT_HEALTH_GUARDS` for every FUSE mount your library
+  symlinks point at — this is the exact guard that prevents a transient mount blip from wiping the library.
+- **Westrepair launch gate.** `WESTREPAIR_MOUNT_GUARD` (default `true`) stops stack-doctor from
+  *launching* `repair.py` while a guarded mount is down. But `repair.py` runs its own internal
+  `--run-interval` loop, so once launched it is **unguarded**. Keep `WESTREPAIR_RUN_INTERVAL` short so
+  the guard re-evaluates often, or add a mount guard inside `repair.py` itself (external, not in this repo).
+- **Stale config divergence.** If `/data/config.json` (written by the dashboard) disagrees with the
+  compose env, stack-doctor prints a `WARNING [config] … override the environment` line to stderr at
+  startup. Treat compose env as the source of truth; the warning names the divergent keys so you can
+  reconcile them.
 
 ## Extending
 
