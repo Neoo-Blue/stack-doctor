@@ -90,7 +90,7 @@ def _load_overrides():
     except Exception:
         return
     for k, v in data.items():
-        if v is None:
+        if v is None or v == "":
             continue
         old = os.environ.get(str(k))
         if old is not None and old != str(v):
