@@ -12,6 +12,8 @@ Modular checks, each toggled and configured by environment variables:
   resources  host load / memory / swap  - report pressure, optional drop_caches relief
   janitor    usenet dead files          - quarantine library symlinks for permanently-dead
                                            releases (reversible) from a decypharr log file
+  metaclean  orphaned altmount metadata - remove orphaned .meta that cause yEnc CRC-retry storms
+  scrubber   proactive file scan        - find bad parts before Plex skips mid-play
   bazarr     Bazarr                     - reachability check
   seerr      Overseerr/Jellyseerr/Seerr - auto-retry FAILED requests (arr add timed out under load)
   warmer     Plex-driven precache       - read the head of likely-next media so playback starts
@@ -27,6 +29,7 @@ import logging
 import logging.handlers
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -80,13 +83,24 @@ def _human(sec):
 CONFIG_FILE = os.environ.get("DOCTOR_CONFIG_FILE", "/data/config.json")
 
 def _load_overrides():
+    diverged = []
     try:
         with open(CONFIG_FILE) as f:
-            for k, v in json.load(f).items():
-                if v is not None:
-                    os.environ[str(k)] = str(v)
+            data = json.load(f)
     except Exception:
-        pass
+        return
+    for k, v in data.items():
+        if v is None:
+            continue
+        old = os.environ.get(str(k))
+        if old is not None and old != str(v):
+            diverged.append(str(k))
+        os.environ[str(k)] = str(v)
+    if diverged:
+        # NOTE: log is not configured yet at import time; use print to stderr.
+        import sys as _sys
+        print("WARNING [config] %d key(s) in %s override the environment: %s"
+              % (len(diverged), CONFIG_FILE, ", ".join(sorted(diverged))), file=_sys.stderr)
 
 _load_overrides()
 
@@ -99,7 +113,7 @@ UI_TOKEN    = os.environ.get("DOCTOR_UI_TOKEN", "")                   # optional
 LOG_LEVEL   = os.environ.get("DOCTOR_LOG_LEVEL", "INFO").upper()
 LOG_FILE    = os.environ.get("DOCTOR_LOG_FILE", "")
 TIMEOUT     = _i("DOCTOR_HTTP_TIMEOUT", 60)
-DRY_RUN     = _b("DOCTOR_DRY_RUN", False)
+DRY_RUN     = _b("DOCTOR_DRY_RUN", True)
 
 # which checks are on
 EN_QUEUE      = _b("ENABLE_QUEUE", True)
@@ -126,6 +140,7 @@ EN_REPAIR     = _b("ENABLE_REPAIR", False)      # proactive self-heal: re-grab a
 WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
 WR_RUN_INTERVAL    = os.environ.get("WESTREPAIR_RUN_INTERVAL", "6h")
 WR_REPAIR_INTERVAL = os.environ.get("WESTREPAIR_REPAIR_INTERVAL", "1m")
+WR_MOUNT_GUARD = _b("WESTREPAIR_MOUNT_GUARD", True)   # skip launching repair.py while any guarded mount is down
 
 BAZARR_URL    = os.environ.get("BAZARR_URL", "")
 BAZARR_APIKEY = os.environ.get("BAZARR_APIKEY", "")
@@ -153,9 +168,23 @@ REPAIR_STATE      = os.environ.get("REPAIR_STATE_FILE", "/data/repair.json")
 REPAIR_EVENTS     = set(e.strip() for e in os.environ.get(
     "REPAIR_EVENTS", "movieFileDeleted,episodeFileDeleted").split(",") if e.strip())
 
+# missing-from-disk check (P2): catches arr-orphaned dead files (the arr thinks a file is present
+# but the disk file/symlink is gone). check_repair only reacts to deletion *events*, so a file that
+# vanished outside an arr event (expired debrid link, manual rm) is a blind spot. OFF by default.
+# HARD SAFETY RULE: only act when the backing mount is confirmed UP (_mount_ok_for(path) is not
+# False). A missing file on a DOWN mount is a transient blip, not a real deletion -> never act.
+EN_MISSING_DISK  = _b("ENABLE_MISSING_FROM_DISK", False)
+MISSING_DISK_MAX = _i("MISSING_FROM_DISK_MAX_PER_SWEEP", 10)
+MISSING_DISK_LOAD = _i("MISSING_FROM_DISK_LOAD_MAX", 12)
+MISSING_DISK_COOLDOWN = _dur(os.environ.get("MISSING_FROM_DISK_COOLDOWN", "6h"))
+MISSING_DISK_STATE = os.environ.get("MISSING_FROM_DISK_STATE_FILE", "/data/missing_disk.json")
+
 # queue check
 MIN_STRIKES   = _i("DOCTOR_MIN_STRIKES", 2)
 MAX_ACTIONS   = _i("DOCTOR_MAX_ACTIONS", 20)
+SCRUB_MAX_DELETES = _i("SCRUBBER_MAX_DELETES", 20)   # cap arr-file deletes/quarantines per sweep
+JAN_MAX_MOVES     = _i("JANITOR_MAX_MOVES", 50)      # cap symlink quarantines per sweep
+META_MAX_REMOVES  = _i("METACLEAN_MAX_REMOVES", 50)  # cap orphan-metadata removals per sweep
 BLOCKLIST     = _b("DOCTOR_BLOCKLIST", True)
 REMOVE_CLIENT = _b("DOCTOR_REMOVE_FROM_CLIENT", True)
 STATE_FILE    = os.environ.get("DOCTOR_STATE_FILE", "/data/state.json")
@@ -318,10 +347,37 @@ SCRUB_HEADER_TO    = _i("SCRUBBER_HEADER_TIMEOUT", 30)
 SCRUB_SKIM_TO      = _i("SCRUBBER_SKIM_TIMEOUT", 180)    # per skim point timeout (tier 2)
 SCRUB_FULL_TO      = _i("SCRUBBER_FULL_TIMEOUT", 1800)   # full-decode timeout (tier 3)
 SCRUB_QUAR         = os.environ.get("SCRUBBER_QUARANTINE_DIR", os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine"))
-SCRUB_DEL_ARR      = _b("SCRUBBER_DELETE_ARR_FILE", True)  # DELETE arr movieFile/episodeFile so it re-searches; false = quarantine only
+SCRUB_DEL_ARR      = _b("SCRUBBER_DELETE_ARR_FILE", False)  # DELETE arr movieFile/episodeFile so it re-searches; false = quarantine only
 SCRUB_EXTS         = tuple(x.strip().lower() for x in os.environ.get("SCRUBBER_EXTENSIONS", ".mkv,.mp4,.avi,.m4v,.ts").split(",") if x.strip())
-SCRUB_MIN_AGE      = _i("SCRUBBER_MIN_AGE_HOURS", 1)     # skip files newer than this (don't fight the warmer / fresh imports)
+SCRUB_MIN_AGE      = _i("SCRUBBER_MIN_AGE_HOURS", 6)     # skip files newer than this (don't fight the warmer / fresh imports)
 SCRUB_REVERIFY_DAYS = _i("SCRUBBER_REVERIFY_DAYS", 30)   # re-check previously-OK files after N days (0=never)
+
+# mount-health gate (P0 safety): a file's symlink/bad-file is only deletable if the mount it
+# lives on is a mountpoint AND responsive. This prevents the "transient mount blip -> mass delete"
+# incident: when a mount is briefly down, EVERY library file on it looks dead and gets wiped.
+# Format: "mount=probe,mount=probe" where `probe` is a directory on that mount that must list a
+# non-empty result. Empty = gate disabled (legacy behaviour). e.g.
+#   MOUNT_HEALTH_GUARDS="/mnt/zurg=/mnt/zurg/__all__,/mnt/altmount=/mnt/altmount"
+MOUNT_GUARDS = {}
+for _mg in os.environ.get("MOUNT_HEALTH_GUARDS", "").split(","):
+    if "=" in _mg:
+        _m, _p = _mg.split("=", 1)
+        _m, _p = _m.strip(), _p.strip()
+        if _m and _p:
+            MOUNT_GUARDS[_m] = _p
+MOUNT_GUARD_TIMEOUT = _i("MOUNT_HEALTH_TIMEOUT", 8)      # per-mount probe timeout (seconds)
+
+# metaclean (orphaned altmount metadata -> yEnc CRC-retry storms). Ported from
+# altmount-maintenance.sh sweep 1: an altmount metadata dir is orphaned when its release NZB is
+# in altmount's failed/ dir AND no live library symlink references it AND it is old enough
+# (or currently CRC-storming). Deleting the orphan stops altmount re-reading a corrupt file forever.
+EN_METACLEAN    = _b("ENABLE_METACLEAN", False)
+META_ROOT       = os.environ.get("METACLEAN_ROOT", "")                # e.g. /data/altmount/config/metadata
+META_CATS       = [c.strip() for c in os.environ.get("METACLEAN_CATEGORIES", "radarr,sonarr,movies,tv").split(",") if c.strip()]
+META_LINK_DIRS  = [p.strip() for p in os.environ.get("METACLEAN_LINK_DIRS", "").split(",") if p.strip()]
+META_MIN_AGE    = _i("METACLEAN_MIN_AGE_HOURS", 6)                    # quiet orphaned metadata must be this old
+META_FAILED_CMD = os.environ.get("METACLEAN_FAILED_CMD", "")          # cmd listing altmount failed/ release dirs
+META_STORM_CMD  = os.environ.get("METACLEAN_STORM_CMD", "")           # cmd printing recent yEnc CRC mismatch log lines
 
 # watchlists (pull Plex Home users + non-Home friends watchlists, add directly to the arrs)
 # Sources:
@@ -458,6 +514,27 @@ def run_cmd(cmd):
     except Exception as e:
         return (1, "cmd error: " + str(e)[:120])
 
+def _safe_rmtree(path):
+    """Remove a directory only if it looks like an absolute temp/staging path.
+    Returns (True, "") on success, (False, reason) otherwise. Refuses root,
+    relative paths, parent-dir traversal, and non-directories."""
+    if not path:
+        return False, "empty path"
+    if not os.path.isabs(path):
+        return False, "not absolute"
+    if any(part == ".." for part in path.split(os.sep)):
+        return False, "contains parent-dir refs"
+    norm = os.path.normpath(path)
+    if norm in ("/", os.sep) or norm == os.path.dirname(norm):
+        return False, "refusing root or filesystem root"
+    if not os.path.isdir(path):
+        return False, "not a directory"
+    try:
+        shutil.rmtree(path)
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:120]
+
 def run_output(cmd, t=120):
     try:
         p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=t)
@@ -472,6 +549,60 @@ def host_load():
             return float(f.read().split()[0])
     except Exception:
         return 0.0
+
+# mount-health gate helpers. Cache probe results per sweep so we don't hammer a mount.
+
+_mount_ok_cache = {}
+
+def _realpath_with_timeout(path, timeout=8):
+    """Resolve a symlink without blocking forever on a hung FUSE mount."""
+    if not (os.path.exists(path) or os.path.islink(path)):
+        return path
+    result = {"p": path}
+    def _do():
+        try:
+            result["p"] = os.path.realpath(path)
+        except Exception:
+            pass
+    th = threading.Thread(target=_do, daemon=True); th.start(); th.join(timeout)
+    return result["p"]
+
+def _mount_ok_for(path):
+    """Return True if the mount backing `path` is up+responsive, False if down, None if not
+    under any guarded mount (or gate disabled). A down mount => every file on it looks broken,
+    so deletion is blocked."""
+    if not MOUNT_GUARDS:
+        return None
+    p = _realpath_with_timeout(path, MOUNT_GUARD_TIMEOUT)
+    # Longest mount path first so nested/overlapping mounts match the most specific guard.
+    for mount, probe in sorted(MOUNT_GUARDS.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if p == mount or p.startswith(mount.rstrip("/") + "/"):
+            return _probe_mount(mount, probe)
+    return None
+
+def _probe_mount(mount, probe):
+    """mountpoint + responsive (probe dir lists non-empty within timeout)."""
+    if mount in _mount_ok_cache:
+        return _mount_ok_cache[mount]
+    result = {"ok": False}
+    def _chk():
+        try:
+            if not os.path.ismount(mount):
+                result["ok"] = False; return
+            result["ok"] = bool(os.listdir(probe))
+        except Exception:
+            result["ok"] = False
+    th = threading.Thread(target=_chk, daemon=True); th.start(); th.join(MOUNT_GUARD_TIMEOUT)
+    ok = result["ok"] if not th.is_alive() else False
+    _mount_ok_cache[mount] = ok
+    if ok:
+        log.info("[mount-guard] %s up+responsive (probe %s)", mount, probe)
+    else:
+        log.warning("[mount-guard] %s DOWN/empty -> deletions under it will be SKIPPED", mount)
+    return ok
+
+def _reset_mount_cache():
+    _mount_ok_cache.clear()
 
 # =========================================================================== #
 # CHECK: queue
@@ -939,8 +1070,11 @@ def check_altmount():
             log.error("[altmount] staging dir %s owned by uid %s (need %s) -> imports will fail", d, uid, ALT_TMP_UID)
             if DRY_RUN:
                 log.error("[altmount] dry-run: would remove %s so AltMount recreates it media-owned", d); continue
-            rc = run_cmd("rm -rf -- '%s'" % d.replace("'", "'\\''"))
-            log.error("[altmount] removed stale-owned staging dir %s rc=%s", d, rc[0] if rc else "?")
+            ok, why = _safe_rmtree(d)
+            if ok:
+                log.error("[altmount] removed stale-owned staging dir %s", d)
+            else:
+                log.error("[altmount] failed to remove stale-owned staging dir %s: %s", d, why)
 
     # 3. propagation guard: a consumer with an rprivate bind never sees the mount, so imports never scan in
     for entry in ALT_PROP_CHECKS:
@@ -1120,7 +1254,8 @@ def check_janitor():
         if JAN_LOG_CMD:
             data = run_output(JAN_LOG_CMD)                       # e.g. journalctl when running on-host
         else:
-            data = open(JAN_LOG, errors="ignore").read()[-2_000_000:]
+            with open(JAN_LOG, errors="ignore") as _f:
+                data = _f.read()[-2_000_000:]
     except Exception as e:
         log.warning("[janitor] cannot read log: %s", e); return
     pat = re.compile(r"Error streaming file: (.+?) error=\"([^\"]*)\"")
@@ -1130,12 +1265,16 @@ def check_janitor():
             bad.add(path.strip().split("/")[0])
     if not bad:
         log.debug("[janitor] no dead releases in log tail"); return
+    _reset_mount_cache()
     moved = 0
+    capped = False
     qroot = os.path.join(JAN_QUAR, time.strftime("%Y%m%d-%H%M%S"))
     manifest = []
     for libp in JAN_LIBS:
         for root, _, files in os.walk(libp):
             for fn in files:
+                if moved >= JAN_MAX_MOVES:
+                    capped = True; break
                 fp = os.path.join(root, fn)
                 if not os.path.islink(fp):
                     continue
@@ -1145,6 +1284,9 @@ def check_janitor():
                     continue
                 mm = re.search(r"/__all__/([^/]+)(?:/|$)", tgt)
                 if mm and mm.group(1) in bad:
+                    if _mount_ok_for(tgt) is False:
+                        log.warning("[janitor] SKIP %s: backing mount down/empty (safety gate)", fp)
+                        continue
                     if DRY_RUN:
                         log.info("[janitor] WOULD quarantine: %s", fp); continue
                     try:
@@ -1154,13 +1296,142 @@ def check_janitor():
                         manifest.append({"orig": fp, "target": tgt}); moved += 1
                     except Exception as e:
                         log.warning("[janitor] move failed %s: %s", fp, e)
+            if moved >= JAN_MAX_MOVES:
+                break
+    if capped:
+        log.warning("[janitor] hit JANITOR_MAX_MOVES=%d -> stopping this sweep", JAN_MAX_MOVES)
     if manifest:
         try:
-            os.makedirs(qroot, exist_ok=True); json.dump(manifest, open(qroot + "/manifest.json", "w"), indent=1)
+            os.makedirs(qroot, exist_ok=True)
+            with open(qroot + "/manifest.json", "w") as _f:
+                json.dump(manifest, _f, indent=1)
         except Exception:
             pass
     if moved:
         log.info("[janitor] quarantined %d dead-file symlink(s) across %d release(s) -> %s", moved, len(bad), qroot)
+
+# =========================================================================== #
+# CHECK: metaclean (orphaned altmount metadata -> yEnc CRC-retry storms)
+#
+# altmount (usenet WebDAV + rclone FUSE) keeps per-release metadata under
+# METACLEAN_ROOT. When a download fails it leaves metadata behind; altmount
+# keeps re-reading that corrupt file forever, wedging ffprobe in D-state and
+# causing a yEnc CRC-mismatch retry storm (e.g. Iceman-DUSKLiGHT class).
+#
+# An orphaned metadata dir is removed only when ALL hold:
+#   1. its release is in altmount's failed/ dir (or currently CRC-storming), AND
+#   2. no live library symlink target references it (serving nothing), AND
+#   3. it is older than METACLEAN_MIN_AGE_HOURS (unless storming -> bypass age).
+# Live/served content is never touched. Honors DOCTOR_DRY_RUN.
+# =========================================================================== #
+
+def _meta_extract_keys(text):
+    """Mirror altmount-maintenance.sh's failed-key normalization + extraction:
+    strip leading digits-dash, trailing .nzb, .par2*, [digits]*; then lowercase
+    alphanum/dot runs >= 8 chars."""
+    keys = set()
+    for line in (text or "").splitlines():
+        line = re.sub(r"^\d+-", "", line.strip())
+        line = re.sub(r"\.nzb$", "", line)
+        line = re.sub(r"\.par2.*$", "", line)
+        line = re.sub(r"\[[0-9+]+\].*$", "", line)
+        keys |= set(re.findall(r"[a-z0-9.]{8,}", line.lower()))
+    return keys
+
+def _meta_storm_keys(text):
+    """Extract currently-storming release keys from 'yEnc CRC mismatch' log lines:
+    file_name=/cat/name -> name, then lowercase alphanum/dot runs >= 8 chars."""
+    keys = set()
+    for line in (text or "").splitlines():
+        if "yEnc CRC mismatch" not in line:
+            continue
+        for m in re.finditer(r"file_name=/[a-z]+/[^/]+", line, re.I):
+            base = m.group(0).rsplit("/", 1)[-1]
+            keys |= set(re.findall(r"[a-z0-9.]{8,}", base.lower()))
+    return keys
+
+def _meta_first_key(name):
+    """First 8+ char release-name token from a metadata dir name (matches bash `head -1`)."""
+    m = re.search(r"[a-z0-9.]{8,}", (name or "").lower())
+    return m.group(0) if m else None
+
+def check_metaclean():
+    if not (META_ROOT and META_LINK_DIRS):
+        log.debug("[metaclean] need METACLEAN_ROOT + METACLEAN_LINK_DIRS"); return
+    if not META_FAILED_CMD:
+        log.warning("[metaclean] METACLEAN_FAILED_CMD not set -> no failed-release list, check is a no-op")
+    failed_keys = set()
+    if META_FAILED_CMD:
+        failed_keys = _meta_extract_keys(run_output(META_FAILED_CMD, t=120))
+    storm_keys = set()
+    if META_STORM_CMD:
+        storm_keys = _meta_storm_keys(run_output(META_STORM_CMD, t=120))
+    if storm_keys:
+        log.info("[metaclean] %d release(s) currently CRC-storming (age gate bypassed)", len(storm_keys))
+    # index live symlink targets (one pass, lowercased, lstat only)
+    link_targets = []
+    for d in META_LINK_DIRS:
+        try:
+            for root, _, files in os.walk(d):
+                for fn in files:
+                    fp = os.path.join(root, fn)
+                    if os.path.islink(fp):
+                        try:
+                            link_targets.append(os.readlink(fp).lower())
+                        except Exception:
+                            pass
+        except Exception as e:
+            log.warning("[metaclean] walk %s failed: %s", d, e)
+    if not link_targets:
+        log.debug("[metaclean] no library symlinks found -> nothing to cross-reference"); return
+    now = time.time()
+    cand = orphan = sk_link = sk_young = 0
+    capped = False
+    for cat in META_CATS:
+        d = os.path.join(META_ROOT, cat)
+        if not os.path.isdir(d):
+            continue
+        try:
+            entries = [os.path.join(d, n) for n in os.listdir(d)]
+        except Exception:
+            continue
+        for meta in entries:
+            if orphan >= META_MAX_REMOVES:
+                capped = True; break
+            if not os.path.isdir(meta):
+                continue
+            name = os.path.basename(meta); lname = name.lower()
+            key = _meta_first_key(name)
+            if not key or key not in failed_keys:
+                continue
+            cand += 1
+            storming = key in storm_keys
+            if not storming:
+                try:
+                    mtime = os.path.getmtime(meta)
+                except Exception:
+                    mtime = now
+                if (now - mtime) / 3600 < META_MIN_AGE:
+                    sk_young += 1; continue
+            if any(lname in t for t in link_targets):
+                sk_link += 1; continue
+            orphan += 1
+            if DRY_RUN:
+                log.info("[metaclean] WOULD remove orphan metadata%s: %s/%s",
+                         " (storm)" if storming else "", cat, name)
+                continue
+            ok, why = _safe_rmtree(meta)
+            if ok:
+                log.info("[metaclean] removed orphan metadata%s: %s/%s",
+                         " (storm)" if storming else "", cat, name)
+            else:
+                log.warning("[metaclean] rmtree %s refused: %s", meta, why)
+        if orphan >= META_MAX_REMOVES:
+            break
+    if capped:
+        log.warning("[metaclean] hit METACLEAN_MAX_REMOVES=%d -> stopping this sweep", META_MAX_REMOVES)
+    log.info("[metaclean] candidates=%d removed=%d skipped_linked=%d skipped_young=%d",
+             cand, orphan, sk_link, sk_young)
 
 # =========================================================================== #
 # CHECK: scrubber (proactive file integrity scan)
@@ -1359,6 +1630,15 @@ def _scrub_act_on_bad(real_path, lib_symlink, reason, qroot, manifest):
     """Quarantine the library symlink + delete the owning arr's file so it re-searches.
     qroot is this sweep's own quarantine dir, so the moved symlink + manifest.json under it
     are a self-contained, per-sweep undo record (mv the symlink back to restore)."""
+    # mount-health gate: never delete when the backing mount is down/empty (transient blip =>
+    # everything looks dead). Skip the whole action and just record the skip.
+    mok = _mount_ok_for(real_path)
+    if mok is False:
+        log.warning("[scrubber] SKIP %s: backing mount down/empty (safety gate)", lib_symlink)
+        manifest.append({"real": real_path, "symlink": lib_symlink, "reason": reason,
+                         "moved": False, "arr_acted": False, "skipped_mount_down": True,
+                         "ts": int(time.time())})
+        return False
     if DRY_RUN:
         log.warning("[scrubber] WOULD quarantine + re-grab %s (%s)", lib_symlink, reason)
         return False
@@ -1408,6 +1688,7 @@ def _scrub_act_on_bad(real_path, lib_symlink, reason, qroot, manifest):
 def check_scrubber():
     if not SCRUB_PATHS:
         log.debug("[scrubber] no SCRUBBER_PATHS (or JANITOR_LIBRARY_PATHS) configured"); return
+    _reset_mount_cache()
     # plex-safe gate
     load1 = host_load()
     if SCRUB_LOAD_MAX > 0 and load1 > SCRUB_LOAD_MAX:
@@ -1450,13 +1731,21 @@ def check_scrubber():
     log.info("[scrubber] scanning %d file(s), tier=%d", len(candidates), SCRUB_TIER)
     manifest = []
     sweep_qroot = os.path.join(SCRUB_QUAR, time.strftime("scrubber-%Y%m%d-%H%M%S"))
-    bad = 0; suspect = 0; ok_n = 0
+    bad = 0; suspect = 0; ok_n = 0; deletes = 0; capped = False
     for real_path, lib_symlink, st in candidates:
         # re-check load mid-sweep; bail early if we've started crowding decypharr
         if SCRUB_LOAD_MAX > 0 and host_load() > SCRUB_LOAD_MAX:
             log.info("[scrubber] load climbed >%.1f, pausing mid-sweep", SCRUB_LOAD_MAX)
             break
+        if deletes >= SCRUB_MAX_DELETES:
+            capped = True; break
         rec = files_state.setdefault(real_path, {})
+        # mount-health gate (pre-check): if the backing mount is down/empty, scan results are
+        # meaningless (every file fails) and strikes would be poisoned -> skip entirely, don't
+        # even record a strike. Final defense is also inside _scrub_act_on_bad.
+        if _mount_ok_for(real_path) is False:
+            log.warning("[scrubber] SKIP %s: backing mount down/empty (safety gate)", lib_symlink)
+            continue
         # ----- tier 1: ffprobe header -----
         ok, why = _scrub_t1_header(real_path)
         cur_tier = 1
@@ -1492,7 +1781,10 @@ def check_scrubber():
             else:
                 bad += 1
                 log.error("[scrubber] BAD t%d %s :: %s", cur_tier, real_path, why[:200])
-                _scrub_act_on_bad(real_path, lib_symlink, why, sweep_qroot, manifest)
+                if _scrub_act_on_bad(real_path, lib_symlink, why, sweep_qroot, manifest):
+                    deletes += 1
+    if capped:
+        log.warning("[scrubber] hit SCRUBBER_MAX_DELETES=%d -> stopping this sweep", SCRUB_MAX_DELETES)
     # persist this sweep's manifest (fresh dir per sweep => a clean, isolated undo record)
     if manifest:
         try:
@@ -2509,6 +2801,102 @@ def check_repair():
         log.info("[repair] triggered %d immediate re-grab(s)", searched)
 
 
+def _missing_disk_load_state():
+    try: return json.load(open(MISSING_DISK_STATE))
+    except Exception: return {}
+
+def _missing_disk_save_state(s):
+    try:
+        os.makedirs(os.path.dirname(MISSING_DISK_STATE) or ".", exist_ok=True)
+        json.dump(s, open(MISSING_DISK_STATE, "w"))
+    except Exception as e:
+        log.debug("[missing-disk] state save failed: %s", e)
+
+def _missing_disk_items(arr):
+    """Items the arr believes are present, each with a reported file path.
+    Returns [{kind, id, file_id, path, title, search_body}]. Radarr lists via /movie
+    (hasFile + movieFile.path); Sonarr lists via /episodefile."""
+    out = []
+    if arr.kind == "radarr":
+        data = arr.get_json("/movie") or []
+        for m in data if isinstance(data, list) else []:
+            mf = m.get("movieFile") or {}
+            if not m.get("hasFile") or not mf.get("path"):
+                continue
+            out.append({"kind": "movie", "id": m.get("id"), "file_id": mf.get("id"),
+                        "path": mf.get("path"), "title": m.get("title") or "",
+                        "search_body": {"name": "MoviesSearch", "movieIds": [m.get("id")]}})
+    else:
+        data = arr.get_json("/episodefile") or []
+        for ef in data if isinstance(data, list) else []:
+            if not ef.get("path"):
+                continue
+            out.append({"kind": "episode", "id": ef.get("seriesId"), "file_id": ef.get("id"),
+                        "path": ef.get("path"), "title": ef.get("relativePath") or "",
+                        "search_body": {"name": "EpisodeSearch",
+                                        "seriesId": ef.get("seriesId"),
+                                        "seasonNumber": ef.get("seasonNumber"),
+                                        "episodeNumbers": ef.get("episodeNumbers")}})
+    return out
+
+def _missing_disk_fix(arr, it):
+    """Delete the arr's stale file record + re-search the item. Returns True on a triggered search."""
+    try:
+        if it.get("file_id"):
+            path = "/moviefile/%d" % it["file_id"] if it["kind"] == "movie" else "/episodefile/%d" % it["file_id"]
+            arr._req("DELETE", path)
+        if arr.command(it["search_body"]) is not None:
+            log.warning("[missing-disk:%s] file missing-from-disk -> re-grabbing NOW: %s",
+                        arr.name, it.get("title") or it.get("path"))
+            return True
+    except Exception as e:
+        log.warning("[missing-disk:%s] fix failed for %s: %s", arr.name, it.get("title"), str(e)[:120])
+    return False
+
+def check_missing_from_disk():
+    """Re-grab items the arr thinks are present but whose file is gone on disk.
+    HARD SAFETY RULE: only act when the backing mount is confirmed UP
+    (_mount_ok_for(path) is not False). A missing file on a DOWN mount is a
+    transient blip, not a real deletion -> never act. Off by default."""
+    arrs = [a for a in INSTANCES if a.kind in ("sonarr", "radarr")]
+    if not arrs:
+        return
+    if MISSING_DISK_LOAD > 0 and host_load() > MISSING_DISK_LOAD:
+        log.info("[missing-disk] host load > %d -> skipping", MISSING_DISK_LOAD); return
+    _reset_mount_cache()
+    state = _missing_disk_load_state()
+    cool = state.setdefault("cooldown", {})
+    now = time.time(); acted = 0
+    for arr in arrs:
+        if acted >= MISSING_DISK_MAX:
+            break
+        for it in _missing_disk_items(arr):
+            if acted >= MISSING_DISK_MAX:
+                break
+            p = it.get("path") or ""
+            if not p:
+                continue
+            real = _realpath_with_timeout(p, MOUNT_GUARD_TIMEOUT)
+            if os.path.exists(real):
+                continue                        # file is fine
+            if _mount_ok_for(p) is False:
+                log.warning("[missing-disk] SKIP %s: mount down/empty (safety gate)", p)
+                continue
+            ck = str(it.get("id") or p)
+            if now - cool.get(ck, 0) < MISSING_DISK_COOLDOWN:
+                continue
+            if DRY_RUN:
+                log.info("[missing-disk] WOULD re-grab: %s", it.get("title") or p); acted += 1; continue
+            if _missing_disk_fix(arr, it):
+                cool[ck] = now; acted += 1
+    for k, ts in list(cool.items()):            # prune stale cooldown entries
+        if now - ts > max(MISSING_DISK_COOLDOWN * 4, 86400):
+            cool.pop(k, None)
+    _missing_disk_save_state(state)
+    if acted:
+        log.info("[missing-disk] re-grabbed %d item(s) missing-from-disk", acted)
+
+
 def _riven_load_state():
     try: return json.load(open(RIVEN_STATE))
     except Exception: return {}
@@ -3208,6 +3596,12 @@ def westrepair_loop(stop):
     log.info("[westrepair] starting %s | run_interval=%s repair_interval=%s",
              WR_SCRIPT, WR_RUN_INTERVAL, WR_REPAIR_INTERVAL)
     while not stop.is_set():
+        if WR_MOUNT_GUARD and MOUNT_GUARDS:
+            _reset_mount_cache()
+            down = [m for m, p in MOUNT_GUARDS.items() if _probe_mount(m, p) is False]
+            if down:
+                log.warning("[westrepair] mount(s) down %s -> not launching repair.py this cycle", down)
+                stop.wait(60); continue
         cmd = ["python", "-u", WR_SCRIPT, "--no-confirm",
                "--run-interval", WR_RUN_INTERVAL,
                "--repair-interval", WR_REPAIR_INTERVAL]
@@ -3282,11 +3676,13 @@ def _wr_plex_rescan():
 CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_providers),
           ("decypharr", EN_DECYPHARR, check_decypharr), ("altmount", EN_ALTMOUNT, check_altmount), ("plex", EN_PLEX, check_plex), ("silo", EN_SILO, check_silo), ("silo-rematch", SILO_REMATCH, check_silo_rematch),
           ("resources", EN_RESOURCES, check_resources), ("janitor", EN_JANITOR, check_janitor),
+          ("metaclean", EN_METACLEAN, check_metaclean),
           ("scrubber", EN_SCRUBBER, check_scrubber),
           ("watchlists", EN_WATCHLISTS, check_watchlists),
           ("holidays", EN_HOLIDAYS, check_holidays),
           ("backlog", EN_BACKLOG, check_backlog),
           ("repair", EN_REPAIR, check_repair),
+          ("missing-disk", EN_MISSING_DISK, check_missing_from_disk),
           ("riven", EN_RIVEN, check_riven),
           ("mediastorm", EN_MEDIASTORM, check_mediastorm),
           ("bazarr", EN_BAZARR, check_bazarr), ("seerr", EN_SEERR, check_seerr),
@@ -3317,12 +3713,13 @@ _SECRET_HINT = ("APIKEY", "API_KEY", "TOKEN", "PASSWORD", "PASS", "SECRET")
 
 UI_SCHEMA = [
     ("Mode", [("DOCTOR_MODE", "cron|event"), ("DOCTOR_INTERVAL", "900"),
-              ("DOCTOR_DRY_RUN", "false"), ("DOCTOR_LOG_LEVEL", "INFO")]),
+              ("DOCTOR_DRY_RUN", "true"), ("DOCTOR_LOG_LEVEL", "INFO")]),
     ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""), ("ENABLE_ALTMOUNT", ""),
-              ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""), ("ENABLE_SCRUBBER", ""),
+              ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""), ("ENABLE_METACLEAN", ""), ("ENABLE_SCRUBBER", ""),
               ("ENABLE_WATCHLISTS", ""), ("ENABLE_HOLIDAYS", ""), ("ENABLE_BACKLOG", ""),
               ("ENABLE_RIVEN", ""), ("ENABLE_MEDIASTORM", ""),
-              ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", "")]),
+              ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", ""),
+              ("ENABLE_MISSING_FROM_DISK", "")]),
     ("AltMount (usenet WebDAV + mount)", [("ALTMOUNT_URL", "http://192.168.50.202:8080"),
               ("ALTMOUNT_APIKEY", "sab api key"), ("ALTMOUNT_MOUNT_TEST", "/mnt/library/altmount"),
               ("ALTMOUNT_RESTART_CMD", "systemctl restart altmount"), ("ALTMOUNT_TMP_UID", "1000"),
@@ -3349,9 +3746,22 @@ UI_SCHEMA = [
               ("SCRUBBER_SKIM_POINTS", "4"), ("SCRUBBER_SKIM_SECS", "5"),
               ("SCRUBBER_MAX_FILES", "50"), ("SCRUBBER_CONCURRENCY", "1"),
               ("SCRUBBER_LOAD_MAX", "12"), ("SCRUBBER_STRIKES", "2"),
-              ("SCRUBBER_REVERIFY_DAYS", "30"), ("SCRUBBER_DELETE_ARR_FILE", "true")]),
+               ("SCRUBBER_REVERIFY_DAYS", "30"), ("SCRUBBER_DELETE_ARR_FILE", "false"),
+               ("SCRUBBER_MIN_AGE_HOURS", "6"),
+               ("MOUNT_HEALTH_GUARDS", "/mnt/zurg=/mnt/zurg/__all__,/mnt/altmount=/mnt/altmount"),
+               ("MOUNT_HEALTH_TIMEOUT", "8")]),
+    ("Metaclean (orphaned altmount metadata)", [
+               ("METACLEAN_ROOT", "/data/altmount/config/metadata"),
+               ("METACLEAN_CATEGORIES", "radarr,sonarr,movies,tv"),
+               ("METACLEAN_LINK_DIRS", "/mnt/iceberg,/mnt/altmount-links"),
+               ("METACLEAN_MIN_AGE_HOURS", "6"),
+               ("METACLEAN_FAILED_CMD", "docker exec altmount sh -c 'ls /config/.nzbs/failed/*/'"),
+               ("METACLEAN_STORM_CMD", "docker logs --since 15m altmount 2>&1 | grep 'yEnc CRC mismatch'")]),
     ("Westrepair", [("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py"),
               ("WESTREPAIR_RUN_INTERVAL", "6h"), ("WESTREPAIR_REPAIR_INTERVAL", "1m")]),
+    ("Missing-from-disk (arr-orphaned dead files)", [
+              ("ENABLE_MISSING_FROM_DISK", "false"), ("MISSING_FROM_DISK_MAX_PER_SWEEP", "10"),
+              ("MISSING_FROM_DISK_LOAD_MAX", "12"), ("MISSING_FROM_DISK_COOLDOWN", "6h")]),
     ("Backlog (search monitored-missing)", [
               ("BACKLOG_INSTANCES", "sonarr,radarr,sonarr4k,radarr4k"),
               ("BACKLOG_PER_SWEEP", "5"), ("BACKLOG_MIN_AGE_DAYS", "7"),
@@ -4978,9 +5388,10 @@ var obMode='easy',obServices=[],obChecks={},obState={};
 var OB_INSTANCE_TYPES={radarr:1,radarr4k:1,sonarr:1,sonarr4k:1,prowlarr:1,riven:1,mediastorm:1};
 var OB_ADDABLE=['radarr','radarr4k','sonarr','sonarr4k','prowlarr','riven','mediastorm','seerr','bazarr'];
 var OB_CHECKS=[['ENABLE_QUEUE','queue'],['ENABLE_SCOUT','scout'],['ENABLE_PLEX','plex'],['ENABLE_SILO','silo'],['ENABLE_DECYPHARR','decypharr'],
- ['ENABLE_PROVIDERS','providers'],['ENABLE_RESOURCES','resources'],['ENABLE_JANITOR','janitor'],['ENABLE_WATCHLISTS','watchlists'],
+ ['ENABLE_PROVIDERS','providers'],['ENABLE_RESOURCES','resources'],['ENABLE_JANITOR','janitor'],['ENABLE_METACLEAN','metaclean'],['ENABLE_WATCHLISTS','watchlists'],
  ['ENABLE_HOLIDAYS','holidays'],['ENABLE_BACKLOG','backlog'],['ENABLE_RIVEN','riven'],['ENABLE_MEDIASTORM','mediastorm'],
- ['ENABLE_SEERR','seerr'],['ENABLE_BAZARR','bazarr'],['ENABLE_SCRUBBER','scrubber'],['ENABLE_WARMER','warmer']];
+ ['ENABLE_SEERR','seerr'],['ENABLE_BAZARR','bazarr'],['ENABLE_SCRUBBER','scrubber'],['ENABLE_WARMER','warmer'],
+ ['ENABLE_MISSING_FROM_DISK','missing-disk']];
 function obHas(t){for(var i=0;i<obServices.length;i++)if(obServices[i].type===t)return true;return false}
 function obHasUrl(u){for(var i=0;i<obServices.length;i++)if(obServices[i].url===u)return true;return false}
 function obMergeDefaults(){var c=obChecks;function d(k){if(c[k]===undefined)c[k]=true}
@@ -5186,12 +5597,14 @@ def main():
         log.error("queue check enabled but no instances. Set INSTANCE_1_URL / _APIKEY / _TYPE.")
         sys.exit(2)
     if not enabled and not warmer_on and not EN_UI:
-        log.error("nothing enabled. Set ENABLE_QUEUE / ENABLE_DECYPHARR / ENABLE_PLEX / ENABLE_RESOURCES / ENABLE_JANITOR / ENABLE_WARMER / ENABLE_UI.")
+        log.error("nothing enabled. Set ENABLE_QUEUE / ENABLE_DECYPHARR / ENABLE_PLEX / ENABLE_RESOURCES / ENABLE_JANITOR / ENABLE_METACLEAN / ENABLE_WARMER / ENABLE_MISSING_FROM_DISK / ENABLE_UI.")
         sys.exit(2)
     extra = [r.name + "(riven)" for r in RIVENS] + [m.name + "(mediastorm)" for m in MEDIASTORMS]
     log.info("stack-doctor v%s | mode=%s | checks=[%s]%s%s | instances=%s | dry_run=%s",
              VERSION, MODE, ",".join(enabled), " +warmer" if warmer_on else "", " +ui" if EN_UI else "",
              ", ".join([a.name for a in INSTANCES] + extra) or "-", DRY_RUN)
+    log.info("safety posture: dry_run=%s scrubber_delete_arr=%s scrubber_min_age=%dh max_actions=%d mount_guards=%d",
+             DRY_RUN, SCRUB_DEL_ARR, SCRUB_MIN_AGE, MAX_ACTIONS, len(MOUNT_GUARDS))
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
