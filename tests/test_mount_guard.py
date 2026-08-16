@@ -207,5 +207,104 @@ class MetacleanCapTest(unittest.TestCase):
             doctor._safe_rmtree(root); doctor._safe_rmtree(links)
 
 
+class MissingFromDiskSonarrTest(unittest.TestCase):
+    def test_sonarr_uses_episode_ids(self):
+        arr = MagicMock()
+        arr.name = "sonarr"; arr.kind = "sonarr"
+        def _get_json(path, t=None):
+            if path == "/episodefile":
+                return [{"id": 55, "seriesId": 9, "seasonNumber": 2,
+                         "path": "/mnt/zurg/x.mkv", "relativePath": "S02E03.mkv"}]
+            if path.startswith("/episode?seriesId="):
+                return [{"id": 501, "episodeFileId": 55}, {"id": 502, "episodeFileId": 77}]
+            return None
+        arr.get_json.side_effect = _get_json
+        arr.command.return_value = {}
+        with patch.object(doctor, "INSTANCES", [arr]), \
+             patch.object(doctor, "DRY_RUN", False), \
+             patch.object(doctor, "host_load", return_value=0.0), \
+             patch.object(doctor, "_mount_ok_for", return_value=True), \
+             patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
+             patch.object(doctor.os.path, "exists", return_value=False), \
+             patch.object(doctor, "_missing_disk_load_state", return_value={}), \
+             patch.object(doctor, "_missing_disk_save_state", return_value=None):
+            doctor.check_missing_from_disk()
+        calls = [c.args[0] for c in arr.command.call_args_list]
+        self.assertTrue(calls, "expected a search command")
+        body = calls[0]
+        self.assertEqual(body.get("name"), "EpisodeSearch")
+        self.assertEqual(body.get("episodeIds"), [501])
+        self.assertNotIn("episodeNumbers", body)
+        arr._req.assert_any_call("DELETE", "/episodefile/55")
+
+    def test_two_episodes_same_series_both_acted(self):
+        arr = MagicMock()
+        arr.name = "sonarr"; arr.kind = "sonarr"
+        def _get_json(path, t=None):
+            if path == "/episodefile":
+                return [
+                    {"id": 55, "seriesId": 9, "seasonNumber": 2, "path": "/mnt/zurg/a.mkv", "relativePath": "a"},
+                    {"id": 56, "seriesId": 9, "seasonNumber": 2, "path": "/mnt/zurg/b.mkv", "relativePath": "b"},
+                ]
+            if path.startswith("/episode?seriesId="):
+                return [{"id": 501, "episodeFileId": 55}, {"id": 502, "episodeFileId": 56}]
+            return None
+        arr.get_json.side_effect = _get_json
+        arr.command.return_value = {}
+        with patch.object(doctor, "INSTANCES", [arr]), \
+             patch.object(doctor, "DRY_RUN", False), \
+             patch.object(doctor, "host_load", return_value=0.0), \
+             patch.object(doctor, "_mount_ok_for", return_value=True), \
+             patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
+             patch.object(doctor.os.path, "exists", return_value=False), \
+             patch.object(doctor, "_missing_disk_load_state", return_value={}), \
+             patch.object(doctor, "_missing_disk_save_state", return_value=None):
+            doctor.check_missing_from_disk()
+        self.assertEqual(arr.command.call_count, 2, "both episodes of the series must be actioned")
+
+
+class ScrubberMountGateOrderTest(unittest.TestCase):
+    def test_scrubber_skips_stat_on_down_mount(self):
+        files = [("/mnt/zurg/f0.mkv", "/mnt/lib/link0.mkv")]
+        with tempfile.TemporaryDirectory() as quar, \
+             patch.object(doctor, "SCRUB_PATHS", ["/mnt/lib"]), \
+             patch.object(doctor, "SCRUB_QUAR", quar), \
+             patch.object(doctor, "SCRUB_LOAD_MAX", 0), \
+             patch.object(doctor, "SCRUB_MIN_AGE", 0), \
+             patch.object(doctor, "_scrub_walk", return_value=iter(files)), \
+             patch.object(doctor, "_scrub_load_state", return_value={}), \
+             patch.object(doctor, "_scrub_save_state", return_value=None), \
+             patch.object(doctor, "_mount_ok_for", return_value=False), \
+             patch.object(doctor, "_stat_with_timeout") as mock_stat:
+            doctor.check_scrubber()
+        mock_stat.assert_not_called()
+
+
+class MetacleanStormOnlyTest(unittest.TestCase):
+    def test_removes_storm_only_orphan(self):
+        root = tempfile.mkdtemp()
+        cat = os.path.join(root, "radarr"); os.makedirs(cat)
+        os.makedirs(os.path.join(cat, "storming.release.2024"))
+        links = tempfile.mkdtemp()
+        os.symlink("/mnt/library/other", os.path.join(links, "live"))
+        try:
+            with patch.object(doctor, "META_ROOT", root), \
+                 patch.object(doctor, "META_LINK_DIRS", [links]), \
+                 patch.object(doctor, "META_CATS", ["radarr"]), \
+                 patch.object(doctor, "META_FAILED_CMD", ""), \
+                 patch.object(doctor, "META_STORM_CMD", "echo storm"), \
+                 patch.object(doctor, "META_MIN_AGE", 999999), \
+                 patch.object(doctor, "META_MAX_REMOVES", 50), \
+                 patch.object(doctor, "DRY_RUN", False), \
+                 patch.object(doctor, "_meta_extract_keys", return_value=set()), \
+                 patch.object(doctor, "_meta_storm_keys", return_value={"storming.release.2024"}), \
+                 patch.object(doctor, "run_output", return_value="storm"):
+                doctor.check_metaclean()
+            self.assertFalse(os.path.isdir(os.path.join(cat, "storming.release.2024")),
+                             "storm-only orphan must be removed even with no failed-list match")
+        finally:
+            doctor._safe_rmtree(root); doctor._safe_rmtree(links)
+
+
 if __name__ == "__main__":
     unittest.main()

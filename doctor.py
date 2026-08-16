@@ -555,9 +555,10 @@ def host_load():
 _mount_ok_cache = {}
 
 def _realpath_with_timeout(path, timeout=8):
-    """Resolve a symlink without blocking forever on a hung FUSE mount."""
-    if not (os.path.exists(path) or os.path.islink(path)):
-        return path
+    """Resolve a symlink without blocking forever on a hung FUSE mount.
+    ALL filesystem access (realpath -> lstat/readlink) runs inside the worker
+    thread, so a hung mount can only cost `timeout` seconds, never the caller.
+    os.path.realpath does not require the path to exist and never raises here."""
     result = {"p": path}
     def _do():
         try:
@@ -566,6 +567,18 @@ def _realpath_with_timeout(path, timeout=8):
             pass
     th = threading.Thread(target=_do, daemon=True); th.start(); th.join(timeout)
     return result["p"]
+
+def _stat_with_timeout(path, timeout=8):
+    """os.stat that can't hang the caller on a dead FUSE mount.
+    Returns the os.stat_result, or None on error/timeout."""
+    result = {"st": None}
+    def _do():
+        try:
+            result["st"] = os.stat(path)
+        except Exception:
+            pass
+    th = threading.Thread(target=_do, daemon=True); th.start(); th.join(timeout)
+    return result["st"]
 
 def _mount_ok_for(path):
     """Return True if the mount backing `path` is up+responsive, False if down, None if not
@@ -1359,7 +1372,7 @@ def check_metaclean():
     if not (META_ROOT and META_LINK_DIRS):
         log.debug("[metaclean] need METACLEAN_ROOT + METACLEAN_LINK_DIRS"); return
     if not META_FAILED_CMD:
-        log.warning("[metaclean] METACLEAN_FAILED_CMD not set -> no failed-release list, check is a no-op")
+        log.warning("[metaclean] METACLEAN_FAILED_CMD not set -> failed-list matching disabled; only currently-storming releases are eligible")
     failed_keys = set()
     if META_FAILED_CMD:
         failed_keys = _meta_extract_keys(run_output(META_FAILED_CMD, t=120))
@@ -1402,7 +1415,7 @@ def check_metaclean():
                 continue
             name = os.path.basename(meta); lname = name.lower()
             key = _meta_first_key(name)
-            if not key or key not in failed_keys:
+            if not key or (key not in failed_keys and key not in storm_keys):
                 continue
             cand += 1
             storming = key in storm_keys
@@ -1491,10 +1504,7 @@ def _scrub_walk(paths):
                     if not fn.lower().endswith(SCRUB_EXTS):
                         continue
                     fp = os.path.join(root, fn)
-                    try:
-                        rp = os.path.realpath(fp)
-                    except Exception:
-                        rp = fp
+                    rp = _realpath_with_timeout(fp, MOUNT_GUARD_TIMEOUT)
                     if rp in seen:
                         continue
                     seen.add(rp)
@@ -1701,9 +1711,12 @@ def check_scrubber():
     # pick candidates: never-scanned OR changed (size/mtime) OR overdue for reverify OR previously suspect (strikes>0)
     candidates = []
     for real_path, lib_symlink in _scrub_walk(SCRUB_PATHS):
-        try:
-            st = os.stat(real_path)
-        except Exception:
+        # mount-health gate BEFORE any blocking stat: a down/hung guarded mount must
+        # not block candidate construction (and its stat results are meaningless).
+        if _mount_ok_for(real_path) is False:
+            continue
+        st = _stat_with_timeout(real_path, MOUNT_GUARD_TIMEOUT)
+        if st is None:
             continue
         if (now - st.st_mtime) < SCRUB_MIN_AGE * 3600:
             continue   # don't fight fresh imports / the warmer
@@ -2814,38 +2827,64 @@ def _missing_disk_save_state(s):
 
 def _missing_disk_items(arr):
     """Items the arr believes are present, each with a reported file path.
-    Returns [{kind, id, file_id, path, title, search_body}]. Radarr lists via /movie
-    (hasFile + movieFile.path); Sonarr lists via /episodefile."""
+    Returns [{kind, key, file_id, series_id, season, path, title, search_body}].
+    `key` is a UNIQUE per-item cooldown key. For sonarr the EpisodeSearch body is
+    resolved later (episodefile records carry no episodeIds)."""
     out = []
     if arr.kind == "radarr":
         data = arr.get_json("/movie") or []
         for m in data if isinstance(data, list) else []:
             mf = m.get("movieFile") or {}
-            if not m.get("hasFile") or not mf.get("path"):
+            mid = m.get("id")
+            if not m.get("hasFile") or not mf.get("path") or not mid:
                 continue
-            out.append({"kind": "movie", "id": m.get("id"), "file_id": mf.get("id"),
-                        "path": mf.get("path"), "title": m.get("title") or "",
-                        "search_body": {"name": "MoviesSearch", "movieIds": [m.get("id")]}})
+            out.append({"kind": "movie", "key": "movie:%s" % mid, "file_id": mf.get("id"),
+                        "series_id": None, "season": None, "path": mf.get("path"),
+                        "title": m.get("title") or "",
+                        "search_body": {"name": "MoviesSearch", "movieIds": [mid]}})
     else:
         data = arr.get_json("/episodefile") or []
         for ef in data if isinstance(data, list) else []:
-            if not ef.get("path"):
+            if not ef.get("path") or not ef.get("id"):
                 continue
-            out.append({"kind": "episode", "id": ef.get("seriesId"), "file_id": ef.get("id"),
-                        "path": ef.get("path"), "title": ef.get("relativePath") or "",
-                        "search_body": {"name": "EpisodeSearch",
-                                        "seriesId": ef.get("seriesId"),
-                                        "seasonNumber": ef.get("seasonNumber"),
-                                        "episodeNumbers": ef.get("episodeNumbers")}})
+            out.append({"kind": "episode", "key": "epfile:%s" % ef.get("id"),
+                        "file_id": ef.get("id"), "series_id": ef.get("seriesId"),
+                        "season": ef.get("seasonNumber"), "path": ef.get("path"),
+                        "title": ef.get("relativePath") or "",
+                        "search_body": None})   # resolved in _missing_disk_fix
     return out
 
+def _missing_disk_episode_ids(arr, series_id, file_id):
+    """Episode IDs whose file is `file_id`. episodefiles carry no episodeIds, so we
+    look them up via /episode BEFORE the episodefile is deleted."""
+    if not series_id:
+        return []
+    eps = arr.get_json("/episode?seriesId=%d" % series_id) or []
+    return [e.get("id") for e in eps
+            if isinstance(e, dict) and e.get("episodeFileId") == file_id and e.get("id")]
+
 def _missing_disk_fix(arr, it):
-    """Delete the arr's stale file record + re-search the item. Returns True on a triggered search."""
+    """Delete the arr's stale file record + re-search the item. Returns True on a
+    triggered search. For sonarr, resolve real episodeIds BEFORE deleting the file
+    (episodefiles have no episodeIds); fall back to a season/series search."""
     try:
+        body = it.get("search_body")
+        if body is None and it.get("kind") == "episode":
+            ids = _missing_disk_episode_ids(arr, it.get("series_id"), it.get("file_id"))
+            if ids:
+                body = {"name": "EpisodeSearch", "episodeIds": ids}
+            elif it.get("series_id") is not None and it.get("season") is not None:
+                body = {"name": "SeasonSearch", "seriesId": it["series_id"], "seasonNumber": it["season"]}
+            elif it.get("series_id"):
+                body = {"name": "SeriesSearch", "seriesId": it["series_id"]}
+        if not body:
+            log.info("[missing-disk:%s] no searchable target for %s",
+                     arr.name, it.get("title") or it.get("path"))
+            return False
         if it.get("file_id"):
             path = "/moviefile/%d" % it["file_id"] if it["kind"] == "movie" else "/episodefile/%d" % it["file_id"]
             arr._req("DELETE", path)
-        if arr.command(it["search_body"]) is not None:
+        if arr.command(body) is not None:
             log.warning("[missing-disk:%s] file missing-from-disk -> re-grabbing NOW: %s",
                         arr.name, it.get("title") or it.get("path"))
             return True
@@ -2882,7 +2921,7 @@ def check_missing_from_disk():
             if _mount_ok_for(p) is False:
                 log.warning("[missing-disk] SKIP %s: mount down/empty (safety gate)", p)
                 continue
-            ck = str(it.get("id") or p)
+            ck = "%s:%s" % (arr.name, it.get("key") or p)
             if now - cool.get(ck, 0) < MISSING_DISK_COOLDOWN:
                 continue
             if DRY_RUN:
