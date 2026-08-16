@@ -83,7 +83,11 @@ def _human(sec):
 CONFIG_FILE = os.environ.get("DOCTOR_CONFIG_FILE", "/data/config.json")
 
 def _load_overrides():
-    diverged = []
+    """Apply /data/config.json (dashboard-saved) settings as a FALLBACK layer only.
+    The compose environment is the source of truth: a key already present in the
+    environment is never overwritten by config.json (so a stale dashboard save
+    can't clobber it). Empty-string values are treated as unset."""
+    ignored = []
     try:
         with open(CONFIG_FILE) as f:
             data = json.load(f)
@@ -93,14 +97,16 @@ def _load_overrides():
         if v is None or v == "":
             continue
         old = os.environ.get(str(k))
-        if old is not None and old != str(v):
-            diverged.append(str(k))
+        if old is not None:
+            if old != str(v):
+                ignored.append(str(k))
+            continue   # environment already sets this key -> env wins
         os.environ[str(k)] = str(v)
-    if diverged:
+    if ignored:
         # NOTE: log is not configured yet at import time; use print to stderr.
         import sys as _sys
-        print("WARNING [config] %d key(s) in %s override the environment: %s"
-              % (len(diverged), CONFIG_FILE, ", ".join(sorted(diverged))), file=_sys.stderr)
+        print("WARNING [config] %d key(s) in %s ignored (environment already sets them): %s"
+              % (len(ignored), CONFIG_FILE, ", ".join(sorted(ignored))), file=_sys.stderr)
 
 _load_overrides()
 

@@ -138,6 +138,7 @@ class MissingFromDiskTest(unittest.TestCase):
 
 class ConfigDivergenceTest(unittest.TestCase):
     def test_config_divergence_warns(self):
+        """A key already set in the environment is NOT overwritten by config.json."""
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         f.write('{"DOCTOR_INTERVAL": "111"}')
         cfg = f.name; f.close()
@@ -147,10 +148,27 @@ class ConfigDivergenceTest(unittest.TestCase):
                  patch("sys.stderr", new_callable=io.StringIO) as err:
                 doctor._load_overrides()
                 out = err.getvalue()
-            self.assertIn("override the environment", out)
+                after = os.environ.get("DOCTOR_INTERVAL")
+            self.assertIn("ignored", out)
             self.assertIn("DOCTOR_INTERVAL", out)
+            self.assertEqual(after, "900", "environment value must win over config.json")
         finally:
             os.unlink(cfg)
+
+    def test_config_applies_when_env_unset(self):
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        f.write('{"DOCTOR_CHURN_LIMIT": "7"}')
+        cfg = f.name; f.close()
+        try:
+            with patch.object(doctor, "CONFIG_FILE", cfg), \
+                 patch("sys.stderr", new_callable=io.StringIO):
+                os.environ.pop("DOCTOR_CHURN_LIMIT", None)
+                doctor._load_overrides()
+                after = os.environ.get("DOCTOR_CHURN_LIMIT")
+            self.assertEqual(after, "7", "config.json must apply keys not set in the env")
+        finally:
+            os.unlink(cfg)
+            os.environ.pop("DOCTOR_CHURN_LIMIT", None)
 
     def test_empty_string_does_not_override(self):
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
