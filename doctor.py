@@ -181,9 +181,11 @@ REPAIR_EVENTS     = set(e.strip() for e in os.environ.get(
 # False). A missing file on a DOWN mount is a transient blip, not a real deletion -> never act.
 EN_MISSING_DISK  = _b("ENABLE_MISSING_FROM_DISK", False)
 MISSING_DISK_MAX = _i("MISSING_FROM_DISK_MAX_PER_SWEEP", 10)
+MISSING_DISK_SERIES = _i("MISSING_FROM_DISK_SERIES_PER_SWEEP", 20)  # sonarr: /episodefile needs a seriesId, so rotate through series this many per sweep
 MISSING_DISK_LOAD = _i("MISSING_FROM_DISK_LOAD_MAX", 12)
 MISSING_DISK_COOLDOWN = _dur(os.environ.get("MISSING_FROM_DISK_COOLDOWN", "6h"))
 MISSING_DISK_STATE = os.environ.get("MISSING_FROM_DISK_STATE_FILE", "/data/missing_disk.json")
+MISSING_DISK_MAX_RETRIES = _i("MISSING_FROM_DISK_MAX_RETRIES", 5)  # give up retrying a lost-record search after this many failed attempts
 
 # queue check
 MIN_STRIKES   = _i("DOCTOR_MIN_STRIKES", 2)
@@ -560,18 +562,23 @@ def host_load():
 
 _mount_ok_cache = {}
 
-def _realpath_with_timeout(path, timeout=8):
+def _realpath_with_timeout(path, timeout=8, return_timeout=False):
     """Resolve a symlink without blocking forever on a hung FUSE mount.
     ALL filesystem access (realpath -> lstat/readlink) runs inside the worker
     thread, so a hung mount can only cost `timeout` seconds, never the caller.
-    os.path.realpath does not require the path to exist and never raises here."""
-    result = {"p": path}
+    os.path.realpath does not require the path to exist and never raises here.
+    If `return_timeout` is set, returns (path, timed_out) so callers can tell
+    a genuine hang apart from realpath legitimately returning the input path."""
+    result = {"p": path, "timed_out": True}
     def _do():
         try:
             result["p"] = os.path.realpath(path)
         except Exception:
             pass
+        result["timed_out"] = False
     th = threading.Thread(target=_do, daemon=True); th.start(); th.join(timeout)
+    if return_timeout:
+        return result["p"], result["timed_out"]
     return result["p"]
 
 def _stat_with_timeout(path, timeout=8):
@@ -592,7 +599,15 @@ def _mount_ok_for(path):
     so deletion is blocked."""
     if not MOUNT_GUARDS:
         return None
-    p = _realpath_with_timeout(path, MOUNT_GUARD_TIMEOUT)
+    p, timed_out = _realpath_with_timeout(path, MOUNT_GUARD_TIMEOUT, return_timeout=True)
+    if timed_out:
+        # Resolving `path` itself hung -- almost certainly a dead/hung FUSE mount
+        # (e.g. a library symlink whose target lives on the guarded mount). We
+        # can't tell which guard it resolves under, so treat it as DOWN rather
+        # than falling through to None ("not guarded"), which would let a caller
+        # wrongly treat a hung mount as a confirmed deletion.
+        log.warning("[mount-guard] realpath(%s) timed out -> treating backing mount as DOWN", path)
+        return False
     # Longest mount path first so nested/overlapping mounts match the most specific guard.
     for mount, probe in sorted(MOUNT_GUARDS.items(), key=lambda kv: len(kv[0]), reverse=True):
         if p == mount or p.startswith(mount.rstrip("/") + "/"):
@@ -2831,11 +2846,15 @@ def _missing_disk_save_state(s):
     except Exception as e:
         log.debug("[missing-disk] state save failed: %s", e)
 
-def _missing_disk_items(arr):
+def _missing_disk_items(arr, state):
     """Items the arr believes are present, each with a reported file path.
     Returns [{kind, key, file_id, series_id, season, path, title, search_body}].
-    `key` is a UNIQUE per-item cooldown key. For sonarr the EpisodeSearch body is
-    resolved later (episodefile records carry no episodeIds)."""
+    `key` is a UNIQUE per-item cooldown key.
+    - radarr: one /movie call lists everything (hasFile + movieFile.path).
+    - sonarr: /episodefile requires a seriesId, so we rotate through the series
+      that have files, MISSING_DISK_SERIES per sweep, resuming from a persisted
+      cursor (last series id), wrapping at the end. EpisodeSearch bodies are
+      resolved later (episodefile records carry no episodeIds)."""
     out = []
     if arr.kind == "radarr":
         data = arr.get_json("/movie") or []
@@ -2848,13 +2867,31 @@ def _missing_disk_items(arr):
                         "series_id": None, "season": None, "path": mf.get("path"),
                         "title": m.get("title") or "",
                         "search_body": {"name": "MoviesSearch", "movieIds": [mid]}})
-    else:
-        data = arr.get_json("/episodefile") or []
-        for ef in data if isinstance(data, list) else []:
+        return out
+    # ----- sonarr: rotate through series with files (per-series /episodefile) -----
+    series = arr.get_json("/series") or []
+    withfiles = sorted(
+        (s for s in series if isinstance(s, dict) and s.get("id")
+         and (s.get("statistics") or {}).get("episodeFileCount", 0) > 0),
+        key=lambda s: s["id"])
+    if not withfiles:
+        return out
+    cur = state.setdefault("series_cursor", {})
+    last_id = cur.get(arr.name, 0)
+    batch = [s for s in withfiles if s["id"] > last_id][:MISSING_DISK_SERIES]
+    if not batch:                                   # reached the end -> wrap to the start
+        batch = withfiles[:MISSING_DISK_SERIES]
+    if batch:
+        cur[arr.name] = batch[-1]["id"]
+    log.debug("[missing-disk:%s] scanning %d/%d series (from id>%d)",
+              arr.name, len(batch), len(withfiles), last_id)
+    for s in batch:
+        efs = arr.get_json("/episodefile?seriesId=%d" % s["id"]) or []
+        for ef in efs if isinstance(efs, list) else []:
             if not ef.get("path") or not ef.get("id"):
                 continue
             out.append({"kind": "episode", "key": "epfile:%s" % ef.get("id"),
-                        "file_id": ef.get("id"), "series_id": ef.get("seriesId"),
+                        "file_id": ef.get("id"), "series_id": ef.get("seriesId") or s["id"],
                         "season": ef.get("seasonNumber"), "path": ef.get("path"),
                         "title": ef.get("relativePath") or "",
                         "search_body": None})   # resolved in _missing_disk_fix
@@ -2870,33 +2907,51 @@ def _missing_disk_episode_ids(arr, series_id, file_id):
             if isinstance(e, dict) and e.get("episodeFileId") == file_id and e.get("id")]
 
 def _missing_disk_fix(arr, it):
-    """Delete the arr's stale file record + re-search the item. Returns True on a
-    triggered search. For sonarr, resolve real episodeIds BEFORE deleting the file
-    (episodefiles have no episodeIds); fall back to a season/series search."""
-    try:
-        body = it.get("search_body")
-        if body is None and it.get("kind") == "episode":
+    """Delete the arr's stale file record + re-search the item. For sonarr,
+    resolve real episodeIds BEFORE deleting the file (episodefiles have no
+    episodeIds); fall back to a season/series search.
+    Returns (status, body):
+      "ok"    - search command was triggered successfully.
+      "retry" - the file record was already deleted but the search command
+                failed (transient API error). The item no longer has a file
+                record, so _missing_disk_items() will never surface it again;
+                the caller must track `body` itself and retry the search on a
+                later sweep, or the item is silently lost.
+      "noop"  - nothing was deleted and nothing needs to be retried.
+    """
+    body = it.get("search_body")
+    if body is None and it.get("kind") == "episode":
+        try:
             ids = _missing_disk_episode_ids(arr, it.get("series_id"), it.get("file_id"))
-            if ids:
-                body = {"name": "EpisodeSearch", "episodeIds": ids}
-            elif it.get("series_id") is not None and it.get("season") is not None:
-                body = {"name": "SeasonSearch", "seriesId": it["series_id"], "seasonNumber": it["season"]}
-            elif it.get("series_id"):
-                body = {"name": "SeriesSearch", "seriesId": it["series_id"]}
-        if not body:
-            log.info("[missing-disk:%s] no searchable target for %s",
-                     arr.name, it.get("title") or it.get("path"))
-            return False
+        except Exception:
+            ids = []
+        if ids:
+            body = {"name": "EpisodeSearch", "episodeIds": ids}
+        elif it.get("series_id") is not None and it.get("season") is not None:
+            body = {"name": "SeasonSearch", "seriesId": it["series_id"], "seasonNumber": it["season"]}
+        elif it.get("series_id"):
+            body = {"name": "SeriesSearch", "seriesId": it["series_id"]}
+    if not body:
+        log.info("[missing-disk:%s] no searchable target for %s",
+                 arr.name, it.get("title") or it.get("path"))
+        return "noop", None
+    deleted = False
+    try:
         if it.get("file_id"):
             path = "/moviefile/%d" % it["file_id"] if it["kind"] == "movie" else "/episodefile/%d" % it["file_id"]
             arr._req("DELETE", path)
+            deleted = True
         if arr.command(body) is not None:
             log.warning("[missing-disk:%s] file missing-from-disk -> re-grabbing NOW: %s",
                         arr.name, it.get("title") or it.get("path"))
-            return True
+            return "ok", body
     except Exception as e:
         log.warning("[missing-disk:%s] fix failed for %s: %s", arr.name, it.get("title"), str(e)[:120])
-    return False
+    if deleted:
+        log.warning("[missing-disk:%s] file record deleted but search command failed for %s "
+                    "-> queued for retry", arr.name, it.get("title") or it.get("path"))
+        return "retry", body
+    return "noop", None
 
 def check_missing_from_disk():
     """Re-grab items the arr thinks are present but whose file is gone on disk.
@@ -2911,35 +2966,81 @@ def check_missing_from_disk():
     _reset_mount_cache()
     state = _missing_disk_load_state()
     cool = state.setdefault("cooldown", {})
-    now = time.time(); acted = 0
+    # Items whose *arr file record was already deleted on a prior sweep but the
+    # search command itself failed (transient API error). Once the record is
+    # gone, _missing_disk_items() can never surface them again, so they must be
+    # tracked here or the search request is silently lost.
+    pending = state.setdefault("pending_search", {})
+    now = time.time(); acted = 0; scanned = 0; missing = 0
+    by_name = {a.name: a for a in arrs}
+
+    for ck in list(pending.keys()):
+        if acted >= MISSING_DISK_MAX:
+            break
+        entry = pending[ck]
+        arr = by_name.get(entry.get("arr"))
+        if not arr:
+            pending.pop(ck, None); continue
+        if now - cool.get(ck, 0) < MISSING_DISK_COOLDOWN:
+            continue
+        if DRY_RUN:
+            log.info("[missing-disk] WOULD retry re-grab: %s", entry.get("title") or ck)
+            acted += 1; continue
+        try:
+            ok = arr.command(entry["body"]) is not None
+        except Exception:
+            ok = False
+        cool[ck] = now
+        if ok:
+            log.warning("[missing-disk:%s] retry re-grab succeeded: %s", arr.name, entry.get("title") or ck)
+            pending.pop(ck, None); acted += 1
+        else:
+            entry["retries"] = entry.get("retries", 0) + 1
+            if entry["retries"] >= MISSING_DISK_MAX_RETRIES:
+                log.warning("[missing-disk:%s] giving up after %d failed retries: %s",
+                            arr.name, entry["retries"], entry.get("title") or ck)
+                pending.pop(ck, None)
+
     for arr in arrs:
         if acted >= MISSING_DISK_MAX:
             break
-        for it in _missing_disk_items(arr):
+        items = _missing_disk_items(arr, state)
+        if items:
+            log.info("[missing-disk:%s] scanning %d %s", arr.name, len(items),
+                     "movie(s)" if arr.kind == "radarr" else "episode file(s)")
+        for it in items:
             if acted >= MISSING_DISK_MAX:
                 break
             p = it.get("path") or ""
             if not p:
                 continue
-            real = _realpath_with_timeout(p, MOUNT_GUARD_TIMEOUT)
-            if os.path.exists(real):
-                continue                        # file is fine
+            scanned += 1
+            # mount-health gate FIRST (non-blocking): a down/hung mount must not be
+            # trusted for existence AND must not block us on a stat.
             if _mount_ok_for(p) is False:
                 log.warning("[missing-disk] SKIP %s: mount down/empty (safety gate)", p)
                 continue
+            real = _realpath_with_timeout(p, MOUNT_GUARD_TIMEOUT)
+            if _stat_with_timeout(real, MOUNT_GUARD_TIMEOUT) is not None:
+                continue                        # file is present -> fine
+            missing += 1
             ck = "%s:%s" % (arr.name, it.get("key") or p)
             if now - cool.get(ck, 0) < MISSING_DISK_COOLDOWN:
                 continue
             if DRY_RUN:
                 log.info("[missing-disk] WOULD re-grab: %s", it.get("title") or p); acted += 1; continue
-            if _missing_disk_fix(arr, it):
+            status, body = _missing_disk_fix(arr, it)
+            if status == "ok":
+                cool[ck] = now; acted += 1
+            elif status == "retry":
+                pending[ck] = {"arr": arr.name, "body": body,
+                               "title": it.get("title") or p, "retries": 0}
                 cool[ck] = now; acted += 1
     for k, ts in list(cool.items()):            # prune stale cooldown entries
         if now - ts > max(MISSING_DISK_COOLDOWN * 4, 86400):
             cool.pop(k, None)
     _missing_disk_save_state(state)
-    if acted:
-        log.info("[missing-disk] re-grabbed %d item(s) missing-from-disk", acted)
+    log.info("[missing-disk] done: scanned %d, missing-from-disk %d, re-grabbed %d", scanned, missing, acted)
 
 
 def _riven_load_state():
@@ -3806,6 +3907,7 @@ UI_SCHEMA = [
               ("WESTREPAIR_RUN_INTERVAL", "6h"), ("WESTREPAIR_REPAIR_INTERVAL", "1m")]),
     ("Missing-from-disk (arr-orphaned dead files)", [
               ("ENABLE_MISSING_FROM_DISK", "false"), ("MISSING_FROM_DISK_MAX_PER_SWEEP", "10"),
+              ("MISSING_FROM_DISK_SERIES_PER_SWEEP", "20"),
               ("MISSING_FROM_DISK_LOAD_MAX", "12"), ("MISSING_FROM_DISK_COOLDOWN", "6h")]),
     ("Backlog (search monitored-missing)", [
               ("BACKLOG_INSTANCES", "sonarr,radarr,sonarr4k,radarr4k"),

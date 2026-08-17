@@ -46,7 +46,8 @@ class JanitorMountGateTest(unittest.TestCase):
                  patch.object(doctor, "DRY_RUN", dry_run), \
                  patch.object(doctor, "JAN_MAX_MOVES", max_moves), \
                  patch.object(doctor, "MOUNT_GUARDS", {"/__all__": "/__all__"}), \
-                 patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
+                 patch.object(doctor, "_realpath_with_timeout",
+                              lambda p, t=None, return_timeout=False: (p, False) if return_timeout else p), \
                  patch.object(doctor, "_probe_mount", return_value=probe_result):
                 doctor.check_janitor()
             return lib, quar
@@ -98,7 +99,8 @@ class JanitorCapTest(unittest.TestCase):
                  patch.object(doctor, "DRY_RUN", False), \
                  patch.object(doctor, "JAN_MAX_MOVES", 1), \
                  patch.object(doctor, "MOUNT_GUARDS", {"/__all__": "/__all__"}), \
-                 patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
+                 patch.object(doctor, "_realpath_with_timeout",
+                              lambda p, t=None, return_timeout=False: (p, False) if return_timeout else p), \
                  patch.object(doctor, "_probe_mount", return_value=True):
                 doctor.check_janitor()
             remaining = sum(1 for n in os.listdir(lib) if os.path.lexists(os.path.join(lib, n)))
@@ -121,7 +123,7 @@ class MissingFromDiskTest(unittest.TestCase):
              patch.object(doctor, "host_load", return_value=0.0), \
              patch.object(doctor, "_mount_ok_for", return_value=mount_ok), \
              patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
-             patch.object(doctor.os.path, "exists", return_value=False), \
+             patch.object(doctor, "_stat_with_timeout", return_value=None), \
              patch.object(doctor, "_missing_disk_load_state", return_value={}), \
              patch.object(doctor, "_missing_disk_save_state", return_value=None):
             doctor.check_missing_from_disk()
@@ -247,7 +249,9 @@ class MissingFromDiskSonarrTest(unittest.TestCase):
         arr = MagicMock()
         arr.name = "sonarr"; arr.kind = "sonarr"
         def _get_json(path, t=None):
-            if path == "/episodefile":
+            if path == "/series":
+                return [{"id": 9, "statistics": {"episodeFileCount": 1}}]
+            if path.startswith("/episodefile?seriesId="):
                 return [{"id": 55, "seriesId": 9, "seasonNumber": 2,
                          "path": "/mnt/zurg/x.mkv", "relativePath": "S02E03.mkv"}]
             if path.startswith("/episode?seriesId="):
@@ -260,7 +264,7 @@ class MissingFromDiskSonarrTest(unittest.TestCase):
              patch.object(doctor, "host_load", return_value=0.0), \
              patch.object(doctor, "_mount_ok_for", return_value=True), \
              patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
-             patch.object(doctor.os.path, "exists", return_value=False), \
+             patch.object(doctor, "_stat_with_timeout", return_value=None), \
              patch.object(doctor, "_missing_disk_load_state", return_value={}), \
              patch.object(doctor, "_missing_disk_save_state", return_value=None):
             doctor.check_missing_from_disk()
@@ -276,7 +280,9 @@ class MissingFromDiskSonarrTest(unittest.TestCase):
         arr = MagicMock()
         arr.name = "sonarr"; arr.kind = "sonarr"
         def _get_json(path, t=None):
-            if path == "/episodefile":
+            if path == "/series":
+                return [{"id": 9, "statistics": {"episodeFileCount": 2}}]
+            if path.startswith("/episodefile?seriesId="):
                 return [
                     {"id": 55, "seriesId": 9, "seasonNumber": 2, "path": "/mnt/zurg/a.mkv", "relativePath": "a"},
                     {"id": 56, "seriesId": 9, "seasonNumber": 2, "path": "/mnt/zurg/b.mkv", "relativePath": "b"},
@@ -291,7 +297,7 @@ class MissingFromDiskSonarrTest(unittest.TestCase):
              patch.object(doctor, "host_load", return_value=0.0), \
              patch.object(doctor, "_mount_ok_for", return_value=True), \
              patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
-             patch.object(doctor.os.path, "exists", return_value=False), \
+             patch.object(doctor, "_stat_with_timeout", return_value=None), \
              patch.object(doctor, "_missing_disk_load_state", return_value={}), \
              patch.object(doctor, "_missing_disk_save_state", return_value=None):
             doctor.check_missing_from_disk()
@@ -339,6 +345,130 @@ class MetacleanStormOnlyTest(unittest.TestCase):
                              "storm-only orphan must be removed even with no failed-list match")
         finally:
             doctor._safe_rmtree(root); doctor._safe_rmtree(links)
+
+
+class MissingFromDiskRotationTest(unittest.TestCase):
+    def test_series_cursor_rotates_and_wraps(self):
+        arr = MagicMock(); arr.name = "sonarr"; arr.kind = "sonarr"
+        def _get_json(path, t=None):
+            if path == "/series":
+                return [{"id": 1, "statistics": {"episodeFileCount": 1}},
+                        {"id": 2, "statistics": {"episodeFileCount": 1}},
+                        {"id": 3, "statistics": {"episodeFileCount": 1}},
+                        {"id": 4, "statistics": {"episodeFileCount": 0}}]   # no files -> skipped
+            if path.startswith("/episodefile?seriesId="):
+                sid = int(path.split("=")[1])
+                return [{"id": 100 + sid, "seriesId": sid, "seasonNumber": 1,
+                         "path": "/mnt/zurg/s%d.mkv" % sid, "relativePath": "s%d" % sid}]
+            return None
+        arr.get_json.side_effect = _get_json
+        state = {}
+        with patch.object(doctor, "MISSING_DISK_SERIES", 2):
+            b1 = doctor._missing_disk_items(arr, state)
+            b2 = doctor._missing_disk_items(arr, state)
+            b3 = doctor._missing_disk_items(arr, state)
+        self.assertEqual([it["series_id"] for it in b1], [1, 2])
+        self.assertEqual([it["series_id"] for it in b2], [3])       # id > 2
+        self.assertEqual([it["series_id"] for it in b3], [1, 2])    # wrapped to start
+
+
+class MountGuardTimeoutTest(unittest.TestCase):
+    """PR #11 review: a hung realpath() (dead FUSE mount) must be treated as
+    DOWN, never as 'not under any guarded mount' -- otherwise a hung mount on
+    a library symlink bypasses the safety gate entirely."""
+
+    def test_realpath_timeout_treated_as_down(self):
+        guards = {"/mnt/zurg": "/mnt/zurg/__all__"}
+        with patch.object(doctor, "MOUNT_GUARDS", guards), \
+             patch.object(doctor, "_realpath_with_timeout",
+                          lambda p, t=None, return_timeout=False: (p, True) if return_timeout else p), \
+             patch.object(doctor, "_probe_mount") as probe:
+            self.assertFalse(doctor._mount_ok_for("/mnt/library/link.mkv"))
+        probe.assert_not_called()
+
+    def test_realpath_no_timeout_still_resolves_guard(self):
+        guards = {"/mnt/zurg": "/mnt/zurg/__all__"}
+        with patch.object(doctor, "MOUNT_GUARDS", guards), \
+             patch.object(doctor, "_realpath_with_timeout",
+                          lambda p, t=None, return_timeout=False:
+                              ("/mnt/zurg/real.mkv", False) if return_timeout else "/mnt/zurg/real.mkv"), \
+             patch.object(doctor, "_probe_mount", return_value=True) as probe:
+            self.assertTrue(doctor._mount_ok_for("/mnt/library/link.mkv"))
+        probe.assert_called_once_with("/mnt/zurg", "/mnt/zurg/__all__")
+
+
+class MissingFromDiskRetryTest(unittest.TestCase):
+    """PR #11 review: once the stale file record is deleted, a failed search
+    command must not lose the item -- it has to be retried on a later sweep
+    even though _missing_disk_items() can no longer see it (no file record)."""
+
+    def _arr(self, command_side_effect):
+        arr = MagicMock()
+        arr.name = "radarr"; arr.kind = "radarr"
+        arr.command.side_effect = command_side_effect
+        return arr
+
+    def test_failed_search_after_delete_is_queued_and_retried(self):
+        arr = self._arr([None, {}])   # first command fails, retry succeeds
+        item = {"kind": "movie", "file_id": 42, "path": "/mnt/zurg/missing.mkv",
+                "title": "Missing Movie", "search_body": {"name": "MoviesSearch", "movieIds": [7]},
+                "key": "movie-7"}
+        state = {}
+        with patch.object(doctor, "INSTANCES", [arr]), \
+             patch.object(doctor, "DRY_RUN", False), \
+             patch.object(doctor, "host_load", return_value=0.0), \
+             patch.object(doctor, "_mount_ok_for", return_value=True), \
+             patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
+             patch.object(doctor, "_stat_with_timeout", return_value=None), \
+             patch.object(doctor, "_missing_disk_items", return_value=[item]), \
+             patch.object(doctor, "MISSING_DISK_COOLDOWN", 0), \
+             patch.object(doctor, "_missing_disk_load_state", return_value=state), \
+             patch.object(doctor, "_missing_disk_save_state", lambda s: state.update(s)):
+            doctor.check_missing_from_disk()               # sweep 1: delete + failed search
+        arr._req.assert_called_once_with("DELETE", "/moviefile/42")
+        self.assertEqual(arr.command.call_count, 1, "sweep 1 tries the search exactly once")
+        self.assertIn("radarr:movie-7", state.get("pending_search", {}),
+                      "a deleted-but-unsearched item must be queued for retry")
+
+        with patch.object(doctor, "INSTANCES", [arr]), \
+             patch.object(doctor, "DRY_RUN", False), \
+             patch.object(doctor, "host_load", return_value=0.0), \
+             patch.object(doctor, "_mount_ok_for", return_value=True), \
+             patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
+             patch.object(doctor, "_stat_with_timeout", return_value=None), \
+             patch.object(doctor, "_missing_disk_items", return_value=[]), \
+             patch.object(doctor, "MISSING_DISK_COOLDOWN", 0), \
+             patch.object(doctor, "_missing_disk_load_state", return_value=state), \
+             patch.object(doctor, "_missing_disk_save_state", lambda s: state.update(s)):
+            doctor.check_missing_from_disk()               # sweep 2: retry succeeds
+        self.assertEqual(arr.command.call_count, 2, "sweep 2 must retry the queued search")
+        self.assertNotIn("radarr:movie-7", state.get("pending_search", {}),
+                         "a successfully-retried item must be removed from the queue")
+
+    def test_retry_gives_up_after_max_retries(self):
+        arr = self._arr(lambda *a, **k: None)   # every attempt fails
+        item = {"kind": "movie", "file_id": 42, "path": "/mnt/zurg/missing.mkv",
+                "title": "Missing Movie", "search_body": {"name": "MoviesSearch", "movieIds": [7]},
+                "key": "movie-7"}
+        state = {}
+        with patch.object(doctor, "INSTANCES", [arr]), \
+             patch.object(doctor, "DRY_RUN", False), \
+             patch.object(doctor, "host_load", return_value=0.0), \
+             patch.object(doctor, "_mount_ok_for", return_value=True), \
+             patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
+             patch.object(doctor, "_stat_with_timeout", return_value=None), \
+             patch.object(doctor, "_missing_disk_items", return_value=[item]), \
+             patch.object(doctor, "MISSING_DISK_COOLDOWN", 0), \
+             patch.object(doctor, "MISSING_DISK_MAX_RETRIES", 2), \
+             patch.object(doctor, "_missing_disk_load_state", return_value=state), \
+             patch.object(doctor, "_missing_disk_save_state", lambda s: state.update(s)):
+            doctor.check_missing_from_disk()                # sweep 1: delete + failed search -> queued
+
+            for _ in range(2):
+                with patch.object(doctor, "_missing_disk_items", return_value=[]):
+                    doctor.check_missing_from_disk()         # sweeps 2-3: retries fail, then give up
+        self.assertNotIn("radarr:movie-7", state.get("pending_search", {}),
+                         "item must be dropped after MISSING_DISK_MAX_RETRIES failed retries")
 
 
 if __name__ == "__main__":
