@@ -2934,16 +2934,21 @@ def check_missing_from_disk():
     _reset_mount_cache()
     state = _missing_disk_load_state()
     cool = state.setdefault("cooldown", {})
-    now = time.time(); acted = 0
+    now = time.time(); acted = 0; scanned = 0; missing = 0
     for arr in arrs:
         if acted >= MISSING_DISK_MAX:
             break
-        for it in _missing_disk_items(arr, state):
+        items = _missing_disk_items(arr, state)
+        if items:
+            log.info("[missing-disk:%s] scanning %d %s", arr.name, len(items),
+                     "movie(s)" if arr.kind == "radarr" else "episode file(s)")
+        for it in items:
             if acted >= MISSING_DISK_MAX:
                 break
             p = it.get("path") or ""
             if not p:
                 continue
+            scanned += 1
             # mount-health gate FIRST (non-blocking): a down/hung mount must not be
             # trusted for existence AND must not block us on a stat.
             if _mount_ok_for(p) is False:
@@ -2952,6 +2957,7 @@ def check_missing_from_disk():
             real = _realpath_with_timeout(p, MOUNT_GUARD_TIMEOUT)
             if _stat_with_timeout(real, MOUNT_GUARD_TIMEOUT) is not None:
                 continue                        # file is present -> fine
+            missing += 1
             ck = "%s:%s" % (arr.name, it.get("key") or p)
             if now - cool.get(ck, 0) < MISSING_DISK_COOLDOWN:
                 continue
@@ -2963,8 +2969,7 @@ def check_missing_from_disk():
         if now - ts > max(MISSING_DISK_COOLDOWN * 4, 86400):
             cool.pop(k, None)
     _missing_disk_save_state(state)
-    if acted:
-        log.info("[missing-disk] re-grabbed %d item(s) missing-from-disk", acted)
+    log.info("[missing-disk] done: scanned %d, missing-from-disk %d, re-grabbed %d", scanned, missing, acted)
 
 
 def _riven_load_state():
