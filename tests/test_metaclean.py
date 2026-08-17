@@ -42,7 +42,8 @@ class MountGuardPrefixTest(unittest.TestCase):
     def test_longest_prefix_wins(self):
         guards = {"/mnt/zurg": "/mnt/zurg/__all__", "/mnt/zurg2": "/mnt/zurg2/__all__"}
         with patch.object(doctor, "MOUNT_GUARDS", guards), \
-             patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
+             patch.object(doctor, "_realpath_with_timeout",
+                          lambda p, t=None, return_timeout=False: (p, False) if return_timeout else p), \
              patch.object(doctor, "_probe_mount", return_value=True) as probe:
             self.assertTrue(doctor._mount_ok_for("/mnt/zurg2/file.mkv"))
         probe.assert_called_once_with("/mnt/zurg2", "/mnt/zurg2/__all__")
@@ -50,7 +51,8 @@ class MountGuardPrefixTest(unittest.TestCase):
     def test_unrelated_path_returns_none(self):
         guards = {"/mnt/zurg": "/mnt/zurg/__all__"}
         with patch.object(doctor, "MOUNT_GUARDS", guards), \
-             patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
+             patch.object(doctor, "_realpath_with_timeout",
+                          lambda p, t=None, return_timeout=False: (p, False) if return_timeout else p), \
              patch.object(doctor, "_probe_mount") as probe:
             self.assertIsNone(doctor._mount_ok_for("/mnt/local/file.mkv"))
         probe.assert_not_called()
