@@ -181,6 +181,7 @@ REPAIR_EVENTS     = set(e.strip() for e in os.environ.get(
 # False). A missing file on a DOWN mount is a transient blip, not a real deletion -> never act.
 EN_MISSING_DISK  = _b("ENABLE_MISSING_FROM_DISK", False)
 MISSING_DISK_MAX = _i("MISSING_FROM_DISK_MAX_PER_SWEEP", 10)
+MISSING_DISK_SERIES = _i("MISSING_FROM_DISK_SERIES_PER_SWEEP", 20)  # sonarr: /episodefile needs a seriesId, so rotate through series this many per sweep
 MISSING_DISK_LOAD = _i("MISSING_FROM_DISK_LOAD_MAX", 12)
 MISSING_DISK_COOLDOWN = _dur(os.environ.get("MISSING_FROM_DISK_COOLDOWN", "6h"))
 MISSING_DISK_STATE = os.environ.get("MISSING_FROM_DISK_STATE_FILE", "/data/missing_disk.json")
@@ -2831,11 +2832,15 @@ def _missing_disk_save_state(s):
     except Exception as e:
         log.debug("[missing-disk] state save failed: %s", e)
 
-def _missing_disk_items(arr):
+def _missing_disk_items(arr, state):
     """Items the arr believes are present, each with a reported file path.
     Returns [{kind, key, file_id, series_id, season, path, title, search_body}].
-    `key` is a UNIQUE per-item cooldown key. For sonarr the EpisodeSearch body is
-    resolved later (episodefile records carry no episodeIds)."""
+    `key` is a UNIQUE per-item cooldown key.
+    - radarr: one /movie call lists everything (hasFile + movieFile.path).
+    - sonarr: /episodefile requires a seriesId, so we rotate through the series
+      that have files, MISSING_DISK_SERIES per sweep, resuming from a persisted
+      cursor (last series id), wrapping at the end. EpisodeSearch bodies are
+      resolved later (episodefile records carry no episodeIds)."""
     out = []
     if arr.kind == "radarr":
         data = arr.get_json("/movie") or []
@@ -2848,13 +2853,31 @@ def _missing_disk_items(arr):
                         "series_id": None, "season": None, "path": mf.get("path"),
                         "title": m.get("title") or "",
                         "search_body": {"name": "MoviesSearch", "movieIds": [mid]}})
-    else:
-        data = arr.get_json("/episodefile") or []
-        for ef in data if isinstance(data, list) else []:
+        return out
+    # ----- sonarr: rotate through series with files (per-series /episodefile) -----
+    series = arr.get_json("/series") or []
+    withfiles = sorted(
+        (s for s in series if isinstance(s, dict) and s.get("id")
+         and (s.get("statistics") or {}).get("episodeFileCount", 0) > 0),
+        key=lambda s: s["id"])
+    if not withfiles:
+        return out
+    cur = state.setdefault("series_cursor", {})
+    last_id = cur.get(arr.name, 0)
+    batch = [s for s in withfiles if s["id"] > last_id][:MISSING_DISK_SERIES]
+    if not batch:                                   # reached the end -> wrap to the start
+        batch = withfiles[:MISSING_DISK_SERIES]
+    if batch:
+        cur[arr.name] = batch[-1]["id"]
+    log.debug("[missing-disk:%s] scanning %d/%d series (from id>%d)",
+              arr.name, len(batch), len(withfiles), last_id)
+    for s in batch:
+        efs = arr.get_json("/episodefile?seriesId=%d" % s["id"]) or []
+        for ef in efs if isinstance(efs, list) else []:
             if not ef.get("path") or not ef.get("id"):
                 continue
             out.append({"kind": "episode", "key": "epfile:%s" % ef.get("id"),
-                        "file_id": ef.get("id"), "series_id": ef.get("seriesId"),
+                        "file_id": ef.get("id"), "series_id": ef.get("seriesId") or s["id"],
                         "season": ef.get("seasonNumber"), "path": ef.get("path"),
                         "title": ef.get("relativePath") or "",
                         "search_body": None})   # resolved in _missing_disk_fix
@@ -2915,18 +2938,20 @@ def check_missing_from_disk():
     for arr in arrs:
         if acted >= MISSING_DISK_MAX:
             break
-        for it in _missing_disk_items(arr):
+        for it in _missing_disk_items(arr, state):
             if acted >= MISSING_DISK_MAX:
                 break
             p = it.get("path") or ""
             if not p:
                 continue
-            real = _realpath_with_timeout(p, MOUNT_GUARD_TIMEOUT)
-            if os.path.exists(real):
-                continue                        # file is fine
+            # mount-health gate FIRST (non-blocking): a down/hung mount must not be
+            # trusted for existence AND must not block us on a stat.
             if _mount_ok_for(p) is False:
                 log.warning("[missing-disk] SKIP %s: mount down/empty (safety gate)", p)
                 continue
+            real = _realpath_with_timeout(p, MOUNT_GUARD_TIMEOUT)
+            if _stat_with_timeout(real, MOUNT_GUARD_TIMEOUT) is not None:
+                continue                        # file is present -> fine
             ck = "%s:%s" % (arr.name, it.get("key") or p)
             if now - cool.get(ck, 0) < MISSING_DISK_COOLDOWN:
                 continue
@@ -3806,6 +3831,7 @@ UI_SCHEMA = [
               ("WESTREPAIR_RUN_INTERVAL", "6h"), ("WESTREPAIR_REPAIR_INTERVAL", "1m")]),
     ("Missing-from-disk (arr-orphaned dead files)", [
               ("ENABLE_MISSING_FROM_DISK", "false"), ("MISSING_FROM_DISK_MAX_PER_SWEEP", "10"),
+              ("MISSING_FROM_DISK_SERIES_PER_SWEEP", "20"),
               ("MISSING_FROM_DISK_LOAD_MAX", "12"), ("MISSING_FROM_DISK_COOLDOWN", "6h")]),
     ("Backlog (search monitored-missing)", [
               ("BACKLOG_INSTANCES", "sonarr,radarr,sonarr4k,radarr4k"),

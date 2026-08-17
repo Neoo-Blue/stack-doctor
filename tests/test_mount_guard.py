@@ -121,7 +121,7 @@ class MissingFromDiskTest(unittest.TestCase):
              patch.object(doctor, "host_load", return_value=0.0), \
              patch.object(doctor, "_mount_ok_for", return_value=mount_ok), \
              patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
-             patch.object(doctor.os.path, "exists", return_value=False), \
+             patch.object(doctor, "_stat_with_timeout", return_value=None), \
              patch.object(doctor, "_missing_disk_load_state", return_value={}), \
              patch.object(doctor, "_missing_disk_save_state", return_value=None):
             doctor.check_missing_from_disk()
@@ -247,7 +247,9 @@ class MissingFromDiskSonarrTest(unittest.TestCase):
         arr = MagicMock()
         arr.name = "sonarr"; arr.kind = "sonarr"
         def _get_json(path, t=None):
-            if path == "/episodefile":
+            if path == "/series":
+                return [{"id": 9, "statistics": {"episodeFileCount": 1}}]
+            if path.startswith("/episodefile?seriesId="):
                 return [{"id": 55, "seriesId": 9, "seasonNumber": 2,
                          "path": "/mnt/zurg/x.mkv", "relativePath": "S02E03.mkv"}]
             if path.startswith("/episode?seriesId="):
@@ -260,7 +262,7 @@ class MissingFromDiskSonarrTest(unittest.TestCase):
              patch.object(doctor, "host_load", return_value=0.0), \
              patch.object(doctor, "_mount_ok_for", return_value=True), \
              patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
-             patch.object(doctor.os.path, "exists", return_value=False), \
+             patch.object(doctor, "_stat_with_timeout", return_value=None), \
              patch.object(doctor, "_missing_disk_load_state", return_value={}), \
              patch.object(doctor, "_missing_disk_save_state", return_value=None):
             doctor.check_missing_from_disk()
@@ -276,7 +278,9 @@ class MissingFromDiskSonarrTest(unittest.TestCase):
         arr = MagicMock()
         arr.name = "sonarr"; arr.kind = "sonarr"
         def _get_json(path, t=None):
-            if path == "/episodefile":
+            if path == "/series":
+                return [{"id": 9, "statistics": {"episodeFileCount": 2}}]
+            if path.startswith("/episodefile?seriesId="):
                 return [
                     {"id": 55, "seriesId": 9, "seasonNumber": 2, "path": "/mnt/zurg/a.mkv", "relativePath": "a"},
                     {"id": 56, "seriesId": 9, "seasonNumber": 2, "path": "/mnt/zurg/b.mkv", "relativePath": "b"},
@@ -291,7 +295,7 @@ class MissingFromDiskSonarrTest(unittest.TestCase):
              patch.object(doctor, "host_load", return_value=0.0), \
              patch.object(doctor, "_mount_ok_for", return_value=True), \
              patch.object(doctor, "_realpath_with_timeout", lambda p, t=None: p), \
-             patch.object(doctor.os.path, "exists", return_value=False), \
+             patch.object(doctor, "_stat_with_timeout", return_value=None), \
              patch.object(doctor, "_missing_disk_load_state", return_value={}), \
              patch.object(doctor, "_missing_disk_save_state", return_value=None):
             doctor.check_missing_from_disk()
@@ -339,6 +343,31 @@ class MetacleanStormOnlyTest(unittest.TestCase):
                              "storm-only orphan must be removed even with no failed-list match")
         finally:
             doctor._safe_rmtree(root); doctor._safe_rmtree(links)
+
+
+class MissingFromDiskRotationTest(unittest.TestCase):
+    def test_series_cursor_rotates_and_wraps(self):
+        arr = MagicMock(); arr.name = "sonarr"; arr.kind = "sonarr"
+        def _get_json(path, t=None):
+            if path == "/series":
+                return [{"id": 1, "statistics": {"episodeFileCount": 1}},
+                        {"id": 2, "statistics": {"episodeFileCount": 1}},
+                        {"id": 3, "statistics": {"episodeFileCount": 1}},
+                        {"id": 4, "statistics": {"episodeFileCount": 0}}]   # no files -> skipped
+            if path.startswith("/episodefile?seriesId="):
+                sid = int(path.split("=")[1])
+                return [{"id": 100 + sid, "seriesId": sid, "seasonNumber": 1,
+                         "path": "/mnt/zurg/s%d.mkv" % sid, "relativePath": "s%d" % sid}]
+            return None
+        arr.get_json.side_effect = _get_json
+        state = {}
+        with patch.object(doctor, "MISSING_DISK_SERIES", 2):
+            b1 = doctor._missing_disk_items(arr, state)
+            b2 = doctor._missing_disk_items(arr, state)
+            b3 = doctor._missing_disk_items(arr, state)
+        self.assertEqual([it["series_id"] for it in b1], [1, 2])
+        self.assertEqual([it["series_id"] for it in b2], [3])       # id > 2
+        self.assertEqual([it["series_id"] for it in b3], [1, 2])    # wrapped to start
 
 
 if __name__ == "__main__":
