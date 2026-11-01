@@ -12,7 +12,7 @@ SECTION=os.environ.get('PLEX_MOVIE_SECTION','1')
 def get(p):
     s='&' if '?' in p else '?'
     return ET.fromstring(urllib.request.urlopen(f'http://{H}:{P}{p}{s}X-Plex-Token={tok}',timeout=60).read())
-def sessions(): return int(get('/status/sessions').get('size') or 0)
+def sessions(): return sum(p.get('state')!='paused' for p in get('/status/sessions').iter('Player'))
 def rng(key,start,want=None,deadline=None,stats=None):
     c=http.client.HTTPConnection(H,P,timeout=120)
     c.request('GET',f'{key}?X-Plex-Token={tok}',headers={'Range':f'bytes={start}-','Accept-Language':'en'})

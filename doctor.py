@@ -3853,7 +3853,7 @@ def _warm_targets(plex):
                         add("next-ep", f)
     # Plex-first: speculative On Deck / recent warming pauses while ANYONE is watching (never competes
     # with a live stream), and is skipped entirely in low-cache mode (keep almost nothing pre-warmed).
-    if not WARM_LOW_CACHE and not sessions and time.time() - _warm_last_ondeck[0] >= WARM_ONDECK_EVERY:
+    if not WARM_LOW_CACHE and not _viewer_playing() and time.time() - _warm_last_ondeck[0] >= WARM_ONDECK_EVERY:
         _warm_last_ondeck[0] = time.time()
         if "hubs" in WARM_SOURCES:                          # what each viewer can click on Home, Continue Watching included
             for v in plex.home_items():
