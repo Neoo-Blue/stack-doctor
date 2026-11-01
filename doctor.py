@@ -28,6 +28,7 @@ import json
 import logging
 import logging.handlers
 import os
+import random
 import re
 import shutil
 import signal
@@ -81,6 +82,22 @@ def _human(sec):
 
 # UI-saved overrides: merge a JSON overlay over the inherited env BEFORE config is read, so edits win.
 CONFIG_FILE = os.environ.get("DOCTOR_CONFIG_FILE", "/data/config.json")
+
+def _atomic_write_json(path, obj, indent=None):
+    """temp file in the same dir, fsync, os.replace: a crash mid-write keeps the old file instead of a truncated one
+    that the loaders silently read as {} (ported from machetie/stack-doctor 68ffccf5)."""
+    import tempfile
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=indent); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try: os.unlink(tmp)
+        except Exception: pass
+        raise
 
 def _load_overrides():
     """Apply /data/config.json (dashboard-saved) settings as a FALLBACK layer only.
@@ -140,6 +157,7 @@ EN_BACKLOG    = _b("ENABLE_BACKLOG", False)     # trickle-search monitored-but-m
 EN_RIVEN      = _b("ENABLE_RIVEN", False)       # Riven (rivenmedia/riven): health + services watch, retry stuck/missing items
 EN_MEDIASTORM = _b("ENABLE_MEDIASTORM", False)  # mediastorm (godver3/mediastorm): up/health watch (no import queue to manage)
 EN_SCOUT      = _b("ENABLE_SCOUT", True)        # dashboard Scout tab: search a title -> Get -> watch it acquire -> play in Plex (uses whatever backend is enabled)
+EN_PLEXSTALE  = _b("ENABLE_PLEXSTALE", False)   # drop Plex entries whose file is gone, so nothing unplayable is listed
 EN_REPAIR     = _b("ENABLE_REPAIR", False)      # proactive self-heal: re-grab a file the instant it goes missing/bad (don't wait for the throttled backlog)
 
 # westrepair config
@@ -171,6 +189,12 @@ REPAIR_COOLDOWN   = _dur(os.environ.get("REPAIR_COOLDOWN", "6h")) # don't re-gra
 REPAIR_LOAD_MAX   = _i("REPAIR_LOAD_MAX", 12)                     # skip when host is busy (keeps Plex responsive)
 REPAIR_LOOKBACK   = _i("REPAIR_HISTORY_LOOKBACK", 200)            # history records scanned per arr per sweep
 REPAIR_STATE      = os.environ.get("REPAIR_STATE_FILE", "/data/repair.json")
+PLEXSTALE_STATE   = os.environ.get("PLEXSTALE_STATE_FILE", "/data/plexstale.json")
+PLEXSTALE_INTERVAL = _i("PLEXSTALE_INTERVAL", 3600)     # seconds between library reconciles
+PLEXSTALE_GRACE   = _i("PLEXSTALE_GRACE", 86400)        # a path must stay gone this long before its entry is dropped
+PLEXSTALE_MAX     = _i("PLEXSTALE_PER_SWEEP", 25)       # entries dropped per reconcile
+PLEXSTALE_MAX_MISSING = _f("PLEXSTALE_MAX_MISSING", 0.05)  # above this share gone, assume a mount problem and stop
+PLEXSTALE_DRY     = _b("PLEXSTALE_DRY_RUN", False)
 REPAIR_EVENTS     = set(e.strip() for e in os.environ.get(
     "REPAIR_EVENTS", "movieFileDeleted,episodeFileDeleted").split(",") if e.strip())
 
@@ -215,7 +239,7 @@ ENABLED_CONDITIONS = [c.strip() for c in os.environ.get("DOCTOR_CONDITIONS", DEF
 #   research     - remove + blocklist (honors DOCTOR_BLOCKLIST) so the arr re-searches a fresh release
 #   remove       - remove + re-search but never blocklist (give the same release another shot)
 #   force_import - call the arr's ManualImport on already-downloaded files (no re-download)
-_VALID_ACTIONS = ("report", "research", "remove", "force_import")
+_VALID_ACTIONS = ("report", "research", "remove", "force_import", "clear")
 _DEFAULT_ACTIONS = {
     "downloadClientUnavailable": "report",        # client is down, not the release's fault -> never blocklist
     "importBlocked":             "force_import",
@@ -256,13 +280,13 @@ RES_MEM_MIN     = _i("RES_MEM_MIN_MB", 800)
 RES_DROP_CACHES = _b("RES_DROP_CACHES", False)       # echo 1 > drop_caches on memory pressure (needs privilege)
 
 # decypharr
-DECY_URL          = os.environ.get("DECYPHARR_URL", "")             # e.g. http://192.168.50.202:8282
+DECY_URL          = os.environ.get("DECYPHARR_URL", "")             # e.g. http://192.168.1.10:8282
 DECY_MOUNT_TEST   = os.environ.get("DECYPHARR_MOUNT_TEST", "")      # a dir on the FUSE mount to read-test
 DECY_READ_TIMEOUT = _i("DECYPHARR_READ_TIMEOUT", 25)
 DECY_RESTART_CMD  = os.environ.get("DECYPHARR_RESTART_CMD", "")     # shell cmd to recover a hung mount
 
 # altmount (usenet WebDAV + rclone FUSE mount; a SABnzbd-compatible download client for the *arrs)
-ALT_URL           = os.environ.get("ALTMOUNT_URL", "")             # e.g. http://192.168.50.202:8080
+ALT_URL           = os.environ.get("ALTMOUNT_URL", "")             # e.g. http://192.168.1.10:8080
 ALT_APIKEY        = os.environ.get("ALTMOUNT_APIKEY", "")          # SAB api key (masked in the dashboard)
 ALT_MOUNT_TEST    = os.environ.get("ALTMOUNT_MOUNT_TEST", "")      # a dir on the FUSE mount to read-test, e.g. /mnt/library/altmount
 ALT_READ_TIMEOUT  = _i("ALTMOUNT_READ_TIMEOUT", 25)
@@ -275,7 +299,7 @@ ALT_TMP_UID       = _i("ALTMOUNT_TMP_UID", 1000)                   # uid AltMoun
 ALT_FIX_TMP       = _b("ALTMOUNT_FIX_TMP", True)                   # remove wrongly-owned staging dirs so AltMount recreates them
 # propagation guard: a consumer (autopulse/plex/silo) whose /mnt/library bind is rprivate never sees
 # the altmount submount, so new imports never scan into that app. Each entry is "label=command" and
-# must exit 0 when healthy, e.g. "autopulse=pct exec 106 -- docker exec autopulse mountpoint -q /mnt/library/altmount".
+# must exit 0 when healthy, e.g. "autopulse=pct exec <ctid> -- docker exec autopulse mountpoint -q /mnt/library/altmount".
 ALT_PROP_CHECKS   = [p.strip() for p in os.environ.get("ALTMOUNT_PROP_CHECKS", "").split(";") if p.strip()]
 ALT_PROP_FIX_CMD  = os.environ.get("ALTMOUNT_PROP_FIX_CMD", "")    # optional shell cmd to repair a stale consumer mount
 
@@ -295,6 +319,17 @@ PLEX_SCAN  = _b("PLEX_SCAN_ON_CHECK", False)
 EN_WARMER         = _b("ENABLE_WARMER", False)
 WARM_HEAD_MB      = _i("WARMER_PRECACHE_MB", 64)        # how much of the file head to pull into cache
 WARM_TAIL_MB      = _i("WARMER_TAIL_MB", 8)             # also pull the tail (mkv cues / Plex end-probe); 0=off
+WARM_START_S      = _i("WARMER_START_SECONDS", 5)       # video a client buffers before it starts
+WARM_RUNWAY_S     = _i("WARMER_RUNWAY_SECONDS", 30)     # how long a slower-than-bitrate fetch must be covered for
+WARM_LOAD_CALM    = _f("WARMER_LOAD_CALM", 4.0)         # above this host load, assume pickup takes proportionally longer
+WARM_BULK_HEAD_MB = _i("WARMER_BULK_HEAD_MB", 40)       # head for bulk sources: 40 MB started every title under 55 Mbps cleanly
+WARM_BULK_SECONDS = _i("WARMER_BULK_SECONDS", 8)        # ...and this much video for higher bitrates, up to twice that head
+WARM_HEAD_MAX_MB  = _i("WARMER_HEAD_MAX_MB", 300)       # most head to pull for one file
+WARM_BUDGET_MB    = _i("WARMER_BUDGET_MB", 18000)       # total speculative warm, kept under the segment cache so it cannot evict itself
+WARM_SEASON_COOLDOWN = _i("WARMER_SEASON_COOLDOWN", 86400)  # re-touch each season's first episode this often (source "seasons")
+WARM_SEASON_BUDGET = _i("WARMER_SEASON_BUDGET", 300)    # seconds per cycle for season warming, so next-episode warms stay prompt
+WARM_HUB_COUNT    = _i("WARMER_HUB_COUNT", 12)          # titles per Home row to warm for each viewer (source "hubs")
+WARM_RESUME_MB    = _i("WARMER_RESUME_MB", 32)          # also pull this much at a Continue Watching item's resume point; 0=off
 WARM_INTERVAL     = _i("WARMER_INTERVAL", 120)          # seconds between session polls (next-episode prefetch)
 WARM_ONDECK_EVERY = _i("WARMER_ONDECK_EVERY", 600)      # seconds between on-deck / recent warms
 WARM_NEXT_EPS     = _i("WARMER_NEXT_EPISODES", 1)       # warm this many upcoming episodes of an active show
@@ -438,7 +473,54 @@ BACKLOG_RETRY_DAYS   = _i("BACKLOG_RETRY_DAYS", 7)                   # per-item 
 BACKLOG_LOAD_MAX     = _f("BACKLOG_LOAD_MAX", 12)                    # skip the whole check while host load is above this (0=ignore load)
 BACKLOG_MAX_FETCH    = _i("BACKLOG_MAX_FETCH", 2000)                 # cap on missing records pulled per instance per sweep
 BACKLOG_STATE        = os.environ.get("BACKLOG_STATE_FILE", "/data/backlog.json")
-BACKLOG_INTERVAL     = _i("BACKLOG_INTERVAL", 900)                   # min seconds between real backlog sweeps; event mode fires many sweeps/min, this throttles grab-rate + arr API load
+BACKLOG_INTERVAL     = _i("BACKLOG_INTERVAL", 900)
+# Probe-first grabbing (2026-10-15): backlog, repair and queue 'clear' hand item ids to this script, which STATs each
+# candidate NZB on usenet and grabs only a complete one, then verifies the import. Blind EpisodeSearch/MoviesSearch
+# picked dead remuxes over and over (Parks and Recreation: 165 grabs, 130 failures in one night). "" = old blind search.
+PROBE_GRAB_CMD = os.environ.get("PROBE_GRAB_CMD", "").strip()
+PROBE_TIMEOUT  = _i("PROBE_TIMEOUT", 3600)
+_probe_q, _probe_lock, _probe_running = [], threading.Lock(), [None]
+
+def probe_enqueue(arr_name, ids):
+    """Queue item ids for a probe-first grab. Returns True when queued (or already queued)."""
+    ids = [int(i) for i in ids if i]
+    if not ids:
+        return False
+    with _probe_lock:
+        queued = {(a, i) for a, b in _probe_q for i in b}
+        new = [i for i in ids if (arr_name, i) not in queued]
+        if new:
+            _probe_q.append((arr_name, new))
+    return True
+
+def probe_busy():
+    with _probe_lock:
+        return bool(_probe_q) or _probe_running[0] is not None
+
+def probe_loop(stop):
+    """One probe_grab batch at a time, so grabs stay gentle on AltMount and the arrs."""
+    while not stop.is_set():
+        with _probe_lock:
+            job = _probe_q.pop(0) if _probe_q else None
+            _probe_running[0] = job
+        if not job:
+            stop.wait(10); continue
+        arr_name, ids = job
+        held = time.time()
+        while time.time() - held < 1800 and not stop.is_set() and _viewer_playing():   # a grab competes for the link
+            stop.wait(30)
+        try:
+            p = subprocess.run([sys.executable, PROBE_GRAB_CMD, arr_name] + [str(i) for i in ids],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=PROBE_TIMEOUT)
+            tail = p.stdout.decode("utf-8", "replace").strip().splitlines()[-1:] or ["?"]
+            log.info("[probe:%s] %s", arr_name, tail[0][20:180])
+        except subprocess.TimeoutExpired:
+            log.warning("[probe:%s] timed out after %ds on %s", arr_name, PROBE_TIMEOUT, ids)
+        except Exception as e:
+            log.warning("[probe:%s] failed: %s", arr_name, str(e)[:120])
+        finally:
+            with _probe_lock:
+                _probe_running[0] = None                   # min seconds between real backlog sweeps; event mode fires many sweeps/min, this throttles grab-rate + arr API load
 
 # riven (rivenmedia/riven): symlink-library manager with its own state machine. We watch /health and
 # /services every sweep (cheap, read-only) and gently retry items wedged in a working state or never
@@ -718,9 +800,18 @@ class Arr:
         self.unknown = "includeUnknownSeriesItems=true" if kind == "sonarr" else "includeUnknownMovieItems=true"
 
     def _req(self, method, path, data=None, t=None):
-        req = urllib.request.Request(self.base + path, data=data, method=method,
-                                     headers={"X-Api-Key": self.apikey, "Content-Type": "application/json"})
-        return urllib.request.urlopen(req, timeout=t or TIMEOUT)
+        # GETs retry with backoff + jitter (an arr answers 500/503 under search load); writes never retry, a retried
+        # DELETE or grab could act twice (ported from machetie/stack-doctor 5d9bad51)
+        delay = 0.5
+        for i in range(3 if method == "GET" else 1):
+            req = urllib.request.Request(self.base + path, data=data, method=method,
+                                         headers={"X-Api-Key": self.apikey, "Content-Type": "application/json"})
+            try:
+                return urllib.request.urlopen(req, timeout=t or TIMEOUT)
+            except Exception as e:
+                if method != "GET" or i == 2 or (isinstance(e, urllib.error.HTTPError) and e.code < 500):
+                    raise
+                time.sleep(delay + random.uniform(0, delay / 2)); delay *= 2
 
     def queue(self):
         if self.kind == "prowlarr":
@@ -895,7 +986,7 @@ def _load_state():
 def _save_state(s):
     try:
         os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
-        json.dump(s, open(STATE_FILE, "w"))
+        _atomic_write_json(STATE_FILE, s)
     except Exception:
         pass
 
@@ -1002,6 +1093,19 @@ def check_queue(only=None):
                     except Exception as e:
                         log.warning("[queue:%s] clear failed: %s", arr.name, e)
                     continue
+            if action == "clear":
+                # condition-mapped clear: drop the dead release without Sonarr/Radarr's blind re-search, and let
+                # the probe-first grabber find a release that is actually complete
+                try:
+                    arr.remove(r["id"], blocklist=BLOCKLIST, skip_redownload=True)
+                    actions += 1; new.pop(iid, None)
+                    tid = r.get("episodeId") if arr.kind == "sonarr" else r.get("movieId")
+                    probed = bool(PROBE_GRAB_CMD and tid and probe_enqueue(arr.name, [tid]))
+                    log.info("[queue:%s] cleared (%s, blocklist=%s)%s: %s", arr.name, reason,
+                             str(BLOCKLIST).lower(), " -> probe-grab" if probed else ", no re-search", title)
+                except Exception as e:
+                    log.warning("[queue:%s] clear failed: %s", arr.name, e)
+                continue
             # research (remove + blocklist) | remove (never blocklist); also reached via escalation
             bl = BLOCKLIST if action == "research" else False
             parked = _churn_record(state, arr, r, title)   # un-monitor first so the remove can't re-search
@@ -1024,8 +1128,16 @@ def check_queue(only=None):
 # CHECK: decypharr (mount hang -> restart hook)
 # =========================================================================== #
 
+_read_inflight = {}   # path -> probe thread from an earlier call that is still blocked in the kernel
+
 def _read_test(path, timeout):
     """Return True if a file under path read its first bytes within timeout, else False (hung/failed)."""
+    prev = _read_inflight.get(path)
+    if prev is not None and prev.is_alive():
+        # A read blocked in a FUSE wait can never be abandoned: the thread stays stuck until the mount
+        # daemon restarts. Starting another probe on the same (first) file only leaks one more, and
+        # 13 leaked threads faked load 16 / io pressure 90% on 2026-09-19. So report hung, read nothing.
+        return False
     result = {"ok": False}
     target = {"f": None}
     try:
@@ -1048,7 +1160,9 @@ def _read_test(path, timeout):
             result["ok"] = False
     th = threading.Thread(target=_do, daemon=True); th.start(); th.join(timeout)
     if th.is_alive():
+        _read_inflight[path] = th
         return False  # hung
+    _read_inflight.pop(path, None)
     return result["ok"]
 
 _decy_last_restart = [0.0]
@@ -1078,6 +1192,7 @@ def check_decypharr():
 # =========================================================================== #
 
 _alt_last_restart = [0.0]
+_alt_hung = [0]
 
 def check_altmount():
     # 1. SABnzbd-compatible API reachability - this is what the *arrs actually talk to
@@ -1130,8 +1245,12 @@ def check_altmount():
     if ok is None:
         log.warning("[altmount] mount %s: no test file found / unlistable", ALT_MOUNT_TEST); return
     if ok:
+        _alt_hung[0] = 0
         log.info("[altmount] mount %s read OK", ALT_MOUNT_TEST); return
-    log.error("[altmount] mount %s READ HUNG (FUSE stall)", ALT_MOUNT_TEST)
+    _alt_hung[0] += 1
+    log.error("[altmount] mount %s READ HUNG (FUSE stall), %d in a row", ALT_MOUNT_TEST, _alt_hung[0])
+    if _alt_hung[0] < 2:
+        return
     if DRY_RUN or not ALT_RESTART_CMD:
         log.error("[altmount] no restart cmd set (or dry-run) -> alert only"); return
     if time.time() - _alt_last_restart[0] < 300:
@@ -1336,9 +1455,7 @@ def check_janitor():
         log.warning("[janitor] hit JANITOR_MAX_MOVES=%d -> stopping this sweep", JAN_MAX_MOVES)
     if manifest:
         try:
-            os.makedirs(qroot, exist_ok=True)
-            with open(qroot + "/manifest.json", "w") as _f:
-                json.dump(manifest, _f, indent=1)
+            os.makedirs(qroot, exist_ok=True); _atomic_write_json(qroot + "/manifest.json", manifest, indent=1)
         except Exception:
             pass
     if moved:
@@ -1479,7 +1596,7 @@ def check_metaclean():
 #
 # Tiered, cheapest -> deepest. Default tier=2 (header + sampled chunks) catches
 # the article-missing failure mode cheaply through the FUSE mount without
-# restreaming whole files from Newshosting. Tier 3/4 only run on suspects
+# restreaming whole files from the provider. Tier 3/4 only run on suspects
 # (when SCRUBBER_PROMOTE_ON_SUSPECT) or when explicitly enabled.
 #
 #   tier 1: ffprobe header               (~1s per file; catches torn containers)
@@ -1509,7 +1626,7 @@ def _scrub_load_state():
 def _scrub_save_state(s):
     try:
         os.makedirs(os.path.dirname(SCRUB_STATE) or ".", exist_ok=True)
-        json.dump(s, open(SCRUB_STATE, "w"))
+        _atomic_write_json(SCRUB_STATE, s)
     except Exception as e:
         log.debug("[scrubber] state save failed: %s", e)
 
@@ -1591,6 +1708,7 @@ def _scrub_run(cmd, timeout):
 # hair more data than the file actually holds (common in remuxes) or when the mount
 # stops serving at the tail; the tool still exits rc=0 and the file plays in Plex.
 _SCRUB_BENIGN_STDERR = ("File ended prematurely",)
+_SCRUB_RC0_FATAL = re.compile(r"0x00 at pos|invalid as first byte|Invalid data found", re.I)
 
 def _scrub_benign_only(err):
     """True when every non-empty stderr line is one of the known-benign warnings above."""
@@ -1598,6 +1716,36 @@ def _scrub_benign_only(err):
     if not lines:
         return True
     return all(any(m in ln for m in _SCRUB_BENIGN_STDERR) for ln in lines)
+
+def _scrub_is_timeout(why):
+    return "TIMEOUT after" in (why or "")
+
+def _scrub_control_ok(files_state, exclude):
+    """Re-read the most recently verified clean files. True: one reads clean, so the mount is fine. False: it
+    fails too, so the mount is at fault. None: no usable control. Uses ffprobe (a subprocess with a timeout),
+    never an in-process stat: sweep() runs every check under one lock, and a stat on a hung mount would stall
+    all of them."""
+    oks = sorted(((r.get("ts", 0), p) for p, r in files_state.items()
+                  if r.get("status") == "ok" and p != exclude), reverse=True)
+    for _, p in oks[:5]:
+        ok, why = _scrub_t1_header(p)
+        if ok:
+            return True
+        if "No such file" not in why:
+            return False
+    return None
+
+def _scrub_confirm_bad(real_path, files_state):
+    """Last look before a file that reached SCRUB_STRIKES is quarantined and its arr record deleted.
+    clear = it reads fine now; mount = the mount is at fault (the recheck timed out, or a recently clean
+    file fails too); wait = nothing clean to compare against yet; act = it really is broken."""
+    ok, why = _scrub_t1_header(real_path)
+    if ok:
+        return "clear"
+    if _scrub_is_timeout(why):
+        return "mount"
+    ctrl = _scrub_control_ok(files_state, real_path)
+    return "act" if ctrl is True else ("mount" if ctrl is False else "wait")
 
 def _scrub_t1_header(path):
     """Tier 1: ffprobe parses the container header. Returns (ok, detail).
@@ -1611,7 +1759,7 @@ def _scrub_t1_header(path):
     rc, err = _scrub_run(cmd, SCRUB_HEADER_TO)
     if rc != 0:
         return False, ("ffprobe rc=%d %s" % (rc, err.strip()[:200])) or "header_fail"
-    if err.strip() and not _scrub_benign_only(err):
+    if err.strip() and not _scrub_benign_only(err) and _SCRUB_RC0_FATAL.search(err):
         return False, "ffprobe rc=0 %s" % err.strip()[:200]
     return True, ""
 
@@ -1795,6 +1943,10 @@ def check_scrubber():
                 ok, why = True, "tier2 hiccup cleared by full decode"
             elif ok and not ok3:
                 ok, why = False, "tier3 full: %s" % why3
+        # ----- a read that never answers is the mount (a wedged AltMount reader), not the file -----
+        if not ok and _scrub_is_timeout(why):
+            log.warning("[scrubber] INCONCLUSIVE %s :: %s; no strike, stopping this sweep", real_path, why[:80])
+            break
         # ----- record result -----
         size = st.st_size; mtime = int(st.st_mtime)
         prev_strikes = rec.get("strikes", 0)
@@ -1813,6 +1965,21 @@ def check_scrubber():
                 log.warning("[scrubber] SUSPECT t%d (%d/%d) %s :: %s",
                             cur_tier, strikes, SCRUB_STRIKES, real_path, why[:160])
             else:
+                # One more look before deleting anything. On 2026-09-19 eight good files were deleted
+                # because both strikes landed while AltMount itself was degraded.
+                verdict = _scrub_confirm_bad(real_path, files_state)
+                if verdict == "clear":
+                    rec.update({"status": "ok", "strikes": 0, "why": ""}); ok_n += 1
+                    log.warning("[scrubber] recheck cleared %s (was: %s)", real_path, why[:120])
+                    continue
+                if verdict != "act":
+                    rec.update({"status": "suspect", "strikes": SCRUB_STRIKES - 1}); suspect += 1
+                    if verdict == "mount":
+                        log.warning("[scrubber] NOT acting on %s: the mount is at fault, not the file; "
+                                    "stopping this sweep", real_path)
+                        break
+                    log.warning("[scrubber] NOT acting on %s yet: no recently clean file to compare against", real_path)
+                    continue
                 bad += 1
                 log.error("[scrubber] BAD t%d %s :: %s", cur_tier, real_path, why[:200])
                 if _scrub_act_on_bad(real_path, lib_symlink, why, sweep_qroot, manifest):
@@ -1822,7 +1989,7 @@ def check_scrubber():
     # persist this sweep's manifest (fresh dir per sweep => a clean, isolated undo record)
     if manifest:
         try:
-            json.dump(manifest, open(os.path.join(sweep_qroot, "manifest.json"), "w"), indent=1)
+            _atomic_write_json(os.path.join(sweep_qroot, "manifest.json"), manifest, indent=1)
         except Exception:
             pass
     _scrub_save_state(state)
@@ -2128,7 +2295,7 @@ def _wl_load_state():
 def _wl_save_state(s):
     try:
         os.makedirs(os.path.dirname(WL_STATE) or ".", exist_ok=True)
-        json.dump(s, open(WL_STATE, "w"))
+        _atomic_write_json(WL_STATE, s)
     except Exception as e:
         log.debug("[watchlists] state save failed: %s", e)
 
@@ -2542,7 +2709,7 @@ def _hol_load_state():
 def _hol_save_state(s):
     try:
         os.makedirs(os.path.dirname(HOL_STATE) or ".", exist_ok=True)
-        json.dump(s, open(HOL_STATE, "w"))
+        _atomic_write_json(HOL_STATE, s)
     except Exception as e:
         log.debug("[holidays] state save failed: %s", e)
 
@@ -2654,7 +2821,7 @@ def _backlog_load_state():
 def _backlog_save_state(s):
     try:
         os.makedirs(os.path.dirname(BACKLOG_STATE) or ".", exist_ok=True)
-        json.dump(s, open(BACKLOG_STATE, "w"))
+        _atomic_write_json(BACKLOG_STATE, s)
     except Exception as e:
         log.debug("[backlog] state save failed: %s", e)
 
@@ -2688,6 +2855,10 @@ def check_backlog():
     targets = [a for a in INSTANCES if a.kind in ("sonarr", "radarr") and a.name in BACKLOG_INSTANCES]
     if not targets:
         log.debug("[backlog] no enabled instances match BACKLOG_INSTANCES=%s", ",".join(BACKLOG_INSTANCES)); return
+    if _viewer_playing():
+        log.debug("[backlog] a viewer is playing - skipping this sweep"); return
+    if PROBE_GRAB_CMD and probe_busy():
+        log.debug("[backlog] previous probe batch still running - skipping this sweep"); return
     state = _backlog_load_state()
     nowsec = time.time()
     if BACKLOG_INTERVAL and not DRY_RUN:
@@ -2733,13 +2904,13 @@ def check_backlog():
             log.info("[backlog:%s] WOULD search %d missing: %s", arr.name, len(ids), label)
             budget -= len(ids); searched += len(ids)
             continue
-        res = arr.command(body)
+        res = probe_enqueue(arr.name, ids) if PROBE_GRAB_CMD else arr.command(body)
         if res is None:
             log.warning("[backlog:%s] search command failed for %d items", arr.name, len(ids)); continue
         nowts = time.time()
         for i in ids: seen[str(i)] = nowts
         budget -= len(ids); searched += len(ids)
-        log.info("[backlog:%s] searching %d missing: %s", arr.name, len(ids), label)
+        log.info("[backlog:%s] %s %d missing: %s", arr.name, "probe-grabbing" if PROBE_GRAB_CMD else "searching", len(ids), label)
     if not DRY_RUN:
         _backlog_save_state(state)
     if searched:
@@ -2759,7 +2930,7 @@ def _repair_load_state():
 def _repair_save_state(s):
     try:
         os.makedirs(os.path.dirname(REPAIR_STATE) or ".", exist_ok=True)
-        json.dump(s, open(REPAIR_STATE, "w"))
+        _atomic_write_json(REPAIR_STATE, s)
     except Exception as e:
         log.debug("[repair] state save failed: %s", e)
 
@@ -2823,7 +2994,7 @@ def check_repair():
                     else {"name": "MoviesSearch", "movieIds": [tid]})
             if DRY_RUN:
                 log.info("[repair:%s] WOULD re-grab NOW: %s", arr.name, title); searched += 1; continue
-            if arr.command(body) is not None:
+            if (probe_enqueue(arr.name, [tid]) if PROBE_GRAB_CMD else arr.command(body) is not None):
                 cd[str(tid)] = now; searched += 1
                 log.warning("[repair:%s] file went missing -> re-grabbing NOW: %s", arr.name, title)
     for d in cool.values():                     # prune stale cooldown entries
@@ -3043,6 +3214,108 @@ def check_missing_from_disk():
     log.info("[missing-disk] done: scanned %d, missing-from-disk %d, re-grabbed %d", scanned, missing, acted)
 
 
+def _plexstale_pick(items, exists, old_enough):
+    """Split items into (stale, ghosts). stale: (item, media) for a dead version beside a live one. ghosts: items where
+    every version is dead. A media with no path, a path still present, or a path not gone for long enough is left alone."""
+    stale, ghosts = [], []
+    for it in items:
+        dead = [m for m in it["media"] if m["files"] and not any(exists(f) for f in m["files"])
+                and all(old_enough(f) for f in m["files"])]
+        live = [m for m in it["media"] if m not in dead]
+        if not dead:
+            continue
+        if any(m["files"] and any(exists(f) for f in m["files"]) for m in live):
+            stale += [(it, m) for m in dead]
+        elif not live:
+            ghosts.append(it)
+    return stale, ghosts
+
+
+def _plexstale_arr(path):
+    """(arr, item id, has file, monitored) for a library path, or None when no arr claims it."""
+    m = re.search(r"S(\d+)E(\d+)", os.path.basename(path))
+    for a in INSTANCES:
+        if a.kind == "radarr":
+            for mv in a.get_json("/movie") or []:
+                if mv.get("path") == os.path.dirname(path):
+                    return a, mv["id"], mv.get("hasFile"), mv.get("monitored")
+        elif a.kind == "sonarr" and m:
+            for sr in a.get_json("/series") or []:
+                if path.startswith(sr.get("path", "\0") + "/"):
+                    for e in a.get_json("/episode?seriesId=%s" % sr["id"]) or []:
+                        if (e["seasonNumber"], e["episodeNumber"]) == (int(m[1]), int(m[2])):
+                            return a, e["id"], e.get("hasFile"), e.get("monitored")
+    return None
+
+
+def check_plexstale():
+    """Keep Plex's list honest without losing anything. Library entries are symlinks on local disk, so a missing path
+    means the arrs removed it, not that a mount hiccuped. A version with a live sibling is dropped outright. An item with
+    no version left is asked of its arr first: file present means Plex rescans that folder, wanted means re-grab then
+    drop the empty entry, and no arr claiming it means leave it alone. allowMediaDeletion is on only during the drops."""
+    try: state = json.load(open(PLEXSTALE_STATE))
+    except Exception: state = {}
+    now = time.time()
+    if now - state.get("last", 0) < PLEXSTALE_INTERVAL:
+        return
+    plex = Plex(PLEX_URL, PLEX_TOKEN)
+    items, total = [], 0
+    for d in plex._get("/library/sections").iter("Directory"):
+        if d.get("type") not in ("movie", "show"):
+            continue
+        root = plex._get("/library/sections/%s/all?type=%d" % (d.get("key"), 1 if d.get("type") == "movie" else 4), timeout=240)
+        for v in root.iter("Video"):
+            media = [{"id": m.get("id"), "files": [p.get("file") for p in m.iter("Part") if p.get("file")]} for m in v.iter("Media")]
+            total += sum(len(m["files"]) for m in media)
+            items.append({"rk": v.get("ratingKey"), "section": d.get("key"), "title": v.get("title"), "media": media})
+    exists = lambda f: os.path.lexists(_host_path(f))
+    gone = {f for it in items for m in it["media"] for f in m["files"] if not exists(f)}
+    if not total or len(gone) / total > PLEXSTALE_MAX_MISSING:
+        log.warning("[plexstale] %d of %d paths gone, assuming a mount problem: dropping nothing", len(gone), total)
+        return
+    seen = {f: state.get("seen", {}).get(f, now) for f in gone}
+    stale, ghosts = _plexstale_pick(items, exists, lambda f: now - seen[f] >= PLEXSTALE_GRACE)
+    state.update(last=now, seen=seen)
+    if stale or ghosts:
+        log.info("[plexstale] %d paths gone: %d dead versions, %d items with no version", len(gone), len(stale), len(ghosts))
+    dropped = 0
+    def drop(it, m):
+        nonlocal dropped
+        if any(exists(f) for f in m["files"]):                # came back since the scan
+            return
+        if PLEXSTALE_DRY or DRY_RUN:
+            log.info("[plexstale] WOULD drop %s: %s", it["title"], os.path.basename(m["files"][0])); dropped += 1; return
+        plex._send("DELETE", "/library/metadata/%s/media/%s" % (it["rk"], m["id"]))
+        for f in m["files"]:
+            seen.pop(f, None)
+        dropped += 1
+        log.warning("[plexstale] dropped %s: %s", it["title"], os.path.basename(m["files"][0]))
+    if not (PLEXSTALE_DRY or DRY_RUN) and (stale or ghosts):
+        plex._send("PUT", "/:/prefs?allowMediaDeletion=1")
+    try:
+        for it, m in stale[:PLEXSTALE_MAX]:
+            drop(it, m)
+        for it in ghosts:
+            if dropped >= PLEXSTALE_MAX:
+                break
+            path = _host_path(it["media"][0]["files"][0])
+            owner = _plexstale_arr(path)
+            if owner is None:
+                log.warning("[plexstale] no arr claims %s, leaving it: %s", it["title"], path); continue
+            arr, iid, has, mon = owner
+            if has:
+                plex._send("GET", "/library/sections/%s/refresh?path=%s" % (it["section"], urllib.parse.quote(os.path.dirname(path))))
+                log.info("[plexstale] %s has a file in %s, Plex rescans its folder", it["title"], arr.name); continue
+            if mon and not (PLEXSTALE_DRY or DRY_RUN):
+                probe_enqueue(arr.name, [iid])
+            for m in it["media"]:
+                drop(it, m)
+    finally:
+        if not (PLEXSTALE_DRY or DRY_RUN) and (stale or ghosts):
+            plex._send("PUT", "/:/prefs?allowMediaDeletion=0")
+    _atomic_write_json(PLEXSTALE_STATE, state)
+
+
 def _riven_load_state():
     try: return json.load(open(RIVEN_STATE))
     except Exception: return {}
@@ -3050,7 +3323,7 @@ def _riven_load_state():
 def _riven_save_state(s):
     try:
         os.makedirs(os.path.dirname(RIVEN_STATE) or ".", exist_ok=True)
-        json.dump(s, open(RIVEN_STATE, "w"))
+        _atomic_write_json(RIVEN_STATE, s)
     except Exception as e:
         log.debug("[riven] state save failed: %s", e)
 
@@ -3269,18 +3542,100 @@ class Plex:
     def __init__(self, url, token):
         self.url = url.rstrip("/"); self.token = token
 
-    def _get(self, path):
+    def _get(self, path, token=None, timeout=15):
         sep = "&" if "?" in path else "?"
-        with urllib.request.urlopen(self.url + path + sep + "X-Plex-Token=" + self.token, timeout=15) as r:
+        with urllib.request.urlopen(self.url + path + sep + "X-Plex-Token=" + (token or self.token), timeout=timeout) as r:
             return ET.fromstring(r.read())
+
+    def _send(self, method, path):
+        sep = "&" if "?" in path else "?"
+        req = urllib.request.Request(self.url + path + sep + "X-Plex-Token=" + self.token, method=method)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status
 
     def sessions(self):
         try: return list(self._get("/status/sessions").iter("Video"))
         except Exception: return []
 
+    def shared_tokens(self):
+        """Shared users' server tokens from plex.tv, refreshed hourly, memory only. On failure the last list stands."""
+        if time.time() - _shared_tokens["ts"] > 3600:
+            _shared_tokens["ts"] = time.time()
+            try:
+                mid = self._get("/identity").get("machineIdentifier")
+                url = "https://plex.tv/api/servers/%s/shared_servers?X-Plex-Token=%s" % (mid, self.token)
+                with urllib.request.urlopen(url, timeout=15) as r:
+                    _shared_tokens["list"] = [s.get("accessToken") for s in ET.fromstring(r.read()).iter("SharedServer")
+                                              if s.get("accessToken")]
+            except Exception as e:
+                log.debug("[warmer] shared tokens: %s", type(e).__name__)
+        return _shared_tokens["list"]
+
     def ondeck(self):
-        try: return list(self._get("/library/onDeck").iter("Video"))
-        except Exception: return []
+        """Continue Watching for the owner and every shared user; each row is only visible with that user's token."""
+        out = []
+        for t in [self.token] + self.shared_tokens():
+            try: out += list(self._get("/library/onDeck", t).iter("Video"))
+            except Exception: pass
+        return out
+
+    def season_firsts(self):
+        """Titles worth a small warm: first episode of every first season, then movies newest first, then the first
+        episode of later seasons. Best version that exists. These lists are large, so they are rebuilt every 6 hours."""
+        if time.time() - _season_firsts["ts"] > 21600:
+            firsts, movies = {}, []
+            try:
+                for d in self._get("/library/sections").iter("Directory"):
+                    if d.get("type") == "movie":
+                        root = self._get("/library/sections/%s/all?type=1&sort=addedAt:desc" % d.get("key"), timeout=240)
+                        for v in root.iter("Video"):
+                            media = sorted(v.iter("Media"), key=lambda m: int(m.get("height") or 0), reverse=True)
+                            files = [p.get("file") for m in media for p in m.iter("Part")
+                                     if p.get("file") and os.path.lexists(_host_path(p.get("file")))]
+                            movies += files[:1]
+                        continue
+                    if d.get("type") != "show":
+                        continue
+                    for v in self._get("/library/sections/%s/all?type=4" % d.get("key"), timeout=240).iter("Video"):
+                        season, ep = int(v.get("parentIndex") or 0), int(v.get("index") or 0)
+                        media = sorted(v.iter("Media"), key=lambda m: int(m.get("height") or 0), reverse=True)
+                        files = [p.get("file") for m in media for p in m.iter("Part")
+                                 if p.get("file") and os.path.lexists(_host_path(p.get("file")))]
+                        key = (v.get("grandparentRatingKey"), season)
+                        if season and files and (key not in firsts or ep < firsts[key][0]):
+                            firsts[key] = (ep, files[0])
+                ordered = sorted(firsts.items(), key=lambda kv: kv[0][1])
+                _season_firsts.update(ts=time.time(), paths=[v[1] for k, v in ordered if k[1] == 1] + movies +
+                                      [v[1] for k, v in ordered if k[1] != 1])
+            except Exception as e:
+                log.warning("[warmer] season list: %s", str(e)[:80])
+        return _season_firsts["paths"]
+
+    def home_items(self):
+        """Movies and episodes on every viewer's Home screen, row by row, one entry per title. An entry with a resume
+        point wins, so the warm lands where playback will start."""
+        items = {}
+        for t in [self.token] + self.shared_tokens():
+            try: hubs = list(self._get("/hubs?count=%d" % WARM_HUB_COUNT, t).iter("Hub"))
+            except Exception: continue
+            for h in hubs:
+                videos = h.findall("Video")
+                for d in h.findall("Directory"):                 # a show or season card: warm the episode a click leads to
+                    if d.get("type") not in ("show", "season"):
+                        continue
+                    show = d.get("ratingKey") if d.get("type") == "show" else d.get("parentRatingKey")
+                    try:
+                        for od in self._get("/library/metadata/%s?includeOnDeck=1" % show, t).iter("OnDeck"):
+                            videos += od.findall("Video")
+                        if d.get("type") == "season":
+                            videos += self._get("/library/metadata/%s/children" % d.get("ratingKey"), t).findall("Video")[-1:]
+                    except Exception:
+                        pass
+                for v in videos:
+                    rk = v.get("ratingKey")
+                    if rk not in items or (v.get("viewOffset") and not items[rk].get("viewOffset")):
+                        items[rk] = v
+        return list(items.values())
 
     def leaves(self, show_rk):
         try: return list(self._get("/library/metadata/%s/allLeaves" % show_rk).iter("Video"))
@@ -3296,6 +3651,7 @@ class Plex:
                 for p in m.iter("Part"):
                     if p.get("file"):
                         out.append((res, p.get("file")))
+                        _warm_rate[p.get("file")] = int(m.get("bitrate") or 0) * 125   # kbps -> bytes/s
             out.sort(key=lambda x: x[0], reverse=True)
         except Exception:
             return []
@@ -3311,6 +3667,13 @@ class Plex:
         except Exception: pass
         return out
 
+_shared_tokens = {"ts": 0.0, "list": []}
+_season_firsts = {"ts": 0.0, "paths": []}
+_viewing = {"ts": 0.0, "on": False}
+_warm_rate = {}             # plex path -> stream bytes/s
+_warm_live = {"pickup": 8.0, "tput": 15 << 20}   # measured from cold reads: seconds to first data, bytes/s after that
+_warm_sizes = {}            # host path -> bytes this warm keeps in cache, for the budget
+_warm_at = {}               # plex path -> resume position as a fraction of the file (last user wins)
 _warm_state = {}            # host_path -> last_warm_ts
 _warm_lock = threading.Lock()
 _warm_sem = threading.Semaphore(max(1, WARM_CONCURRENCY))        # background warming lane
@@ -3326,6 +3689,7 @@ def _warm_record(title, why):
         del _warm_recent[:len(_warm_recent) - 80]
 
 def _limit_parts(files):
+    files = [f for f in files if os.path.lexists(_host_path(f))]   # Plex keeps entries for deleted versions until reconciled
     return files if WARM_PARTS <= 0 else files[:WARM_PARTS]
 
 def _host_path(f):
@@ -3335,6 +3699,69 @@ def _host_path(f):
             return b + f[len(a):]
     return f
 
+_WARM_READER = """
+import sys, time
+with open(sys.argv[1], "rb", buffering=0) as f:
+    for r in sys.argv[2:]:
+        off, n = map(int, r.split(":"))
+        f.seek(off)
+        t0, first, got = time.time(), None, 0
+        while got < n:
+            b = f.read(min(4 << 20, n - got))
+            if not b:
+                break
+            got += len(b)
+            first = first if first is not None else time.time() - t0
+        print("%.3f %.3f %d" % (first or 0, time.time() - t0, got))
+"""
+
+def _viewer_playing():
+    """True while someone is playing or buffering, cached 5 s. Background work yields to them, because the link is the
+    bottleneck. A paused session uses no bandwidth, so one left paused overnight must not hold everything back."""
+    if not PLEX_URL:
+        return False
+    if time.time() - _viewing["ts"] > 5:
+        _viewing["ts"] = time.time()
+        _viewing["on"] = any((v.find("Player") is None or v.find("Player").get("state") != "paused")
+                             for v in Plex(PLEX_URL, PLEX_TOKEN).sessions())
+    return _viewing["on"]
+
+
+def _warm_bulk_head(rate):
+    """Head for a bulk title: thousands of these must fit the cache, so they get what a clean start needs, no more."""
+    base = WARM_BULK_HEAD_MB << 20
+    return int(max(base, min(rate * WARM_BULK_SECONDS, base * 2)))
+
+
+def _warm_head_bytes(sz, rate, pickup, tput, load):
+    """Head to hold so a client can start and the live fetch can catch up before the cached bytes run out: the client's
+    start buffer plus the measured pickup time, stretched when the host is busy, at this file's bitrate. A fetch slower
+    than the bitrate never catches up, so cover that shortfall for WARM_RUNWAY_S too."""
+    stretch = min(2.0, 1.0 + max(0.0, load - WARM_LOAD_CALM) / WARM_LOAD_CALM)
+    want = rate * (WARM_START_S + pickup * stretch) + max(0, rate - tput) * WARM_RUNWAY_S
+    return int(min(sz, max(WARM_HEAD_MB << 20, min(want, WARM_HEAD_MAX_MB << 20))))
+
+
+def _warm_stop(proc):
+    """Kill a warm reader and collect it, without hanging on one the kernel has not released yet."""
+    proc.kill()
+    try:
+        proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _warm_learn(report):
+    """Feed cold reads from the reader into the rolling pickup and throughput; cache hits say nothing about either."""
+    for line in report.splitlines():
+        first, total, n = line.split()
+        first, total, n = float(first), float(total), int(n)
+        if first >= 0.3:
+            _warm_live["pickup"] = 0.8 * _warm_live["pickup"] + 0.2 * first
+        if first >= 0.3 and total >= 1 and n >= 8 << 20:
+            _warm_live["tput"] = 0.8 * _warm_live["tput"] + 0.2 * (n / total)
+
+
 def _warm_file(path, reason="cycle"):
     p = _host_path(path)
     # a title you actively opened tolerates more load (2x) than speculative background warming, but
@@ -3343,7 +3770,7 @@ def _warm_file(path, reason="cycle"):
     if guard > 0 and host_load() > guard:
         return False
     with _warm_lock:                                    # atomic claim: one warm per file per cooldown
-        if time.time() - _warm_state.get(p, 0) < WARM_COOLDOWN:
+        if time.time() - _warm_state.get(p, 0) < (WARM_SEASON_COOLDOWN if reason == "season" else WARM_COOLDOWN):
             return False
         _warm_state[p] = time.time()
     try:
@@ -3351,37 +3778,53 @@ def _warm_file(path, reason="cycle"):
     except Exception as e:
         _warm_state.pop(p, None)                         # release so it can be retried
         log.debug("[warmer] stat fail %s: %s", p, str(e)[:60]); return False
-    head = min(WARM_HEAD_MB << 20, sz)
+    rate = _warm_rate.get(path) or sz / 7200                  # no bitrate from Plex: treat it as a 2 h film
+    head = _warm_head_bytes(sz, rate, _warm_live["pickup"], _warm_live["tput"], host_load())
+    if reason == "season":
+        head = min(head, _warm_bulk_head(rate))
+    at = _warm_at.get(path) if WARM_RESUME_MB > 0 else None
+    planned = head + (WARM_TAIL_MB << 20) + ((WARM_RESUME_MB << 20) if at else 0)
+    if reason in ("hubs", "season") and p not in _warm_sizes and sum(_warm_sizes.values()) + planned > WARM_BUDGET_MB << 20:
+        _warm_state.pop(p, None)                              # out of budget, not done: Home order decides who stays
+        return False
+    _warm_sizes[p] = planned
     tail = WARM_TAIL_MB > 0 and sz > head + (WARM_TAIL_MB << 20)
-    res = {"got": 0, "err": None}
-    def _do():
-        try:
-            with open(p, "rb", buffering=0) as fh:
-                while res["got"] < head:
-                    b = fh.read(min(4 << 20, head - res["got"]))
-                    if not b: break
-                    res["got"] += len(b)
-                if tail:
-                    fh.seek(sz - (WARM_TAIL_MB << 20))
-                    while fh.read(4 << 20):
-                        pass
-        except Exception as e:
-            res["err"] = str(e)[:60]
+    # Tail first: AltMount prefetches ahead of a head read and a seek then queues behind it (measured 2026-10-31).
+    ranges = [(sz - (WARM_TAIL_MB << 20), WARM_TAIL_MB << 20)] if tail else []
+    if at:
+        # ponytail: time fraction = byte fraction, the 8 MB lead absorbs mild VBR; parse mkv Cues if misses show up
+        ranges.append((max(0, int(sz * at) - (8 << 20)), WARM_RESUME_MB << 20))
+    ranges.append((0, head))
     t0 = time.time()
     sem = _warm_sem_open if reason == "detail-page" else _warm_sem   # opens get their own lane (instant)
-    with sem:                                           # cap concurrent usenet pulls so warming never floods decypharr
-        th = threading.Thread(target=_do, daemon=True); th.start(); th.join(WARM_READ_TIMEOUT)
-    if th.is_alive():
-        _warm_state.pop(p, None)
-        log.warning("[warmer] read timed out (%ds, mount slow/hung?): %s", WARM_READ_TIMEOUT, os.path.basename(p))
-        return False
-    if res["err"]:
-        _warm_state.pop(p, None)
-        log.warning("[warmer] read fail %s: %s", os.path.basename(p), res["err"]); return False
+    with sem:                                           # cap concurrent usenet pulls so warming never floods AltMount
+        # A separate process, because a read wedged in FUSE can be killed there and never can in a thread (one wedged
+        # read stopped all warming for hours on 2026-10-31).
+        proc = subprocess.Popen([sys.executable, "-c", _WARM_READER, p] + ["%d:%d" % r for r in ranges],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        while True:
+            try:
+                report, err = proc.communicate(timeout=3)
+                break
+            except subprocess.TimeoutExpired:
+                if reason in ("hubs", "season") and _viewer_playing():
+                    _warm_stop(proc)                     # they get the link now; this title is retried next cycle
+                    _warm_state.pop(p, None); _warm_sizes.pop(p, None)
+                    log.info("[warmer] viewer started, dropped warm of %s", os.path.basename(p))
+                    return False
+                if time.time() - t0 > WARM_READ_TIMEOUT:
+                    _warm_stop(proc)                     # the cooldown claim stays, so this file sits out a while
+                    log.warning("[warmer] read timed out (%ds), killed it and moving on: %s", WARM_READ_TIMEOUT, os.path.basename(p))
+                    return False
+    if proc.returncode != 0:
+        _warm_state.pop(p, None); _warm_sizes.pop(p, None)
+        log.warning("[warmer] read fail %s: %s", os.path.basename(p), (err or "").strip()[-60:]); return False
+    _warm_learn(report)
     _warm_record(os.path.basename(p), reason)
-    log.info("[warmer] warmed %dMB head%s in %.1fs: %s",
-             res["got"] >> 20, "+%dMB tail" % WARM_TAIL_MB if tail else "",
-             time.time() - t0, os.path.basename(p))
+    log.info("[warmer] warmed %dMB head%s%s in %.1fs (%.1f MB/s stream, pickup %.1fs, fetch %.0f MB/s): %s",
+             head >> 20, "+%dMB tail" % WARM_TAIL_MB if tail else "",
+             "+%dMB resume" % WARM_RESUME_MB if at else "",
+             time.time() - t0, rate / (1 << 20), _warm_live["pickup"], _warm_live["tput"] / (1 << 20), os.path.basename(p))
     return True
 
 def _warm_targets(plex):
@@ -3412,10 +3855,21 @@ def _warm_targets(plex):
     # with a live stream), and is skipped entirely in low-cache mode (keep almost nothing pre-warmed).
     if not WARM_LOW_CACHE and not sessions and time.time() - _warm_last_ondeck[0] >= WARM_ONDECK_EVERY:
         _warm_last_ondeck[0] = time.time()
+        if "hubs" in WARM_SOURCES:                          # what each viewer can click on Home, Continue Watching included
+            for v in plex.home_items():
+                for f in _limit_parts(plex.parts(v.get("ratingKey"))):
+                    add("hubs", f)
+                    try: _warm_at[f] = int(v.get("viewOffset")) / int(v.get("duration"))
+                    except (TypeError, ValueError, ZeroDivisionError): pass
+        if "seasons" in WARM_SOURCES:                       # after Home, so a full cache never costs the visible titles
+            for f in plex.season_firsts():
+                add("season", f)
         if WARM_ONDECK and "ondeck" in WARM_SOURCES:        # Continue Watching / Up Next (WARMER_ONDECK is the on/off)
             for v in plex.ondeck():
                 for f in _limit_parts(plex.parts(v.get("ratingKey"))):
                     add("ondeck", f)
+                    try: _warm_at[f] = int(v.get("viewOffset")) / int(v.get("duration"))
+                    except (TypeError, ValueError, ZeroDivisionError): pass
         if "recent" in WARM_SOURCES and WARM_RECENT_COUNT > 0:
             for v in plex.recent(WARM_RECENT_COUNT):
                 for f in _limit_parts(plex.parts(v.get("ratingKey"))):
@@ -3596,7 +4050,8 @@ def _silo_targets(silo):
 def warm_cycle():
     if WARM_LOAD_MAX > 0 and host_load() > WARM_LOAD_MAX:
         log.info("[warmer] host load > %.0f -> skip cycle", WARM_LOAD_MAX); return
-    targets = _warm_targets(Plex(PLEX_URL, PLEX_TOKEN)) if PLEX_URL else []
+    plex = Plex(PLEX_URL, PLEX_TOKEN) if PLEX_URL else None
+    targets = _warm_targets(plex) if plex else []
     if SILO_URL:
         try:
             targets = targets + _silo_targets(Silo(SILO_URL, SILO_APIKEY, SILO_PROFILE))
@@ -3607,9 +4062,12 @@ def warm_cycle():
         if _p not in _seen:
             _seen.add(_p); _uniq.append((_r, _p))
     targets = _uniq
-    done = 0
+    done, started = 0, time.time()
     for reason, path in targets:
-        if done >= WARM_MAX_CYCLE:
+        if done >= WARM_MAX_CYCLE or (reason == "season" and time.time() - started > WARM_SEASON_BUDGET):
+            break
+        if reason in ("hubs", "season") and _viewer_playing():  # a viewer started: they get the link
+            log.info("[warmer] viewer started, stopping this cycle after %d", done)
             break
         if _warm_file(path, reason):
             done += 1
@@ -3829,6 +4287,7 @@ CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_pr
           ("backlog", EN_BACKLOG, check_backlog),
           ("repair", EN_REPAIR, check_repair),
           ("missing-disk", EN_MISSING_DISK, check_missing_from_disk),
+          ("plexstale", EN_PLEXSTALE, check_plexstale),
           ("riven", EN_RIVEN, check_riven),
           ("mediastorm", EN_MEDIASTORM, check_mediastorm),
           ("bazarr", EN_BAZARR, check_bazarr), ("seerr", EN_SEERR, check_seerr),
@@ -3866,11 +4325,11 @@ UI_SCHEMA = [
               ("ENABLE_RIVEN", ""), ("ENABLE_MEDIASTORM", ""),
               ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", ""),
               ("ENABLE_MISSING_FROM_DISK", "")]),
-    ("AltMount (usenet WebDAV + mount)", [("ALTMOUNT_URL", "http://192.168.50.202:8080"),
+    ("AltMount (usenet WebDAV + mount)", [("ALTMOUNT_URL", "http://192.168.1.10:8080"),
               ("ALTMOUNT_APIKEY", "sab api key"), ("ALTMOUNT_MOUNT_TEST", "/mnt/library/altmount"),
               ("ALTMOUNT_RESTART_CMD", "systemctl restart altmount"), ("ALTMOUNT_TMP_UID", "1000"),
               ("ALTMOUNT_FIX_TMP", "true|false"), ("ALTMOUNT_TMP_DIRS", "/tmp/altmount-uploads,/tmp/.altmount-queue"),
-              ("ALTMOUNT_PROP_CHECKS", "autopulse=pct exec 106 -- docker exec autopulse mountpoint -q /mnt/library/altmount"),
+              ("ALTMOUNT_PROP_CHECKS", "autopulse=pct exec <ctid> -- docker exec autopulse mountpoint -q /mnt/library/altmount"),
               ("ALTMOUNT_PROP_FIX_CMD", "")]),
     ("Watchlists (Plex Home + friends -> arrs)", [
               ("WATCHLISTS_FRIENDS", "alice:xxxx,bob:yyyy"),
@@ -4020,7 +4479,7 @@ def _scout_load():
 def _scout_save(s):
     try:
         os.makedirs(os.path.dirname(SCOUT_STATE) or ".", exist_ok=True)
-        json.dump(s, open(SCOUT_STATE, "w"))
+        _atomic_write_json(SCOUT_STATE, s)
     except Exception as e:
         log.debug("[scout] state save failed: %s", e)
 
@@ -4746,7 +5205,7 @@ def _ui_save(body):
             ov[k] = v; os.environ[str(k)] = str(v); n += 1
     try:
         os.makedirs(os.path.dirname(CONFIG_FILE) or ".", exist_ok=True)
-        json.dump(ov, open(CONFIG_FILE, "w"), indent=1)
+        _atomic_write_json(CONFIG_FILE, ov, indent=1)
     except Exception as e:
         return False, str(e)[:80]
     return True, "saved %d (restart to apply)" % n
@@ -4904,7 +5363,7 @@ def _config_write(updates, drop_prefixes=()):
     for k, v in updates.items():
         ov[str(k)] = str(v); os.environ[str(k)] = str(v)
     os.makedirs(os.path.dirname(CONFIG_FILE) or ".", exist_ok=True)
-    json.dump(ov, open(CONFIG_FILE, "w"), indent=1)
+    _atomic_write_json(CONFIG_FILE, ov, indent=1)
 
 def _onb_save(body):
     try:
@@ -5761,6 +6220,9 @@ def main():
         threading.Thread(target=warmer_loop, args=(stop,), daemon=True).start()
         if WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE:
             threading.Thread(target=plexlog_loop, args=(stop,), daemon=True).start()
+
+    if PROBE_GRAB_CMD:
+        threading.Thread(target=probe_loop, args=(stop,), daemon=True).start()
 
     if EN_WESTREPAIR:
         threading.Thread(target=westrepair_loop, args=(stop,), daemon=True).start()

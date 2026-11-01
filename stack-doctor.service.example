@@ -55,7 +55,7 @@ Environment=WARMER_LOAD_MAX=12
 Environment=WARMER_CONCURRENCY=2
 # detail-page warming: warm the exact title a viewer opens (tail Plex's server log).
 # host can reach Plex-in-a-Proxmox-container with: pct exec <ctid> -- tail -n0 -F '<logpath>'
-Environment=WARMER_PLEXLOG_CMD=pct exec 100 -- tail -n0 -F '/mnt/appdata/plex/Library/Application Support/Plex Media Server/Logs/Plex Media Server.log'
+Environment=WARMER_PLEXLOG_CMD=pct exec <ctid> -- tail -n0 -F '<plex appdata>/Library/Application Support/Plex Media Server/Logs/Plex Media Server.log'
 # --- janitor reads decypharr's journal directly ---
 Environment=JANITOR_LIBRARY_PATHS=/mnt/library/tv,/mnt/library/movies
 Environment=JANITOR_LOG_CMD=journalctl -u decypharr -n 10000 --no-hostname

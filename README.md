@@ -27,6 +27,7 @@ container, everything configured by env vars.
 | **decypharr** | hung FUSE mount (read-test) + API down | runs your restart hook (`DECYPHARR_RESTART_CMD`) |
 | **altmount** | [AltMount](https://github.com/javi11/altmount) usenet WebDAV+FUSE mount feeding the *arrs: SAB API down, hung mount (read-test), root-owned NZB staging dirs (a footgun that silently fails every import), and consumers whose bind mount can't see the FUSE submount (so new content never scans in) | restarts via `ALTMOUNT_RESTART_CMD`, auto-heals wrongly-owned staging dirs, and flags/repairs stale consumer mounts (`ALTMOUNT_PROP_CHECKS`) |
 | **plex** | Plex unresponsive | alerts (optional library refresh) |
+| **plexstale** | Plex entries whose file is gone | drops them after checking the arrs, so nothing unplayable is listed |
 | **resources** | host load / low memory / swap pressure | reports; optional `drop_caches` relief |
 | **janitor** | permanently-dead usenet releases (from decypharr's log) | quarantines those library symlinks (reversible) |
 | **metaclean** | orphaned altmount metadata causing yEnc `CRC mismatch` retry storms | removes the orphaned metadata dir (failed release + unreferenced + old) so altmount stops re-reading a dead file |
@@ -395,7 +396,7 @@ own concurrency lane, even during playback.
 | `ENABLE_WARMER` | `false` | turn the warmer on (needs `PLEX_URL` + `PLEX_TOKEN`) |
 | `WARMER_PRECACHE_MB` | `64` | how much of each file's head to pull into cache |
 | `WARMER_TAIL_MB` | `8` | also pull the tail (mkv cues / Plex end-probe); `0` = off |
-| `WARMER_SOURCES` | `ondeck,next` | background signals to warm from (`ondeck`, `next`, `recent`). Detail-page warming is separate, via the log vars below |
+| `WARMER_SOURCES` | `ondeck,next` | background signals to warm from (`ondeck`, `next`, `recent`, `hubs`, `seasons`). `hubs` is every viewer's Home screen including Continue Watching, and shows resolve to the episode that viewer would play next. `seasons` is a small warm of the first episode of every season and every movie: every first season, then movies newest first, then later seasons. Detail-page warming is separate, via the log vars below |
 | `WARMER_ONDECK` | `true` | quick on/off for **Continue Watching** (On Deck) warming, without editing `WARMER_SOURCES` |
 | `WARMER_PLEXLOG_CMD` | *(none)* | stream command for Plex's server log (e.g. `tail -n0 -F '<log>'`, or `pct exec <ct> -- tail -n0 -F '<log>'`). Enables detail-page warming |
 | `WARMER_PLEXLOG_FILE` | *(none)* | a directly-readable path to Plex's log (alternative to `_CMD`) |
@@ -411,12 +412,39 @@ own concurrency lane, even during playback.
 | `WARMER_CONCURRENCY` | `2` | simultaneous **background** (on-deck/recent) warm reads. Kept low so background warming never starves live playback of usenet connections |
 | `WARMER_OPEN_CONCURRENCY` | `4` | simultaneous **detail-page** warm reads, a separate lane so a title you actively open starts warming instantly and never queues behind background warming |
 | `WARMER_PARTS` | `1` | how many versions per title to warm (`1` = highest-resolution only; `0` = all). Stops a 1080p you'll never play from warming alongside the 4K and clogging the lane |
-| `WARMER_READ_TIMEOUT` | `60` | abandon a single warm read after this long (hung-mount guard) |
+| `WARMER_READ_TIMEOUT` | `60` | kill a warm read after this long, and move on (hung-mount guard). Reads run in their own process, so one wedged in FUSE cannot stall the warmer |
+| `WARMER_HUB_COUNT` | `12` | titles per Home row to warm for each viewer (`hubs`) |
+| `WARMER_RESUME_MB` | `32` | also pull this much at a Continue Watching item's resume point; `0` = off |
+| `WARMER_START_SECONDS` | `5` | video a client buffers before it starts, part of how the head is sized |
+| `WARMER_RUNWAY_SECONDS` | `30` | how long to cover a fetch that is slower than the title's bitrate |
+| `WARMER_LOAD_CALM` | `4` | above this host load, assume the live fetch takes proportionally longer to catch up |
+| `WARMER_HEAD_MAX_MB` | `300` | most head to pull for one file |
+| `WARMER_BULK_HEAD_MB` | `40` | head for `seasons` titles |
+| `WARMER_BULK_SECONDS` | `8` | ...or this much video for higher bitrates, up to twice that head |
+| `WARMER_BUDGET_MB` | `18000` | total speculative warm. Keep it below the mount's cache size, or the warmer evicts its own work |
+| `WARMER_SEASON_COOLDOWN` | `86400` | re-touch each `seasons` title this often, so an LRU cache keeps it |
+| `WARMER_SEASON_BUDGET` | `300` | seconds per cycle for `seasons`, so next-episode warms stay prompt |
 | `WARMER_PATH_MAP` | *(none)* | `plexPrefix:hostPrefix` if Plex's file path differs from this host's |
 
 > Items with multiple versions (e.g. a 4K and a 1080p file on one movie) warm every version,
 > since the warmer can't know which the client will pick. Lower `WARMER_MAX_PER_CYCLE` or
 > `WARMER_PRECACHE_MB` if that's too much speculative fetching for your provider.
+
+**How much it reads.** `WARMER_PRECACHE_MB` is the floor, not a fixed size. The head is the client's start buffer plus the
+measured time a cold read takes to get going, stretched when the host is busy, at the title's own bitrate. A fetch slower
+than the bitrate adds the shortfall. Those estimates come from the warmer's own cold reads, so they follow the link.
+The tail is read first, because players fetch the index there right after the first bytes.
+
+**What a warm buys.** Measured through Plex in a real client's read order, with a simulated player at each title's own
+bitrate: a warmed title started in 0.1 s, a cold one in about 6 s. A 40 MB head plus a 16 MB tail played cleanly up to
+55 Mbps; 24 MB rebuffered at 63 Mbps. `tools/plex_start_bench.py` repeats the test on your stack.
+
+**Background work yields to viewers.** A speculative warm is killed within seconds of someone starting to play, and backlog
+sweeps and probe grabs wait, because on a narrow link they compete for the same bandwidth. A paused session does not count.
+
+**AltMount tuning.** If cold starts are slow and the link is saturated while the player waits, `streaming.max_prefetch` is
+probably too high for your link: the read-ahead opens fully on the first byte, and the seek to the index queues behind it.
+Sustained reads suffer too. On a link near 100 Mbps, 32 beat both 24 and 48, and 200 was far worse. Re-test when your link changes.
 
 ---
 
@@ -551,6 +579,30 @@ real deletion, so it is never actioned.
 
 Honors `DOCTOR_DRY_RUN` (logs each WOULD re-grab, changes nothing) and respects
 `MOUNT_HEALTH_GUARDS` (see the Scrubber section).
+
+## Plexstale (entries whose file is gone)
+
+Plex keeps an entry for a version whose file was replaced, and players or the warmer can pick it. `ENABLE_PLEXSTALE` drops
+those entries so nothing unplayable is listed, and nothing you added is lost.
+
+- Library paths are symlinks on local disk, so a missing path means the arrs removed it, not that a mount hiccuped.
+- A dead version beside a live one is dropped after `PLEXSTALE_GRACE`.
+- An item with no version left is asked of its arr first: file present means Plex rescans that folder, wanted means re-grab
+  then drop the empty entry, and if no arr claims it, it is left alone.
+- Above `PLEXSTALE_MAX_MISSING` of paths gone, it assumes a mount problem and drops nothing.
+- Plex's `allowMediaDeletion` is turned on only while dropping, and turned off again even on failure.
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_PLEXSTALE` | `false` | turn it on (needs `PLEX_URL` + `PLEX_TOKEN`) |
+| `PLEXSTALE_DRY_RUN` | `false` | log what it would drop, change nothing |
+| `PLEXSTALE_INTERVAL` | `3600` | seconds between reconciles |
+| `PLEXSTALE_GRACE` | `86400` | a path must stay gone this long first |
+| `PLEXSTALE_PER_SWEEP` | `25` | entries dropped per reconcile |
+| `PLEXSTALE_MAX_MISSING` | `0.05` | above this share of paths gone, stop |
+| `PLEXSTALE_STATE_FILE` | `/data/plexstale.json` | when each path was first seen missing |
+
+---
 
 ## Watchlists (Plex Home + friends -> arrs, no Overseerr)
 
@@ -689,6 +741,13 @@ gates keep it gentle:
 Honors `DOCTOR_DRY_RUN` (logs each WOULD-search, fires nothing). At the defaults it drains about
 `BACKLOG_PER_SWEEP` items every `BACKLOG_INTERVAL`, so a large backlog fills over days rather
 than in one flood, keeping Plex responsive throughout.
+
+### Probe before grabbing
+
+Set `PROBE_GRAB_CMD` to `tools/probe_grab.py` and backlog, repair and queue fixes stop grabbing blind: each candidate's NZB
+is fetched, spread articles are checked with STAT, and only a complete release is grabbed. See [tools/README.md](tools/README.md).
+
+---
 
 ## Riven (health + retry stuck/missing)
 

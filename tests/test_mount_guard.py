@@ -210,6 +210,7 @@ class ScrubberCapTest(unittest.TestCase):
              patch.object(doctor, "_scrub_load_state", return_value={}), \
              patch.object(doctor, "_scrub_save_state", return_value=None), \
              patch.object(doctor, "_scrub_t1_header", return_value=(False, "torn container")), \
+             patch.object(doctor, "_scrub_confirm_bad", return_value="act"), \
              patch.object(doctor, "_mount_ok_for", return_value=True), \
              patch.object(doctor, "_scrub_act_on_bad", return_value=True) as act:
             doctor.check_scrubber()
