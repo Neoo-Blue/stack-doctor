@@ -111,6 +111,34 @@ class WedgedReadTest(unittest.TestCase):
         doctor._warm_state.pop(doctor._host_path(self.fifo))
 
 
+class SpeculativeGateTest(unittest.TestCase):
+    """A session left paused must not stop warming; someone actually playing must."""
+
+    def targets(self, playing):
+        with tempfile.NamedTemporaryFile() as f:
+            title = ET.fromstring('<Video ratingKey="7" type="movie"/>')
+
+            class Fake:
+                def sessions(self):
+                    return [ET.fromstring('<Video type="movie"><Player state="paused"/></Video>')]
+
+                def home_items(self):
+                    return [title]
+
+                def parts(self, rk):
+                    return [f.name]
+            with patch.object(doctor, "WARM_SOURCES", ["hubs"]), patch.object(doctor, "WARM_LOW_CACHE", False), \
+                    patch.object(doctor, "_warm_last_ondeck", [0.0]), \
+                    patch.object(doctor, "_viewer_playing", return_value=playing):
+                return doctor._warm_targets(Fake())
+
+    def test_paused_session_does_not_block_warming(self):
+        self.assertEqual([reason for reason, _ in self.targets(False)], ["hubs"])
+
+    def test_viewer_playing_blocks_warming(self):
+        self.assertEqual(self.targets(True), [])
+
+
 class ViewerPlayingTest(unittest.TestCase):
     def playing(self, *states):
         videos = [ET.fromstring(f'<Video><Player state="{s}"/></Video>') for s in states]
