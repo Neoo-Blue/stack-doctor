@@ -14,6 +14,7 @@ PROBE = os.environ.get("WATCH_PROBE_QUERY", "ubuntu")            # any query tha
 NOTIFY = shlex.split(os.environ.get("WATCH_NOTIFY_CMD", ""))     # gets the subject as an argument, the body on stdin
 CAUSE = os.environ.get("WATCH_CAUSE_CMD", "")                    # optional shell command, its output joins the alert
 REPEAT = 86400
+ENV_PREFIXES = ("ARR_", "ALTMOUNT_", "PROBE_", "PROWLARR_", "WATCH_")   # what the backfill needs from this environment
 PORTS = dict(p.split("=") for p in os.environ.get("ARR_PORTS", "radarr=7878,sonarr=8989").split(","))
 
 
@@ -77,8 +78,8 @@ def main():
         clear_arr_backoff()
         if st.get("alerted"):
             a, b = [D.datetime.fromtimestamp(t, D.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") for t in (st["since"] - 3600, now + 300)]
-            subprocess.run(["systemd-run", f"--unit=indexer-backfill-{int(now)}", "--collect", "--property=Nice=10",
-                            f"--setenv=WATCH_INDEXER_ID={INDEXER}", f"--setenv=ARR_CONFIG_DIR={ARR_DIR}", f"--setenv=ARR_HOST={ARR_HOST}",
+            passed = [f"--setenv={k}={v}" for k, v in os.environ.items() if k.startswith(ENV_PREFIXES)]
+            subprocess.run(["systemd-run", f"--unit=indexer-backfill-{int(now)}", "--collect", "--property=Nice=10", *passed,
                             os.path.join(HERE, "backfill_window.py"), a, b], check=True)
             notify("Indexer recovered", f"Back at {time.strftime('%F %H:%M')}. Backfilling {a} to {b} UTC.")
         st = {}
